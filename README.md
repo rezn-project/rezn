@@ -1,7 +1,7 @@
 # Rezn
 
 **Rezn** is meant to be a Gleam-based control loop for container orchestration.  
-It’s not a PaaS. It’s not Kubernetes. And it’s not ready.
+It's not a PaaS. It's not Kubernetes. And it's not ready.
 
 This is not a POC. It’s a starting point.
 
