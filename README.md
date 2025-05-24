@@ -51,15 +51,15 @@ Your cluster obeys only **cryptographically verifiable truth**.
 
 ## Feature Highlights
 
-| ✅                        | Feature                                                                                          | Why it matters |
-| ------------------------ | ------------------------------------------------------------------------------------------------ | -------------- |
-| ✅ | **Typed DSL**            | Declare infra with first-class types instead of stringly chaos.                                  |                |
-| ✅ | **Design-by-Contract**   | Attach invariants and pre/post-conditions to every resource. Compiler refuses invalid states.    |                |
-| ✅ | **Real logic**           | Conditionals, variables, simple expressions  *inside* the config, no templating monkey-patches. |                |
-| ✅ | **Signed IR**            | Desired state is cryptographically signed; executors reject anything forged or stale.            |                |
-| ✅ | **Solid reconciliation** | A tight loop continually converges actual ↔ desired without guessing.                            |                |
-| ✅ | **No runtime surprises** | If it compiles, it deploys. If it violates a contract, it never leaves your laptop.              |                |
-| ✅ | **Tiny footprint**       | One small, static binary per component; no JVMs, no 160 MB Node runtimes.                        |                |
+| ✅ | Feature                  | Why it matters                                                                                   |
+| ----------------------------- | ------------------------------------------------------------------------------------------------ |
+| ✅ | **Typed DSL**            | Declare infra with first-class types instead of stringly chaos.                                  |
+| ✅ | **Design-by-Contract**   | Attach invariants and pre/post-conditions to every resource. Compiler refuses invalid states.    |
+| ✅ | **Real logic**           | Conditionals, variables, simple expressions  *inside* the config, no templating monkey-patches.  | 
+| ✅ | **Signed IR**            | Desired state is cryptographically signed; executors reject anything forged or stale.            |
+| ✅ | **Solid reconciliation** | A tight loop continually converges actual ↔ desired without guessing.                            |
+| ✅ | **No runtime surprises** | If it compiles, it deploys. If it violates a contract, it never leaves your laptop.              |
+| ✅ | **Tiny footprint**       | One small, static binary per component; no JVMs, no 160 MB Node runtimes.                        |
 
 ---
 
