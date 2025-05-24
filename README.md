@@ -52,7 +52,7 @@ Your cluster obeys only **cryptographically verifiable truth**.
 ## Feature Highlights
 
 | ✅ | Feature                  | Why it matters                                                                                   |
-| ----------------------------- | ------------------------------------------------------------------------------------------------ |
+| -- | ------------------------ | ------------------------------------------------------------------------------------------------ |
 | ✅ | **Typed DSL**            | Declare infra with first-class types instead of stringly chaos.                                  |
 | ✅ | **Design-by-Contract**   | Attach invariants and pre/post-conditions to every resource. Compiler refuses invalid states.    |
 | ✅ | **Real logic**           | Conditionals, variables, simple expressions  *inside* the config, no templating monkey-patches.  | 
