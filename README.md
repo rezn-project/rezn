@@ -1,42 +1,24 @@
-# Rezn
+# rezn
 
-**Rezn** is meant to be a Gleam-based control loop for container orchestration.  
-It's not a PaaS. It's not Kubernetes. And it's not ready.
+[![Package Version](https://img.shields.io/hexpm/v/rezn)](https://hex.pm/packages/rezn)
+[![Hex Docs](https://img.shields.io/badge/hex-docs-ffaff3)](https://hexdocs.pm/rezn/)
 
-This is not a POC. It’s a starting point.
+```sh
+gleam add rezn@1
+```
+```gleam
+import rezn
 
----
+pub fn main() -> Nil {
+  // TODO: An example of the project in use
+}
+```
 
-## Goals (WIP)
+Further documentation can be found at <https://hexdocs.pm/rezn>.
 
-- Define desired state as Gleam code
-- Compare against actual state (via Docker API)
-- Reconcile the difference
-- Run as a supervised process on the BEAM
+## Development
 
----
-
-## Not Yet Implemented
-
-- Session lifecycle
-- State storage
-- API layer
-- CLI
-- Anything useful
-
----
-
-## Dependencies
-
-- Docker daemon
-- Erlang/OTP
-- Gleam
-
----
-
-## You should not use this
-
-This is scaffolding.  
-Nothing works yet.  
-That’s the point.
- 
+```sh
+gleam run   # Run the project
+gleam test  # Run the tests
+```
