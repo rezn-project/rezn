@@ -1,5 +1,6 @@
 # Rezn
-**The Typed, Secure & Sane Way to Declare Infrastructure**  
+
+**The Infra Epoxy. Contracts that bind. Deployments that stick.**
 
 ---
 
