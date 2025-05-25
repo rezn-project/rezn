@@ -1,7 +1,7 @@
 package reznstore
 
 import (
-	"log"
+	"fmt"
 
 	"github.com/dgraph-io/badger/v4"
 )
@@ -10,14 +10,14 @@ type Store struct {
 	db *badger.DB
 }
 
-func New(path string) *Store {
+func New(path string) (*Store, error) {
 	opts := badger.DefaultOptions(path)
 	opts.Logger = nil // shut up, badger
 	db, err := badger.Open(opts)
 	if err != nil {
-		log.Fatalf("Failed to open badger store: %v", err)
+		return nil, fmt.Errorf("failed to open badger store: %w", err)
 	}
-	return &Store{db: db}
+	return &Store{db: db}, nil
 }
 
 func (s *Store) Write(key string, data []byte) error {
@@ -39,6 +39,6 @@ func (s *Store) Read(key string) ([]byte, error) {
 	return valCopy, err
 }
 
-func (s *Store) Close() {
-	s.db.Close()
+func (s *Store) Close() error {
+	return s.db.Close()
 }

@@ -38,7 +38,11 @@ func main() {
 		dbPath = os.Args[1]
 	}
 
-	store := reznstore.New(dbPath)
+	store, err := reznstore.New(dbPath)
+	if err != nil {
+		fmt.Printf("Failed to open store: %v\n", err)
+		os.Exit(1)
+	}
 	defer store.Close()
 
 	for {
@@ -86,7 +90,7 @@ func reconcileLoop(store *reznstore.Store) error {
 	for _, pod := range desiredPods {
 		var matches []string
 		for _, c := range running {
-			if strings.Contains(c, pod.Name+"-") {
+			if strings.HasPrefix(c, pod.Name+"-") {
 				matches = append(matches, c)
 			}
 		}
@@ -103,7 +107,9 @@ func reconcileLoop(store *reznstore.Store) error {
 		} else if len(matches) > pod.Replicas {
 			extra := len(matches) - pod.Replicas
 			for i := 0; i < extra; i++ {
-				stopContainer(matches[i])
+				if err := stopContainer(matches[i]); err != nil {
+					fmt.Printf("Failed to stop container %s: %v\n", matches[i], err)
+				}
 			}
 		}
 	}
@@ -136,7 +142,7 @@ func startContainer(name string, pod PodSpec) error {
 	return cmd.Run()
 }
 
-func stopContainer(name string) {
+func stopContainer(name string) error {
 	cmd := exec.Command("docker", "rm", "-f", name)
-	cmd.Run()
+	return cmd.Run()
 }
