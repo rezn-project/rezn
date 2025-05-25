@@ -2,6 +2,8 @@
 
 **The Infra Epoxy. Contracts that bind. Deployments that stick.**
 
+Join the Discord: https://discord.gg/UeSVxCgB7b 
+
 ---
 
 ## Why another tool?
