@@ -1,1 +1,5 @@
-rezn-data
+/target
+/rezn-data
+db
+conf
+snap.*
