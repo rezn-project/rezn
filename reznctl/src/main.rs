@@ -63,9 +63,6 @@ fn main() -> Result<()> {
     let program = json.get("program").context("missing 'program' field")?;
     let program_raw = serde_json::to_vec(program).context("serializing 'program'")?;
 
-    let hash = Sha256::digest(&program_raw);
-    println!("✔ hash: {}", hex::encode(hash));
-
     public_key
         .verify(&program_raw, &signature)
         .context("signature verification failed")?;
