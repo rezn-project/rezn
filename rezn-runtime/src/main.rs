@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use crate::main_loop::reconcile_loop;
 use store::SledStore;
-use tokio::{signal, task};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
@@ -20,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
 
     let store: Arc<dyn store::Store + Send + Sync> = Arc::new(SledStore::new(&db_path)?);
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<()>();
+    let (tx, mut rx) = mpsc::channel::<()>(1);
     let is_reconciling = Arc::new(AtomicBool::new(false));
     let store = Arc::clone(&store);
 
@@ -33,9 +32,8 @@ async fn main() -> anyhow::Result<()> {
                 .is_ok()
             {
                 eprintln!("[reconcile] Begin");
-                if let Err(e) = reconcile_loop(store).await {
-                    eprintln!("[reconcile] Error: {}", e);
-                }
+                reconcile_loop(store.clone()).await;
+
                 is_reconciling_clone.store(false, Ordering::SeqCst);
                 eprintln!("[reconcile] Done");
             } else {
@@ -43,6 +41,27 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
+
+    // Spawn periodic reconcile trigger
+    let tx_periodic = tx.clone();
+    tokio::spawn(async move {
+        let interval = std::env::var("RECONCILE_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(5);
+
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval));
+        loop {
+            interval.tick().await;
+            let _ = tx_periodic.send(());
+        }
+    });
+
+    // Handle Ctrl-C gracefully
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to listen for ctrl-c");
+    eprintln!("Received Ctrl-C, shutting down...");
 
     Ok(())
 }
