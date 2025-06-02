@@ -1,5 +1,4 @@
 mod docker;
-mod main_loop;
 mod reconcile;
 mod store;
 mod types;
@@ -7,7 +6,7 @@ mod types;
 use std::env;
 use std::sync::Arc;
 
-use crate::main_loop::reconcile_loop;
+use crate::reconcile::reconcile;
 use store::SledStore;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,7 +31,9 @@ async fn main() -> anyhow::Result<()> {
                 .is_ok()
             {
                 eprintln!("[reconcile] Begin");
-                reconcile_loop(store.clone()).await;
+                if let Err(e) = reconcile(&*store).await {
+                    eprintln!("[reconcile] Error: {}", e);
+                }
 
                 is_reconciling_clone.store(false, Ordering::SeqCst);
                 eprintln!("[reconcile] Done");
