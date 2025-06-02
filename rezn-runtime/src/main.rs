@@ -1,39 +1,41 @@
 mod docker;
+mod main_loop;
 mod reconcile;
 mod store;
 mod types;
 
-use reconcile::reconcile_loop;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::env;
 use std::sync::Arc;
-use std::{env, thread, time::Duration};
-use store::SledStore;
 
-fn main() {
-    let db_path = env::args().nth(1).unwrap_or("./rezn-data".into());
-    let store = match SledStore::new(&db_path) {
-        Ok(store) => store,
-        Err(e) => {
-            eprintln!("Failed to open store at '{}': {}", db_path, e);
-            std::process::exit(1);
-        }
+use crate::main_loop::reconcile_loop;
+use store::SledStore;
+use tokio::{signal, task};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let db_path = env::args().nth(1).unwrap_or_else(|| "./rezn-data".into());
+
+    let store: Arc<dyn store::Store + Send + Sync> = Arc::new(SledStore::new(&db_path)?);
+
+    let reconciler_handle = {
+        let store = Arc::clone(&store);
+        task::spawn(reconcile_loop(store))
     };
 
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-    ctrlc::set_handler(move || {
-        r.store(false, Ordering::SeqCst);
-    })
-    .expect("Error setting Ctrl-C handler");
+    // Optional: add socket task later
+    // let socket_handle = task::spawn(unix_socket_server(Arc::clone(&store)));
 
-    while running.load(Ordering::SeqCst) {
-        if let Err(e) = reconcile_loop(&store) {
-            eprintln!("Reconcile error: {}", e);
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            eprintln!("SIGINT received. Shutting down.");
         }
-        let sleep_duration = env::var("RECONCILE_INTERVAL")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5);
-        thread::sleep(Duration::from_secs(sleep_duration));
+        res = reconciler_handle => {
+            if let Err(e) = res {
+                eprintln!("Reconciler failed: {:?}", e);
+            }
+        }
+        // res = socket_handle => ...
     }
+
+    Ok(())
 }

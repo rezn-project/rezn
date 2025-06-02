@@ -4,24 +4,26 @@ use crate::{
     types::{GenericItem, PodFields, PodSpec},
 };
 use anyhow::{Context, Result};
-use std::thread;
+use chrono::Utc;
 
-pub fn reconcile_loop(store: &impl Store) -> Result<()> {
+pub async fn reconcile(store: &(dyn Store + Send + Sync)) -> Result<()> {
     let data = match store.read("desired") {
         Ok(data) => data,
         Err(e) => {
             eprintln!("Warning: desired state not available: {}", e);
-            return Ok(()); // skip this tick
+            return Ok(());
         }
     };
-    let items: Vec<GenericItem> = serde_json::from_slice(&data).context("parsing desired state")?;
+
+    let items: Vec<GenericItem> =
+        serde_json::from_slice(&data).context("Failed to parse desired state from store")?;
 
     let mut desired_pods = vec![];
     for item in items {
         if item.kind == "pod" {
             if let Some(fields_val) = item.fields {
                 let fields: PodFields =
-                    serde_json::from_value(fields_val).context("parsing pod fields")?;
+                    serde_json::from_value(fields_val).context("Failed to parse pod fields")?;
                 desired_pods.push(PodSpec {
                     name: item.name,
                     image: fields.image,
@@ -32,41 +34,43 @@ pub fn reconcile_loop(store: &impl Store) -> Result<()> {
         }
     }
 
-    let running = docker::list_running_containers().context("listing containers")?;
+    let running = docker::list_running_containers().context("Failed to list running containers")?;
 
-    let handles: Vec<_> = desired_pods
-        .into_iter()
-        .map(|pod| {
-            let running = running.clone();
-            thread::spawn(move || {
-                let matches: Vec<_> = running
-                    .iter()
-                    .filter(|c| c.starts_with(&format!("{}-", pod.name)))
-                    .collect();
-                if matches.len() < pod.replicas {
-                    for _ in 0..(pod.replicas - matches.len()) {
-                        let cname = format!(
-                            "{}-{}",
-                            pod.name,
-                            chrono::Utc::now().timestamp_nanos_opt().unwrap()
-                        );
-                        if let Err(e) = docker::start_container(&cname, &pod.image, &pod.ports) {
-                            eprintln!("Failed to start {}: {}", cname, e);
-                        }
-                    }
-                } else if matches.len() > pod.replicas {
-                    for cname in matches.iter().take(matches.len() - pod.replicas) {
-                        if let Err(e) = docker::stop_container(cname) {
-                            eprintln!("Failed to stop {}: {}", cname, e);
-                        }
+    let mut tasks = vec![];
+
+    for pod in desired_pods {
+        let running = running.clone();
+        let task = tokio::spawn(async move {
+            let matches: Vec<_> = running
+                .iter()
+                .filter(|c| c.starts_with(&format!("{}-", pod.name)))
+                .collect();
+
+            if matches.len() < pod.replicas {
+                for _ in 0..(pod.replicas - matches.len()) {
+                    let cname =
+                        format!("{}-{}", pod.name, Utc::now().timestamp_nanos_opt().unwrap());
+                    if let Err(e) = docker::start_container(&cname, &pod.image, &pod.ports) {
+                        eprintln!("Failed to start {}: {}", cname, e);
                     }
                 }
-            })
-        })
-        .collect();
+            } else if matches.len() > pod.replicas {
+                for cname in matches.iter().take(matches.len() - pod.replicas) {
+                    if let Err(e) = docker::stop_container(cname) {
+                        eprintln!("Failed to stop {}: {}", cname, e);
+                    }
+                }
+            }
+        });
 
-    for h in handles {
-        let _ = h.join();
+        tasks.push(task);
+    }
+
+    // Await all pod reconcile tasks
+    for task in tasks {
+        if let Err(e) = task.await {
+            eprintln!("Pod reconcile task failed: {}", e);
+        }
     }
 
     Ok(())
