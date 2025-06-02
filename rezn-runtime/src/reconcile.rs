@@ -50,9 +50,15 @@ pub async fn reconcile(store: &(dyn Store + Send + Sync)) -> Result<()> {
                 for _ in 0..(pod.replicas - matches.len()) {
                     let cname =
                         format!("{}-{}", pod.name, Utc::now().timestamp_nanos_opt().unwrap());
-                    if let Err(e) = docker::start_container(&cname, &pod.image, &pod.ports) {
-                        eprintln!("Failed to start {}: {}", cname, e);
-                    }
+                    let image = pod.image.clone();
+                    let ports = pod.ports.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = docker::start_container(&cname, &image, &ports) {
+                            eprintln!("Failed to start {}: {}", cname, e);
+                        }
+                    })
+                    .await
+                    .ok(); // ignore JoinError but keep the async flow non-blocking
                 }
             } else if matches.len() > pod.replicas {
                 for cname in matches.iter().take(matches.len() - pod.replicas) {
