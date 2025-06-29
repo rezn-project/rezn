@@ -102,9 +102,23 @@ impl OrqosClient {
             .post(format!("{}/containers/{}/stop", self.base_url, name))
             .send()
             .await
-            .context("Failed to send delete request")?
+            .context("Failed to send stop container request")?
             .error_for_status()
             .context("Failed to stop container")?;
+        Ok(())
+    }
+
+    pub async fn remove_container(&self, name: &str) -> Result<()> {
+        self.client
+            .post(format!("{}/containers/{}/remove", self.base_url, name))
+            .json(&serde_json::json!({
+                "force": true,
+            }))
+            .send()
+            .await
+            .context("Failed to send remove container request")?
+            .error_for_status()
+            .context("Failed to remove container")?;
         Ok(())
     }
 }

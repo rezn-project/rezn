@@ -108,6 +108,10 @@ pub async fn reconcile(store: &(dyn Store + Send + Sync), orqos: &OrqosClient) -
                         if let Err(e) = orqos.stop_container(name).await {
                             tracing::warn!("Failed to stop {}: {}", name, e);
                         }
+
+                        if let Err(e) = orqos.remove_container(name).await {
+                            tracing::warn!("Failed to remove {}: {}", name, e);
+                        }
                     } else {
                         tracing::warn!("Container {} has no name?!", c.id);
                     }
