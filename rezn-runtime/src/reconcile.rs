@@ -1,35 +1,48 @@
-use crate::{
-    orqos_client::OrqosClient,
-    store::Store,
-    types::{GenericItem, PodFields, PodSpec},
-};
+use crate::{orqos_client::OrqosClient, store::Store};
 use anyhow::{Context, Result};
 use chrono::Utc;
+use common::types::{DesiredMap, PodFields, PodSpec};
 
 pub async fn reconcile(store: &(dyn Store + Send + Sync), orqos: &OrqosClient) -> Result<()> {
+    tracing::debug!("Reconcile: starting");
+
     let data = match store.read("desired") {
         Ok(data) => data,
         Err(e) => {
-            eprintln!("Warning: desired state not available: {}", e);
+            tracing::warn!("Warning: desired state not available: {}", e);
             return Ok(());
         }
     };
 
-    let items: Vec<GenericItem> =
-        serde_json::from_slice(&data).context("Failed to parse desired state from store")?;
+    tracing::debug!("Reconcile: read desired state from store");
 
-    let mut desired_pods = vec![];
-    for item in items {
-        if item.kind == "pod" {
-            if let Some(fields_val) = item.fields {
-                let fields: PodFields =
-                    serde_json::from_value(fields_val).context("Failed to parse pod fields")?;
-                desired_pods.push(PodSpec {
-                    name: item.name,
-                    image: fields.image,
-                    replicas: fields.replicas,
-                    ports: fields.ports,
-                });
+    let desired: DesiredMap =
+        serde_json::from_slice(&data).context("Failed to parse desired state as molecule map")?;
+
+    tracing::debug!(
+        "Reconcile: parsed {} items from desired state",
+        desired.len()
+    );
+
+    let mut desired_pods = Vec::<PodSpec>::new();
+
+    for (mol_name, atoms) in &desired {
+        for item in atoms {
+            if item.kind == "pod" {
+                if let Some(_) = &item.fields {
+                    let fields_val = item.fields.clone().context("pod missing 'fields'")?;
+                    let fields: PodFields =
+                        serde_json::from_value(fields_val).with_context(|| {
+                            format!("Failed to parse pod fields in molecule '{mol_name}'")
+                        })?;
+
+                    desired_pods.push(PodSpec {
+                        name: item.name.clone(),
+                        image: fields.image,
+                        replicas: fields.replicas,
+                        ports: fields.ports,
+                    });
+                }
             }
         }
     }
@@ -65,16 +78,12 @@ pub async fn reconcile(store: &(dyn Store + Send + Sync), orqos: &OrqosClient) -
                     let orqos = orqos.clone();
                     let parent_name = pod_name.clone();
 
-                    tokio::spawn(async move {
-                        if let Err(e) = orqos
-                            .start_container(&cname, &image, &ports, &parent_name)
-                            .await
-                        {
-                            eprintln!("Failed to start {}: {}", cname, e);
-                        }
-                    })
-                    .await
-                    .ok(); // ignore JoinError but keep the async flow non-blocking
+                    if let Err(e) = orqos
+                        .start_container(&cname, &image, &ports, &parent_name)
+                        .await
+                    {
+                        eprintln!("Failed to start {}: {}", cname, e);
+                    }
                 }
             } else if matches.len() > pod_replicas {
                 for cname in matches.iter().take(matches.len() - pod_replicas) {

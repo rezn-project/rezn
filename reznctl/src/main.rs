@@ -1,20 +1,21 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose, Engine};
+use common::types::{DesiredMap, Molecule, MoleculeMeta};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey as PublicKey};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use sled;
-use std::{env, fs};
+use std::{collections::BTreeMap, env, fs};
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        eprintln!("Usage: reznctl-apply <signed-ir.json> <sled-db-path>");
+    if args.len() != 4 {
+        eprintln!("Usage: reznctl-apply <name> <signed-ir.json> <sled-db-path>");
         std::process::exit(1);
     }
 
-    let json_path = &args[1];
-    let sled_path = &args[2];
+    let name = &args[1];
+    let json_path = &args[2];
+    let sled_path = &args[3];
     let raw = fs::read_to_string(json_path).context("reading IR file")?;
     let json: Value = serde_json::from_str(&raw).context("parsing JSON")?;
 
@@ -71,10 +72,74 @@ fn main() -> Result<()> {
     let ts_key = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let full_key = format!("conf/{}", ts_key);
 
-    db.insert(full_key.as_bytes(), raw.as_bytes())
-        .context("inserting conf")?;
-    db.insert("conf/latest", ts_key.as_bytes())
-        .context("setting latest conf")?;
+    let program_array = program.as_array().context("'program' must be an array")?;
+
+    let mut items: DesiredMap = if let Some(bytes) = db.get("desired")? {
+        match serde_json::from_slice(&bytes) {
+            Ok(map) => map,
+            Err(e) => {
+                eprintln!(
+                    "Error: failed to deserialize 'desired' as a molecule map.\n\
+                This likely means the DB contains an old format (e.g., a flat list of atoms).\n\
+                Details: {}\n\
+                Tip: wipe ./rezn-data or migrate the format manually.",
+                    e
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        BTreeMap::new()
+    };
+
+    if items.contains_key(name) {
+        eprintln!("Warning: overwriting existing entry for '{}'", name);
+    }
+
+    items.insert(
+        name.to_string(),
+        program_array
+            .iter()
+            .map(|item| {
+                serde_json::from_value(item.clone()).context("parsing item in 'program' array")
+            })
+            .collect::<Result<Vec<Molecule>>>()?,
+    );
+
+    let updated = serde_json::to_vec(&items).context("serializing updated desired state")?;
+    db.insert("desired", updated)?;
+
+    // ---
+
+    let now = chrono::Utc::now();
+
+    let atoms = program_array
+        .iter()
+        .map(|item| {
+            let obj = item.as_object().context("expected object in 'program'")?;
+            let kind = obj
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .context("missing 'kind'")?;
+            let name = obj
+                .get("name")
+                .and_then(|n| n.as_str())
+                .context("missing 'name'")?;
+            Ok((kind.to_string(), name.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let meta: MoleculeMeta = MoleculeMeta {
+        sig_id: sig_b64.to_string(),
+        applied_at: now,
+        atoms,
+    };
+
+    let meta_key = format!("molecule/{}", name);
+    let meta_value = serde_json::to_vec(&meta)?;
+    db.insert(meta_key, meta_value)?;
+
+    // ---
 
     db.flush()?;
 

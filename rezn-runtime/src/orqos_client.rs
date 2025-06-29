@@ -9,6 +9,20 @@ pub struct OrqosClient {
     client: Client,
 }
 
+#[derive(Serialize, Debug)]
+struct CreateReq<'a> {
+    name: &'a str,
+    image: &'a str,
+    ports: Vec<PortMap>,
+    labels: HashMap<String, String>,
+}
+
+#[derive(Serialize, Debug)]
+struct PortMap {
+    container: u16,
+    host: u16,
+}
+
 impl OrqosClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
@@ -42,20 +56,6 @@ impl OrqosClient {
         ports: &[u16],
         pod_name: &str,
     ) -> Result<()> {
-        #[derive(Serialize)]
-        struct CreateReq<'a> {
-            name: &'a str,
-            image: &'a str,
-            ports: Vec<PortMap>,
-            labels: HashMap<String, String>,
-        }
-
-        #[derive(Serialize)]
-        struct PortMap {
-            container: u16,
-            host: u16,
-        }
-
         let labels = HashMap::from([("pod".into(), pod_name.into())]);
 
         let port_maps: Vec<PortMap> = ports
@@ -72,6 +72,11 @@ impl OrqosClient {
             ports: port_maps,
             labels,
         };
+
+        tracing::debug!(
+            "Creating container request:\n{}",
+            serde_json::to_string_pretty(&req).unwrap()
+        );
 
         self.client
             .post(format!("{}/containers", self.base_url))
