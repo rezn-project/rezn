@@ -2,6 +2,7 @@ use crate::{orqos_client::OrqosClient, store::Store};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use common::types::{DesiredMap, PodFields, PodSpec};
+use std::collections::HashMap;
 
 pub async fn reconcile(store: &(dyn Store + Send + Sync), orqos: &OrqosClient) -> Result<()> {
     tracing::debug!("Reconcile: starting");
@@ -37,6 +38,7 @@ pub async fn reconcile(store: &(dyn Store + Send + Sync), orqos: &OrqosClient) -
                         })?;
 
                     desired_pods.push(PodSpec {
+                        mol_name: mol_name.clone(),
                         name: item.name.clone(),
                         image: fields.image,
                         replicas: fields.replicas,
@@ -50,17 +52,25 @@ pub async fn reconcile(store: &(dyn Store + Send + Sync), orqos: &OrqosClient) -
     let mut tasks = vec![];
 
     for pod in desired_pods {
+        let pod_label = format!("{}:{}", pod.mol_name, pod.name);
+
         let running = orqos
-            .list_pod_containers(&pod.name)
+            .list_pod_containers(&pod_label)
             .await
             .context("Failed to query Orqos for running containers")?;
 
         // Clone all necessary data before moving into the async block
+        let mol_name = pod.mol_name.clone();
         let pod_name = pod.name.clone();
         let pod_image = pod.image.clone();
         let pod_ports = pod.ports.clone();
         let pod_replicas = pod.replicas;
         let orqos = orqos.clone();
+        let mut labels: HashMap<String, String> = HashMap::new();
+
+        labels.insert("mol".to_string(), format!("{}", pod.mol_name));
+        labels.insert("pod".to_string(), pod_label.clone());
+
         let running = running.clone();
 
         let task = tokio::spawn(async move {
@@ -71,15 +81,18 @@ pub async fn reconcile(store: &(dyn Store + Send + Sync), orqos: &OrqosClient) -
 
             if matches.len() < pod_replicas {
                 for _ in 0..(pod_replicas - matches.len()) {
-                    let cname =
-                        format!("{}-{}", pod_name, Utc::now().timestamp_nanos_opt().unwrap());
+                    let cname = format!(
+                        "{}-{}-{}",
+                        mol_name,
+                        pod_name,
+                        Utc::now().timestamp_nanos_opt().unwrap()
+                    );
                     let image = pod_image.clone();
                     let ports = pod_ports.clone();
                     let orqos = orqos.clone();
-                    let parent_name = pod_name.clone();
 
                     if let Err(e) = orqos
-                        .start_container(&cname, &image, &ports, &parent_name)
+                        .start_container(&cname, &image, &ports, labels.clone())
                         .await
                     {
                         eprintln!("Failed to start {}: {}", cname, e);

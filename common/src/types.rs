@@ -29,6 +29,7 @@ pub struct PodFields {
 }
 
 pub struct PodSpec {
+    pub mol_name: String,
     pub name: String,
     pub image: String,
     pub replicas: usize,

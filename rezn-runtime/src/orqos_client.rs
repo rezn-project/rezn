@@ -34,11 +34,11 @@ impl OrqosClient {
         }
     }
 
-    pub async fn list_pod_containers(&self, pod_name: &str) -> Result<Vec<String>> {
+    pub async fn list_pod_containers(&self, pod_label: &str) -> Result<Vec<String>> {
         let res = self
             .client
             .get(format!("{}/containers", self.base_url))
-            .query(&[("label", format!("pod:{}", pod_name))])
+            .query(&[("label", pod_label)])
             .send()
             .await
             .context("Failed to send list request")?
@@ -54,10 +54,8 @@ impl OrqosClient {
         name: &str,
         image: &str,
         ports: &[u16],
-        pod_name: &str,
+        labels: HashMap<String, String>,
     ) -> Result<()> {
-        let labels = HashMap::from([("pod".into(), pod_name.into())]);
-
         let port_maps: Vec<PortMap> = ports
             .iter()
             .map(|p| PortMap {
