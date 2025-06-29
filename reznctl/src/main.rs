@@ -20,6 +20,9 @@ fn main() -> Result<()> {
         "name": name,
         "molecule_wrapper": serde_json::from_str::<Value>(&raw).context("parsing JSON")?,
     });
+
+    print!("{}", payload.to_string());
+
     let response = client
         .post(&*url)
         .json(&payload)

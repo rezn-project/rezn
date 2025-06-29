@@ -9,6 +9,7 @@ pub type DesiredMap = BTreeMap<String, Vec<Molecule>>;
 #[derive(Serialize, Deserialize, Debug, ToSchema)]
 pub struct Signature {
     pub algorithm: String,
+    #[serde(rename = "pub")]
     pub pubkey: String,
     pub sig: String,
 }
@@ -30,7 +31,11 @@ pub struct MoleculeMeta {
 pub struct Molecule {
     pub kind: String,
     pub name: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fields: Option<serde_json::Value>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<Vec<String>>,
 }
 

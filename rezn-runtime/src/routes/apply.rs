@@ -5,6 +5,7 @@ use base64::Engine;
 use common::types::{DesiredMap, MoleculeMeta, MoleculeWrapper};
 use reqwest::StatusCode;
 use serde::Deserialize;
+use serde_json_canonicalizer::to_vec;
 use std::{collections::BTreeMap, sync::Arc};
 use utoipa::ToSchema;
 
@@ -25,6 +26,11 @@ pub struct ApplyPayload {
 #[utoipa::path(
     post,
     path = "/apply",
+    request_body(
+        content = ApplyPayload,
+        description = "Payload to create a container",
+        content_type = "application/json",
+    ),
     responses(
         (status = 200, body = Object)
     ),
@@ -34,6 +40,8 @@ pub async fn apply_handler(
     State(app): State<Arc<AppState>>,
     Json(payload): Json<ApplyPayload>,
 ) -> Result<Json<bool>, AppError> {
+    tracing::debug!("Applying payload");
+
     let name = payload.name;
     let molecule_wrapper = payload.molecule_wrapper;
 
@@ -42,7 +50,7 @@ pub async fn apply_handler(
     let sig_b64 = &sig.sig;
     let algorithm = &sig.algorithm;
     let program = &molecule_wrapper.program;
-    let program_raw = serde_json::to_vec(program).map_err(app_error)?;
+    let program_raw = to_vec(program).map_err(app_error)?;
 
     if algorithm != "ed25519" {
         return Err(app_error(format!(
@@ -80,7 +88,7 @@ pub async fn apply_handler(
     };
 
     if desired_state_map.contains_key(&name) {
-        eprintln!("Warning: overwriting existing entry for '{}'", name);
+        tracing::info!("Warning: overwriting existing entry for '{}'", name);
     }
 
     desired_state_map.insert(name.to_string(), program.to_vec());
