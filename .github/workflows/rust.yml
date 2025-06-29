@@ -1,0 +1,30 @@
+name: Rust
+
+on:
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Add x86_64 target
+      run: rustup target add x86_64-unknown-linux-gnu
+    - name: Build
+      run: cargo build --verbose --release --target x86_64-unknown-linux-gnu
+    - name: Rename the rezn binary
+      run: mv target/x86_64-unknown-linux-gnu/release/rezn target/x86_64-unknown-linux-gnu/release/rezn-x86_64-unknown-linux-gnu
+    - name: Rename the reznctl binary
+      run: mv target/x86_64-unknown-linux-gnu/release/reznctl target/x86_64-unknown-linux-gnu/release/reznctl-x86_64-unknown-linux-gnu
+    - name: Upload release artifacts
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          target/x86_64-unknown-linux-gnu/release/rezn-x86_64-unknown-linux-gnu
+          target/x86_64-unknown-linux-gnu/release/reznctl-x86_64-unknown-linux-gnu
+      env:
+        GITHUB_TOKEN: ${{ secrets.GH_PAT }}
