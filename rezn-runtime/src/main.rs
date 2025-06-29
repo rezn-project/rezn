@@ -7,7 +7,10 @@ mod routes;
 use std::env;
 use std::sync::Arc;
 
-use crate::{reconcile::reconcile, routes::state::get_state_handler};
+use crate::{
+    reconcile::reconcile,
+    routes::state::{get_state_handler, get_state_raw_handler},
+};
 use axum::{routing::get, Router};
 use store::SledStore;
 use utoipa::OpenApi;
@@ -24,13 +27,17 @@ struct AppState {
 #[derive(OpenApi)]
 #[openapi(
     info(description = "Rezn Api"),
-    paths(crate::routes::state::get_state_handler,)
+    paths(
+        crate::routes::state::get_state_handler,
+        crate::routes::state::get_state_raw_handler,
+    )
 )]
 struct ApiDoc;
 
 pub(crate) fn build_router(app: Arc<AppState>) -> Router {
     Router::new()
         .route("/state", get(get_state_handler))
+        .route("/state/raw", get(get_state_raw_handler))
         .with_state(app)
         .merge(
             utoipa_swagger_ui::SwaggerUi::new("/swagger")
@@ -111,8 +118,9 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let listener = TcpListener::bind("0.0.0.0:4000").await?;
-    tracing::info!("Listening on 0.0.0.0:4000");
+    let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:4000".into());
+    let listener = TcpListener::bind(&bind_addr).await?;
+    tracing::info!("Listening on {}", bind_addr);
 
     let router = build_router(app_state);
 
