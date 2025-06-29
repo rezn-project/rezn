@@ -22,9 +22,14 @@ async fn main() -> anyhow::Result<()> {
     let is_reconciling = Arc::new(AtomicBool::new(false));
     let store = Arc::clone(&store);
 
-    let orqos_client = orqos_client::OrqosClient::new(
-        env::var("ORQOS_API_URL").unwrap_or_else(|_| "http://localhost:3000".into()),
-    );
+    let orqos_url = env::var("ORQOS_API_URL").unwrap_or_else(|_| "http://localhost:3000".into());
+    // Validate URL format
+    if !orqos_url.starts_with("http://") && !orqos_url.starts_with("https://") {
+        return Err(anyhow::anyhow!(
+            "Invalid ORQOS_API_URL: must start with http:// or https://"
+        ));
+    }
+    let orqos_client = orqos_client::OrqosClient::new(orqos_url);
 
     // Spawn reconcile listener
     let is_reconciling_clone = Arc::clone(&is_reconciling);

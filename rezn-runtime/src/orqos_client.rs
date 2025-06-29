@@ -13,7 +13,10 @@ impl OrqosClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(20))
+                .build()
+                .expect("Failed to build HTTP client"),
         }
     }
 
