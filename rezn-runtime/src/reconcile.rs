@@ -30,10 +30,9 @@ pub async fn reconcile(store: &(dyn Store + Send + Sync), orqos: &OrqosClient) -
     for (mol_name, atoms) in &desired {
         for item in atoms {
             if item.kind == "pod" {
-                if let Some(_) = &item.fields {
-                    let fields_val = item.fields.clone().context("pod missing 'fields'")?;
-                    let fields: PodFields =
-                        serde_json::from_value(fields_val).with_context(|| {
+                if let Some(fields_val) = &item.fields {
+                    let fields: PodFields = serde_json::from_value(fields_val.clone())
+                        .with_context(|| {
                             format!("Failed to parse pod fields in molecule '{mol_name}'")
                         })?;
 
@@ -85,7 +84,7 @@ pub async fn reconcile(store: &(dyn Store + Send + Sync), orqos: &OrqosClient) -
                         "{}-{}-{}",
                         mol_name,
                         pod_name,
-                        Utc::now().timestamp_nanos_opt().unwrap()
+                        Utc::now().timestamp_nanos_opt().unwrap_or_default()
                     );
                     let image = pod_image.clone();
                     let ports = pod_ports.clone();
