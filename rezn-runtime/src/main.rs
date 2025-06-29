@@ -2,14 +2,48 @@ mod orqos_client;
 mod reconcile;
 mod store;
 
+mod routes;
+
 use std::env;
 use std::sync::Arc;
 
-use crate::reconcile::reconcile;
+use crate::{
+    reconcile::reconcile,
+    routes::state::{get_state_handler, get_state_raw_handler},
+};
+use axum::{routing::get, Router};
 use store::SledStore;
+use utoipa::OpenApi;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::mpsc;
+use tokio::{net::TcpListener, sync::mpsc};
+
+#[derive(Clone)]
+struct AppState {
+    store: Arc<dyn store::Store + Send + Sync>,
+    orqos: Arc<orqos_client::OrqosClient>,
+}
+
+#[derive(OpenApi)]
+#[openapi(
+    info(description = "Rezn Api"),
+    paths(
+        crate::routes::state::get_state_handler,
+        crate::routes::state::get_state_raw_handler,
+    )
+)]
+struct ApiDoc;
+
+pub(crate) fn build_router(app: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/state", get(get_state_handler))
+        .route("/state/raw", get(get_state_raw_handler))
+        .with_state(app)
+        .merge(
+            utoipa_swagger_ui::SwaggerUi::new("/swagger")
+                .url("/api/openapi.json", ApiDoc::openapi()),
+        )
+}
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -25,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (tx, mut rx) = mpsc::channel::<()>(1);
     let is_reconciling = Arc::new(AtomicBool::new(false));
-    let store = Arc::clone(&store);
+    // let store = Arc::clone(&store);
 
     tracing::info!("Setting up ORQOS API client");
 
@@ -36,11 +70,13 @@ async fn main() -> anyhow::Result<()> {
             "Invalid ORQOS_API_URL: must start with http:// or https://"
         ));
     }
-    let orqos_client = orqos_client::OrqosClient::new(&orqos_url);
+    let orqos = Arc::new(orqos_client::OrqosClient::new(&orqos_url));
 
     tracing::info!("ORQOS API client initialized with URL: {}", orqos_url);
 
-    // Spawn reconcile listener
+    let app_state = Arc::new(AppState { store, orqos });
+
+    let reconcile_state = Arc::clone(&app_state);
     let is_reconciling_clone = Arc::clone(&is_reconciling);
     tokio::spawn(async move {
         while let Some(_) = rx.recv().await {
@@ -51,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
                 .is_ok()
             {
                 tracing::debug!("[reconcile] Begin");
-                if let Err(e) = reconcile(&*store, &orqos_client).await {
+                if let Err(e) = reconcile(&*reconcile_state.store, &*reconcile_state.orqos).await {
                     tracing::error!("[reconcile] Error: {}", e);
                 }
 
@@ -82,11 +118,19 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Handle Ctrl-C gracefully
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to listen for ctrl-c");
-    tracing::info!("Received Ctrl-C, shutting down...");
+    let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:4000".into());
+    let listener = TcpListener::bind(&bind_addr).await?;
+    tracing::info!("Listening on {}", bind_addr);
+
+    let router = build_router(app_state);
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to install Ctrl-C handler");
+        })
+        .await?;
 
     Ok(())
 }
