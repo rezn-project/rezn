@@ -4,6 +4,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use common::types::DesiredMap;
 use reqwest::StatusCode;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::AppState;
@@ -23,8 +24,19 @@ pub async fn get_state_handler(
 ) -> Result<Json<DesiredMap>, AppError> {
     tracing::debug!("Retrieving current state");
 
-    let data = app.store.read("desired").map_err(app_error)?;
-    let desired: DesiredMap = serde_json::from_slice(&data).map_err(app_error)?;
+    let desired: DesiredMap = match app.db.get("desired").map_err(app_error)? {
+        Some(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::warn!("Invalid 'desired' state, falling back to empty: {e}");
+                BTreeMap::new()
+            }
+        },
+        None => {
+            tracing::debug!("No 'desired' state found, returning empty");
+            BTreeMap::new()
+        }
+    };
 
     Ok(Json(desired))
 }
@@ -38,7 +50,10 @@ pub async fn get_state_handler(
     tag = "State",
 )]
 pub async fn get_state_raw_handler(State(app): State<Arc<AppState>>) -> Result<Response, AppError> {
-    let data = app.store.read("desired").map_err(app_error)?;
+    let data = match app.db.get("desired").map_err(app_error)? {
+        Some(ivec) => Bytes::from(ivec.to_vec()),
+        None => Bytes::copy_from_slice(b"{}"),
+    };
     Ok(([("Content-Type", "application/json")], Bytes::from(data)).into_response())
 }
 

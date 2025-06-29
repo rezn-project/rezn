@@ -234,6 +234,8 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "utoipa",
+ "utoipa-swagger-ui",
 ]
 
 [[package]]
@@ -1473,13 +1475,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "chrono",
  "common",
  "ctrlc",
+ "ed25519-dalek",
+ "hex",
  "log",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "sled",
  "tokio",
  "tracing",
@@ -1494,15 +1500,10 @@ name = "reznctl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64",
- "chrono",
  "common",
- "ed25519-dalek",
- "hex",
+ "reqwest",
  "serde",
  "serde_json",
- "sha2",
- "sled",
 ]
 
 [[package]]

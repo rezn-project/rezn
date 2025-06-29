@@ -1,6 +1,5 @@
 mod orqos_client;
 mod reconcile;
-mod store;
 
 mod routes;
 
@@ -9,10 +8,16 @@ use std::sync::Arc;
 
 use crate::{
     reconcile::reconcile,
-    routes::state::{get_state_handler, get_state_raw_handler},
+    routes::{
+        apply::apply_handler,
+        state::{get_state_handler, get_state_raw_handler},
+    },
 };
-use axum::{routing::get, Router};
-use store::SledStore;
+use axum::{
+    routing::{get, post},
+    Router,
+};
+use sled::Db;
 use utoipa::OpenApi;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +25,7 @@ use tokio::{net::TcpListener, sync::mpsc};
 
 #[derive(Clone)]
 struct AppState {
-    store: Arc<dyn store::Store + Send + Sync>,
+    db: Arc<Db>,
     orqos: Arc<orqos_client::OrqosClient>,
 }
 
@@ -28,6 +33,7 @@ struct AppState {
 #[openapi(
     info(description = "Rezn Api"),
     paths(
+        crate::routes::apply::apply_handler,
         crate::routes::state::get_state_handler,
         crate::routes::state::get_state_raw_handler,
     )
@@ -36,6 +42,7 @@ struct ApiDoc;
 
 pub(crate) fn build_router(app: Arc<AppState>) -> Router {
     Router::new()
+        .route("/apply", post(apply_handler))
         .route("/state", get(get_state_handler))
         .route("/state/raw", get(get_state_raw_handler))
         .with_state(app)
@@ -51,11 +58,12 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting Rezn Runtime");
 
-    let db_path = env::args().nth(1).unwrap_or_else(|| "./rezn-data".into());
+    let db_path: String = env::args().nth(1).unwrap_or_else(|| "./rezn-data".into());
+    let db_path_clone = db_path.clone();
 
-    let store: Arc<dyn store::Store + Send + Sync> = Arc::new(SledStore::new(&db_path)?);
+    let db: Arc<Db> = Arc::new(sled::open(db_path)?);
 
-    tracing::info!("Starting Rezn Runtime with database at: {}", db_path);
+    tracing::info!("Starting Rezn Runtime with database at: {}", db_path_clone);
 
     let (tx, mut rx) = mpsc::channel::<()>(1);
     let is_reconciling = Arc::new(AtomicBool::new(false));
@@ -74,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("ORQOS API client initialized with URL: {}", orqos_url);
 
-    let app_state = Arc::new(AppState { store, orqos });
+    let app_state = Arc::new(AppState { db, orqos });
 
     let reconcile_state = Arc::clone(&app_state);
     let is_reconciling_clone = Arc::clone(&is_reconciling);
@@ -87,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
                 .is_ok()
             {
                 tracing::debug!("[reconcile] Begin");
-                if let Err(e) = reconcile(&*reconcile_state.store, &*reconcile_state.orqos).await {
+                if let Err(e) = reconcile(&*reconcile_state.db, &*reconcile_state.orqos).await {
                     tracing::error!("[reconcile] Error: {}", e);
                 }
 
