@@ -8,6 +8,7 @@ description = "Minimal Rust runtime for executing signed IR emitted by the Rezn 
 repository = "https://github.com/rezn-project/rezn"
 
 [dependencies]
+common = { path = "../common" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
@@ -21,3 +22,12 @@ tokio = { version = "1.45.1", features = [
     "macros",
     "sync",
 ] }
+reqwest = { version = "0.12.20", features = [
+    "json",
+    "cookies",
+    "stream",
+    "blocking",
+] }
+log = "0.4.27"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"

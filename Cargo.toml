@@ -1,2 +1,2 @@
 [workspace]
-members = ["rezn-runtime", "reznctl"]
+members = ["rezn-runtime", "reznctl", "common"]
