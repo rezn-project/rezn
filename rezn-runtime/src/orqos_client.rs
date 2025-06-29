@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Clone)]
@@ -23,6 +23,15 @@ struct PortMap {
     host: u16,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ContainerSummary {
+    #[serde(rename = "Id")]
+    pub id: String,
+    #[serde(rename = "Names")]
+    pub names: Vec<String>,
+}
+
 impl OrqosClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
@@ -34,15 +43,15 @@ impl OrqosClient {
         }
     }
 
-    pub async fn list_pod_containers(&self, pod_label: &str) -> Result<Vec<String>> {
+    pub async fn list_pod_containers(&self, pod_label: &str) -> Result<Vec<ContainerSummary>> {
         let res = self
             .client
             .get(format!("{}/containers", self.base_url))
-            .query(&[("label", pod_label)])
+            .query(&[("label", format!("pod={}", pod_label))])
             .send()
             .await
             .context("Failed to send list request")?
-            .json::<Vec<String>>()
+            .json::<Vec<ContainerSummary>>()
             .await
             .context("Failed to parse list response")?;
 
@@ -90,7 +99,7 @@ impl OrqosClient {
 
     pub async fn stop_container(&self, name: &str) -> Result<()> {
         self.client
-            .delete(format!("{}/containers/{}", self.base_url, name))
+            .post(format!("{}/containers/{}/stop", self.base_url, name))
             .send()
             .await
             .context("Failed to send delete request")?

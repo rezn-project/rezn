@@ -75,12 +75,17 @@ pub async fn reconcile(store: &(dyn Store + Send + Sync), orqos: &OrqosClient) -
         let task = tokio::spawn(async move {
             let matches: Vec<_> = running
                 .iter()
-                .filter(|c| c.starts_with(&format!("{}-", pod_name)))
+                .filter(|c| {
+                    c.names.iter().any(|n| {
+                        n.trim_start_matches('/')
+                            .starts_with(&format!("{}-{}-", mol_name, pod_name))
+                    })
+                })
                 .collect();
 
             if matches.len() < pod_replicas {
                 for _ in 0..(pod_replicas - matches.len()) {
-                    let cname = format!(
+                    let cname: String = format!(
                         "{}-{}-{}",
                         mol_name,
                         pod_name,
@@ -94,13 +99,17 @@ pub async fn reconcile(store: &(dyn Store + Send + Sync), orqos: &OrqosClient) -
                         .start_container(&cname, &image, &ports, labels.clone())
                         .await
                     {
-                        eprintln!("Failed to start {}: {}", cname, e);
+                        tracing::warn!("Failed to start {}: {}", cname, e);
                     }
                 }
             } else if matches.len() > pod_replicas {
-                for cname in matches.iter().take(matches.len() - pod_replicas) {
-                    if let Err(e) = orqos.stop_container(cname).await {
-                        eprintln!("Failed to stop {}: {}", cname, e);
+                for c in matches.iter().take(matches.len() - pod_replicas) {
+                    if let Some(name) = c.names.first().map(|s| s.trim_start_matches('/')) {
+                        if let Err(e) = orqos.stop_container(name).await {
+                            tracing::warn!("Failed to stop {}: {}", name, e);
+                        }
+                    } else {
+                        tracing::warn!("Container {} has no name?!", c.id);
                     }
                 }
             }
