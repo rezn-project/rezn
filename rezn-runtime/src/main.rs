@@ -1,4 +1,4 @@
-mod docker;
+mod orqos_client;
 mod reconcile;
 mod store;
 mod types;
@@ -22,6 +22,10 @@ async fn main() -> anyhow::Result<()> {
     let is_reconciling = Arc::new(AtomicBool::new(false));
     let store = Arc::clone(&store);
 
+    let orqos_client = orqos_client::OrqosClient::new(
+        env::var("ORQOS_API_URL").unwrap_or_else(|_| "http://localhost:3000".into()),
+    );
+
     // Spawn reconcile listener
     let is_reconciling_clone = Arc::clone(&is_reconciling);
     tokio::spawn(async move {
@@ -31,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
                 .is_ok()
             {
                 eprintln!("[reconcile] Begin");
-                if let Err(e) = reconcile(&*store).await {
+                if let Err(e) = reconcile(&*store, &orqos_client).await {
                     eprintln!("[reconcile] Error: {}", e);
                 }
 

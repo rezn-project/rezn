@@ -1,12 +1,12 @@
 use crate::{
-    docker,
+    orqos_client::OrqosClient,
     store::Store,
     types::{GenericItem, PodFields, PodSpec},
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
 
-pub async fn reconcile(store: &(dyn Store + Send + Sync)) -> Result<()> {
+pub async fn reconcile(store: &(dyn Store + Send + Sync), orqos: &OrqosClient) -> Result<()> {
     let data = match store.read("desired") {
         Ok(data) => data,
         Err(e) => {
@@ -34,35 +34,51 @@ pub async fn reconcile(store: &(dyn Store + Send + Sync)) -> Result<()> {
         }
     }
 
-    let running = docker::list_running_containers().context("Failed to list running containers")?;
-
     let mut tasks = vec![];
 
     for pod in desired_pods {
+        let running = orqos
+            .list_pod_containers(&pod.name)
+            .await
+            .context("Failed to query Orqos for running containers")?;
+
+        // Clone all necessary data before moving into the async block
+        let pod_name = pod.name.clone();
+        let pod_image = pod.image.clone();
+        let pod_ports = pod.ports.clone();
+        let pod_replicas = pod.replicas;
+        let orqos = orqos.clone();
         let running = running.clone();
+
         let task = tokio::spawn(async move {
             let matches: Vec<_> = running
                 .iter()
-                .filter(|c| c.starts_with(&format!("{}-", pod.name)))
+                .filter(|c| c.starts_with(&format!("{}-", pod_name)))
                 .collect();
 
-            if matches.len() < pod.replicas {
-                for _ in 0..(pod.replicas - matches.len()) {
+            if matches.len() < pod_replicas {
+                for _ in 0..(pod_replicas - matches.len()) {
                     let cname =
-                        format!("{}-{}", pod.name, Utc::now().timestamp_nanos_opt().unwrap());
-                    let image = pod.image.clone();
-                    let ports = pod.ports.clone();
-                    tokio::task::spawn_blocking(move || {
-                        if let Err(e) = docker::start_container(&cname, &image, &ports) {
+                        format!("{}-{}", pod_name, Utc::now().timestamp_nanos_opt().unwrap());
+                    let image = pod_image.clone();
+                    let ports = pod_ports.clone();
+                    let orqos = orqos.clone();
+                    let parent_name = pod_name.clone();
+
+                    tokio::spawn(async move {
+                        if let Err(e) = orqos
+                            .start_container(&cname, &image, &ports, &parent_name)
+                            .await
+                        {
                             eprintln!("Failed to start {}: {}", cname, e);
                         }
                     })
                     .await
                     .ok(); // ignore JoinError but keep the async flow non-blocking
                 }
-            } else if matches.len() > pod.replicas {
-                for cname in matches.iter().take(matches.len() - pod.replicas) {
-                    if let Err(e) = docker::stop_container(cname) {
+            } else if matches.len() > pod_replicas {
+                for cname in matches.iter().take(matches.len() - pod_replicas) {
+                    if let Err(e) = orqos.stop_container(cname).await {
                         eprintln!("Failed to stop {}: {}", cname, e);
                     }
                 }
