@@ -121,7 +121,7 @@ pub async fn reconcile(store: &(dyn Store + Send + Sync), orqos: &OrqosClient) -
     // Await all pod reconcile tasks
     for task in tasks {
         if let Err(e) = task.await {
-            eprintln!("Pod reconcile task failed: {}", e);
+            tracing::warn!("Pod reconcile task failed: {}", e);
         }
     }
 

@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::signal::ctrl_c()
         .await
         .expect("Failed to listen for ctrl-c");
-    eprintln!("Received Ctrl-C, shutting down...");
+    tracing::info!("Received Ctrl-C, shutting down...");
 
     Ok(())
 }
