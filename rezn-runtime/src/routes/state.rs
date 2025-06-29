@@ -3,13 +3,12 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use common::types::DesiredMap;
-use reqwest::StatusCode;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::routes::common::{app_error, AppError};
 use crate::AppState;
-
-type AppError = (StatusCode, String);
 
 #[utoipa::path(
     get,
@@ -55,9 +54,4 @@ pub async fn get_state_raw_handler(State(app): State<Arc<AppState>>) -> Result<R
         None => Bytes::copy_from_slice(b"{}"),
     };
     Ok(([("Content-Type", "application/json")], Bytes::from(data)).into_response())
-}
-
-fn app_error<E: std::fmt::Display>(e: E) -> AppError {
-    tracing::warn!("internal error: {e}");
-    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }

@@ -11,9 +11,10 @@ use utoipa::ToSchema;
 use anyhow::Result;
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey as PublicKey};
 
-use crate::AppState;
-
-type AppError = (StatusCode, String);
+use crate::{
+    routes::common::{app_error, AppError},
+    AppState,
+};
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ApplyPayload {
@@ -23,11 +24,11 @@ pub struct ApplyPayload {
 
 #[utoipa::path(
     post,
-    path = "/state",
+    path = "/apply",
     responses(
         (status = 200, body = Object)
     ),
-    tag = "State",
+    tag = "Apply",
 )]
 pub async fn apply_handler(
     State(app): State<Arc<AppState>>,
@@ -115,9 +116,4 @@ pub async fn apply_handler(
     app.db.flush().map_err(app_error)?;
 
     Ok(Json(true))
-}
-
-fn app_error<E: std::fmt::Display>(e: E) -> AppError {
-    tracing::warn!("internal error: {e}");
-    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
