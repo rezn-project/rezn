@@ -1,16 +1,21 @@
-use crate::{orqos_client::OrqosClient, store::Store};
+use crate::orqos_client::OrqosClient;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use common::types::{DesiredMap, PodFields, PodSpec};
+use sled::Db;
 use std::collections::HashMap;
 
-pub async fn reconcile(store: &(dyn Store + Send + Sync), orqos: &OrqosClient) -> Result<()> {
+pub async fn reconcile(db: &Db, orqos: &OrqosClient) -> Result<()> {
     tracing::debug!("Reconcile: starting");
 
-    let data = match store.read("desired") {
-        Ok(data) => data,
+    let data = match db.get("desired") {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            tracing::warn!("Warning: 'desired' state not found in the DB");
+            return Ok(()); // or return Err(...) if it's mandatory
+        }
         Err(e) => {
-            tracing::warn!("Warning: desired state not available: {}", e);
+            tracing::warn!("Warning: failed to read 'desired' state: {}", e);
             return Ok(());
         }
     };
