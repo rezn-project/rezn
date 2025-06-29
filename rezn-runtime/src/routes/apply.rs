@@ -3,10 +3,10 @@ use axum::Json;
 use base64::engine::general_purpose;
 use base64::Engine;
 use common::types::{DesiredMap, MoleculeMeta, MoleculeWrapper};
-use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json_canonicalizer::to_vec;
-use std::{collections::BTreeMap, sync::Arc};
+use sled::transaction::{ConflictableTransactionError, TransactionError};
+use std::sync::Arc;
 use utoipa::ToSchema;
 
 use anyhow::Result;
@@ -75,26 +75,36 @@ pub async fn apply_handler(
         .verify(&program_raw, &signature)
         .map_err(app_error)?;
 
-    let mut desired_state_map: DesiredMap = match app.db.get("desired").map_err(app_error)? {
-        Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
-            tracing::error!("Failed to deserialize 'desired'. Likely old format. Err: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Invalid desired state format. Try wiping ./rezn-data or migrating manually."
-                    .into(),
-            )
-        })?,
-        None => BTreeMap::new(),
-    };
+    app.db
+        .transaction(|tree| {
+            // ---- load current state (may be absent) ----
+            let mut desired: DesiredMap = tree
+                .get("desired")?
+                .map(|v| {
+                    serde_json::from_slice(&v)
+                        .map_err(|e| ConflictableTransactionError::Abort(app_error(e)))
+                    // 🔑 convert error
+                })
+                .transpose()?
+                .unwrap_or_default();
 
-    if desired_state_map.contains_key(&name) {
-        tracing::info!("Warning: overwriting existing entry for '{}'", name);
-    }
+            // ---- mutate ----
+            desired.insert(name.clone(), program.to_vec());
 
-    desired_state_map.insert(name.to_string(), program.to_vec());
+            // ---- store back ----
+            let bytes = serde_json::to_vec(&desired)
+                .map_err(|e| ConflictableTransactionError::Abort(app_error(e)))?;
 
-    let updated = serde_json::to_vec(&desired_state_map).map_err(app_error)?;
-    app.db.insert("desired", updated).map_err(app_error)?;
+            tree.insert("desired", bytes)?; // sled ops already return CTE
+
+            Ok(())
+        })
+        .map_err(|e| match e {
+            TransactionError::Abort(app_e) => app_e,
+            TransactionError::Storage(io_e) => app_error(io_e),
+        })?;
+
+    // ----
 
     let now = chrono::Utc::now();
 
