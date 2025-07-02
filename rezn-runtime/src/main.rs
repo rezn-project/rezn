@@ -3,20 +3,44 @@ mod reconcile;
 
 mod router;
 mod routes;
+mod stats;
 
 use std::env;
 use std::sync::Arc;
 
-use crate::{reconcile::reconcile, router::build_router};
+use crate::{reconcile::reconcile, router::build_router, stats::container_stats_handler};
 use sled::Db;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::{net::TcpListener, sync::mpsc};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, RwLock},
+};
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Stats {
+    cpu_avg: Option<f64>,
+    max_mem: Option<u64>,
+}
+
+type ContainerID = String;
+
+#[derive(Debug, Clone)]
+struct TimestampedStats {
+    stats: Stats,
+    timestamp: u64,
+}
+
+type StatsMap = BTreeMap<ContainerID, TimestampedStats>;
 
 #[derive(Clone)]
 struct AppState {
     db: Arc<Db>,
     orqos: Arc<orqos_client::OrqosClient>,
+    stats: Arc<RwLock<StatsMap>>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -49,7 +73,11 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("ORQOS API client initialized with URL: {}", orqos_url);
 
-    let app_state = Arc::new(AppState { db, orqos });
+    let app_state = Arc::new(AppState {
+        db,
+        orqos,
+        stats: Arc::new(RwLock::new(BTreeMap::default())),
+    });
 
     let reconcile_state = Arc::clone(&app_state);
     let is_reconciling_clone = Arc::clone(&is_reconciling);
@@ -90,6 +118,13 @@ async fn main() -> anyhow::Result<()> {
 
             interval.tick().await;
             let _ = tx_periodic.send(()).await;
+        }
+    });
+
+    let stats_state = Arc::clone(&app_state);
+    tokio::spawn(async move {
+        if let Err(e) = container_stats_handler(&stats_state.stats).await {
+            tracing::error!("Stats handler error: {}", e);
         }
     });
 
