@@ -122,7 +122,11 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let stats_state = Arc::clone(&app_state);
-    let _ = container_stats_handler(&stats_state.stats);
+    tokio::spawn(async move {
+        if let Err(e) = container_stats_handler(&stats_state.stats).await {
+            tracing::error!("Stats handler error: {}", e);
+        }
+    });
 
     let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:4000".into());
     let listener = TcpListener::bind(&bind_addr).await?;
