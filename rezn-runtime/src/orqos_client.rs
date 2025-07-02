@@ -10,17 +10,18 @@ pub struct OrqosClient {
 }
 
 #[derive(Serialize, Debug)]
-struct CreateReq<'a> {
-    name: &'a str,
-    image: &'a str,
-    ports: Vec<PortMap>,
-    labels: HashMap<String, String>,
+pub struct CreateReq {
+    pub name: String,
+    pub image: String,
+    pub cpu: Option<String>,
+    pub ports: Vec<PortMap>,
+    pub labels: HashMap<String, String>,
 }
 
 #[derive(Serialize, Debug)]
-struct PortMap {
-    container: u16,
-    host: u16,
+pub struct PortMap {
+    pub container: u16,
+    pub host: u16,
 }
 
 #[derive(Clone, Deserialize)]
@@ -58,28 +59,7 @@ impl OrqosClient {
         Ok(res)
     }
 
-    pub async fn start_container(
-        &self,
-        name: &str,
-        image: &str,
-        ports: &[u16],
-        labels: HashMap<String, String>,
-    ) -> Result<()> {
-        let port_maps: Vec<PortMap> = ports
-            .iter()
-            .map(|p| PortMap {
-                container: *p,
-                host: 0, // or whatever logic you want here
-            })
-            .collect();
-
-        let req = CreateReq {
-            name,
-            image,
-            ports: port_maps,
-            labels,
-        };
-
+    pub async fn start_container(&self, req: CreateReq) -> Result<()> {
         tracing::debug!(
             "Creating container request:\n{}",
             serde_json::to_string_pretty(&req).unwrap()

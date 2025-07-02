@@ -1,4 +1,4 @@
-use crate::orqos_client::OrqosClient;
+use crate::orqos_client::{CreateReq, OrqosClient, PortMap};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use common::types::{DesiredMap, PodFields, PodSpec};
@@ -100,10 +100,23 @@ pub async fn reconcile(db: &Db, orqos: &OrqosClient) -> Result<()> {
                     let ports = pod_ports.clone();
                     let orqos = orqos.clone();
 
-                    if let Err(e) = orqos
-                        .start_container(&cname, &image, &ports, labels.clone())
-                        .await
-                    {
+                    let port_maps: Vec<PortMap> = ports
+                        .iter()
+                        .map(|p| PortMap {
+                            container: *p,
+                            host: 0,
+                        })
+                        .collect();
+
+                    let req = CreateReq {
+                        name: cname.clone(),
+                        image,
+                        ports: port_maps,
+                        labels: labels.clone(),
+                        cpu: None,
+                    };
+
+                    if let Err(e) = orqos.start_container(req).await {
                         tracing::warn!("Failed to start {}: {}", cname, e);
                     }
                 }
