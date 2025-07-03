@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::{reconcile::reconcile, router::build_router, stats::container_stats_handler};
 use sled::Db;
+use utoipa::ToSchema;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::{
@@ -20,7 +21,7 @@ use tokio::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 struct Stats {
     cpu_avg: Option<f64>,
     max_mem: Option<u64>,
@@ -28,7 +29,7 @@ struct Stats {
 
 type ContainerID = String;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, ToSchema, Serialize)]
 struct TimestampedStats {
     stats: Stats,
     timestamp: u64,
