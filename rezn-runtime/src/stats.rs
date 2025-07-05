@@ -6,13 +6,13 @@ use std::{
 
 use anyhow::Context;
 use futures_util::StreamExt;
-use tokio::{sync::RwLock, time::sleep};
+use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
 
-use crate::{Stats, StatsMap, TimestampedStats};
+use crate::{AppState, Stats, TimestampedStats};
 
-pub async fn container_stats_handler(stats: &Arc<RwLock<StatsMap>>) -> anyhow::Result<()> {
+pub async fn container_stats_handler(app: Arc<AppState>) -> anyhow::Result<()> {
     let ws_url = std::env::var("STATS_WS_URL")
         .unwrap_or_else(|_| "ws://localhost:3000/stats/ws".to_string());
 
@@ -46,7 +46,7 @@ pub async fn container_stats_handler(stats: &Arc<RwLock<StatsMap>>) -> anyhow::R
                                 .unwrap()
                                 .as_secs();
 
-                            let mut stats_guard = stats.write().await;
+                            let mut stats_guard = app.stats.write().await;
 
                             for (id, new_stat) in parsed_stats {
                                 stats_guard
@@ -64,6 +64,10 @@ pub async fn container_stats_handler(stats: &Arc<RwLock<StatsMap>>) -> anyhow::R
                                         timestamp: now,
                                     });
                             }
+
+                            drop(stats_guard);
+
+                            push_stats_to_ws_clients(app.clone()).await;
                         }
                         Err(e) => {
                             tracing::debug!("[WS] JSON parse error: {}", e);
@@ -84,5 +88,18 @@ pub async fn container_stats_handler(stats: &Arc<RwLock<StatsMap>>) -> anyhow::R
 
         // Wait a bit before retrying
         sleep(Duration::from_secs(2)).await;
+    }
+}
+
+pub async fn push_stats_to_ws_clients(app: Arc<AppState>) {
+    let stats = app.stats.read().await;
+
+    match serde_json::to_value(&stats.clone()) {
+        Ok(serialized) => {
+            let _ = app.stats_tx.send(serialized);
+        }
+        Err(e) => {
+            tracing::warn!("Failed to serialize stats: {}", e);
+        }
     }
 }
