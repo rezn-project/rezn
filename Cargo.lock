@@ -1982,6 +1982,7 @@ dependencies = [
  "log",
  "once_cell",
  "reqwest",
+ "secrecy",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",

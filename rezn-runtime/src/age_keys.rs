@@ -1,12 +1,12 @@
-// src/age_keys.rs
-use age::{x25519, Identity};
-use anyhow::{Context, Result};
+use age::x25519;
+use anyhow::{anyhow, Context, Result};
 use once_cell::sync::OnceCell;
+use secrecy::ExposeSecret;
 use std::{
     fs::{self, OpenOptions},
     io::Write,
     os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 static IDENTITY: OnceCell<x25519::Identity> = OnceCell::new();
@@ -24,30 +24,34 @@ fn load_or_generate_identity() -> Result<x25519::Identity> {
         .unwrap_or_else(|_| PathBuf::from("/etc/rezn/keys/identity.txt"));
 
     if id_path.exists() {
-        // ----- Load -----
+        // ----- Load ---------------------------------------------------
         let raw = fs::read_to_string(&id_path)
-            .with_context(|| format!("reading identity from {}", id_path.display()))?;
+            .with_context(|| format!("reading {}", id_path.display()))?;
 
-        raw.parse::<x25519::Identity>()
-            .context("parsing age identity failed")
+        raw.lines()
+            .find(|l| l.trim_start().starts_with("AGE-SECRET-KEY-1"))
+            .ok_or_else(|| anyhow!("no age identity in file"))?
+            .trim()
+            .parse::<x25519::Identity>()
+            .map_err(|e| anyhow!("parsing age identity failed: {e}"))
     } else {
-        // ----- Generate -----
+        // ----- Generate ----------------------------------------------
         if let Some(dir) = id_path.parent() {
             fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
 
         let id = x25519::Identity::generate();
 
-        // Persist private key (0600)
+        // write private key (0600)
         OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .mode(0o600)
             .open(&id_path)?
-            .write_all(id.to_string().as_bytes())?;
+            .write_all(id.to_string().expose_secret().as_bytes())?;
 
-        // Persist public key so CI/CD can encrypt to it (0644)
+        // write public key (0644)
         let pub_path = PathBuf::from("/etc/rezn/recipients/default.txt");
         if let Some(dir) = pub_path.parent() {
             fs::create_dir_all(dir)?;
@@ -60,6 +64,6 @@ fn load_or_generate_identity() -> Result<x25519::Identity> {
             .open(&pub_path)?
             .write_all(id.to_public().to_string().as_bytes())?;
 
-        Ok(id)
+        Ok(id) // ← this branch returns Result<Identity, Error>
     }
 }
