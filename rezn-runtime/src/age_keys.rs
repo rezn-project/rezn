@@ -21,7 +21,7 @@ fn load_or_generate_identity() -> Result<x25519::Identity> {
     // Let admins override the path if they really need to.
     let id_path = std::env::var("REZN_AGE_IDENTITY")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/etc/rezn/keys/identity.txt"));
+        .unwrap_or_else(|_| PathBuf::from("identity.txt"));
 
     if id_path.exists() {
         // ----- Load ---------------------------------------------------
@@ -52,7 +52,7 @@ fn load_or_generate_identity() -> Result<x25519::Identity> {
             .write_all(id.to_string().expose_secret().as_bytes())?;
 
         // write public key (0644)
-        let pub_path = PathBuf::from("/etc/rezn/recipients/default.txt");
+        let pub_path = PathBuf::from("default.txt");
         if let Some(dir) = pub_path.parent() {
             fs::create_dir_all(dir)?;
         }

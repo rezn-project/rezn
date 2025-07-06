@@ -60,11 +60,19 @@ impl SecretStore {
         }
     }
 
-    /// Remove a secret entirely.
-    pub fn delete(&self, key: &str) -> Result<()> {
-        self.db.remove(key)?;
+    pub fn delete(&self, key: &str) -> Result<bool> {
+        let removed = self.db.remove(key)?;
         self.db.flush()?;
-        Ok(())
+        Ok(removed.is_some())
+    }
+
+    pub fn keys(&self) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
+        for kv in self.db.iter() {
+            let (k, _) = kv?;
+            keys.push(String::from_utf8(k.to_vec())?);
+        }
+        Ok(keys)
     }
 
     /// Dump a secret to a `.age` file so it can be shipped elsewhere.
