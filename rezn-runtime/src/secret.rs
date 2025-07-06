@@ -67,6 +67,15 @@ impl SecretStore {
         Ok(())
     }
 
+    pub fn keys(&self) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
+        for kv in self.db.iter() {
+            let (k, _) = kv?;
+            keys.push(String::from_utf8(k.to_vec())?);
+        }
+        Ok(keys)
+    }
+
     /// Dump a secret to a `.age` file so it can be shipped elsewhere.
     pub fn export<P: AsRef<Path>>(&self, key: &str, output: P) -> Result<()> {
         let plain = self
