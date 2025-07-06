@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Query, State},
+    http::StatusCode,
     Json,
 };
 use serde::Deserialize;
@@ -21,10 +22,10 @@ pub struct SecretQuery {
     delete,
     path = "/secret",
     params(
-        ("key" = String, Query, description = "The full secret key name, e.g. rezn/prod/db_url")
+        ("key" = String, Query, description = "Full secret key, e.g. rezn/prod/db_url")
     ),
     responses(
-        (status = 200, description = "Secret deleted", body = bool),
+        (status = 200, body = bool, description = "Secret deleted"),
         (status = 404, description = "Secret not found")
     ),
     tag = "Secrets",
@@ -32,18 +33,12 @@ pub struct SecretQuery {
 pub async fn delete_secret_handler(
     State(app): State<Arc<AppState>>,
     Query(query): Query<SecretQuery>,
-) -> Result<Json<bool>, AppError> {
-    let existed = app
-        .secret_store
-        .get(&query.key)
-        .map_err(app_error)?
-        .is_some();
+) -> Result<(StatusCode, Json<bool>), AppError> {
+    let removed = app.secret_store.delete(&query.key).map_err(app_error)?; // ↓ returns bool now
 
-    if !existed {
-        return Err(app_error(anyhow!("Secret '{}' not found", query.key)));
+    if removed {
+        Ok((StatusCode::OK, Json(true)))
+    } else {
+        Ok((StatusCode::NOT_FOUND, Json(false)))
     }
-
-    app.secret_store.delete(&query.key).map_err(app_error)?;
-
-    Ok(Json(true))
 }

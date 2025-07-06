@@ -26,7 +26,7 @@ pub struct PutSecretPayload {
         content_type = "application/json",
     ),
     responses(
-        (status = 200, body = Object)
+        (status = 200, body = bool)
     ),
     tag = "Secrets",
 )]

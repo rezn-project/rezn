@@ -44,7 +44,7 @@ pub async fn get_secret_handler(
     get,
     path = "/secrets",
     responses(
-        (status = 200, body = Object)
+        (status = 200, description = "List of secret keys", body = Vec<String>)
     ),
     tag = "Secrets",
 )]
