@@ -1,14 +1,18 @@
+mod age_keys;
 mod orqos_client;
 mod reconcile;
 
 mod router;
 mod routes;
+mod secret;
 mod stats;
 
 use std::env;
 use std::sync::Arc;
 
-use crate::{reconcile::reconcile, router::build_router, stats::container_stats_handler};
+use crate::{
+    reconcile::reconcile, router::build_router, secret::SecretStore, stats::container_stats_handler,
+};
 use sled::Db;
 use utoipa::ToSchema;
 
@@ -42,7 +46,8 @@ struct AppState {
     db: Arc<Db>,
     orqos: Arc<orqos_client::OrqosClient>,
     stats: Arc<RwLock<StatsMap>>,
-    pub(crate) stats_tx: broadcast::Sender<serde_json::Value>,
+    stats_tx: broadcast::Sender<serde_json::Value>,
+    secret_store: SecretStore,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -51,12 +56,15 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting Rezn Runtime");
 
-    let db_path: String = env::args().nth(1).unwrap_or_else(|| "./rezn-data".into());
-    let db_path_clone = db_path.clone();
+    let state_db_path = env::var("STATE_DB_PATH").unwrap_or_else(|_| "./rezn-data".into());
+    let state_db_path_clone = state_db_path.clone();
 
-    let db: Arc<Db> = Arc::new(sled::open(db_path)?);
+    let db: Arc<Db> = Arc::new(sled::open(state_db_path)?);
 
-    tracing::info!("Starting Rezn Runtime with database at: {}", db_path_clone);
+    tracing::info!(
+        "Starting Rezn Runtime with database at: {}",
+        state_db_path_clone
+    );
 
     let (reconcile_state_tx, mut resoncile_state_rx) = mpsc::channel::<()>(1);
     let is_reconciling = Arc::new(AtomicBool::new(false));
@@ -76,11 +84,17 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("ORQOS API client initialized with URL: {}", orqos_url);
 
+    let identity = age_keys::get_identity()?.clone();
+
+    let secrets_db_path = env::var("SECRETS_DB_PATH").unwrap_or_else(|_| "./secrets".into());
+    let secret_store = SecretStore::open(secrets_db_path, identity)?;
+
     let app_state = Arc::new(AppState {
         db,
         orqos,
         stats: Arc::new(RwLock::new(BTreeMap::default())),
         stats_tx,
+        secret_store,
     });
 
     let reconcile_state = Arc::clone(&app_state);
