@@ -15,7 +15,7 @@ use utoipa::ToSchema;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::{
     net::TcpListener,
-    sync::{mpsc, RwLock},
+    sync::{broadcast, mpsc, RwLock},
 };
 
 use serde::{Deserialize, Serialize};
@@ -42,6 +42,7 @@ struct AppState {
     db: Arc<Db>,
     orqos: Arc<orqos_client::OrqosClient>,
     stats: Arc<RwLock<StatsMap>>,
+    pub(crate) stats_tx: broadcast::Sender<serde_json::Value>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -57,9 +58,10 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting Rezn Runtime with database at: {}", db_path_clone);
 
-    let (tx, mut rx) = mpsc::channel::<()>(1);
+    let (reconcile_state_tx, mut resoncile_state_rx) = mpsc::channel::<()>(1);
     let is_reconciling = Arc::new(AtomicBool::new(false));
-    // let store = Arc::clone(&store);
+
+    let (stats_tx, _) = broadcast::channel(100);
 
     tracing::info!("Setting up ORQOS API client");
 
@@ -78,12 +80,13 @@ async fn main() -> anyhow::Result<()> {
         db,
         orqos,
         stats: Arc::new(RwLock::new(BTreeMap::default())),
+        stats_tx,
     });
 
     let reconcile_state = Arc::clone(&app_state);
     let is_reconciling_clone = Arc::clone(&is_reconciling);
     tokio::spawn(async move {
-        while let Some(_) = rx.recv().await {
+        while let Some(_) = resoncile_state_rx.recv().await {
             tracing::debug!("Received reconcile trigger");
 
             if is_reconciling_clone
@@ -104,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Spawn periodic reconcile trigger
-    let tx_periodic = tx.clone();
+    let tx_periodic = reconcile_state_tx.clone();
     tokio::spawn(async move {
         let interval = std::env::var("RECONCILE_INTERVAL")
             .ok()
@@ -122,9 +125,10 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let stats_state = Arc::clone(&app_state);
+    let container_stats_handler_clone = Arc::clone(&app_state);
+
     tokio::spawn(async move {
-        if let Err(e) = container_stats_handler(&stats_state.stats).await {
+        if let Err(e) = container_stats_handler(container_stats_handler_clone).await {
             tracing::error!("Stats handler error: {}", e);
         }
     });
@@ -133,7 +137,8 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(&bind_addr).await?;
     tracing::info!("Listening on {}", bind_addr);
 
-    let router = build_router(app_state);
+    let router_app_state_clone = Arc::clone(&app_state);
+    let router = build_router(router_app_state_clone);
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async {
