@@ -2,7 +2,7 @@ use axum::extract::State;
 use axum::Json;
 use base64::engine::general_purpose;
 use base64::Engine;
-use common::types::{DesiredMap, MoleculeMeta, MoleculeWrapper};
+use common::types::{DesiredMap, InstructionMeta, InstructionWrapper};
 use serde::Deserialize;
 use serde_json_canonicalizer::to_vec;
 use sled::transaction::{ConflictableTransactionError, TransactionError};
@@ -20,7 +20,7 @@ use crate::{
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ApplyPayload {
     name: String,
-    molecule_wrapper: MoleculeWrapper,
+    instruction_wrapper: InstructionWrapper,
 }
 
 #[utoipa::path(
@@ -43,13 +43,13 @@ pub async fn apply_handler(
     tracing::debug!("Applying payload");
 
     let name = payload.name;
-    let molecule_wrapper = payload.molecule_wrapper;
+    let instruction_wrapper = payload.instruction_wrapper;
 
-    let sig = &molecule_wrapper.signature;
+    let sig = &instruction_wrapper.signature;
     let pubkey_b64 = &sig.pubkey;
     let sig_b64 = &sig.sig;
     let algorithm = &sig.algorithm;
-    let program = &molecule_wrapper.program;
+    let program = &instruction_wrapper.program;
     let program_raw = to_vec(program).map_err(app_error)?;
 
     if algorithm != "ed25519" {
@@ -118,13 +118,13 @@ pub async fn apply_handler(
         .collect::<Result<Vec<_>>>()
         .map_err(app_error)?;
 
-    let meta: MoleculeMeta = MoleculeMeta {
+    let meta: InstructionMeta = InstructionMeta {
         sig_id: sig_b64.to_string(),
         applied_at: now,
         atoms,
     };
 
-    let meta_key = format!("molecule/{}", name);
+    let meta_key = format!("instruction/{}", name);
     let meta_value = serde_json::to_vec(&meta)
         .map_err(|e| app_error(format!("Failed to serialize meta: {e}")))?;
     app.db.insert(meta_key, meta_value).map_err(app_error)?;

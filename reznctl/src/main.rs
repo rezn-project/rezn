@@ -18,7 +18,7 @@ fn main() -> Result<()> {
     let client = reqwest::blocking::Client::new();
     let payload = serde_json::json!({
         "name": name,
-        "molecule_wrapper": serde_json::from_str::<Value>(&raw).context("parsing JSON")?,
+        "instruction_wrapper": serde_json::from_str::<Value>(&raw).context("parsing JSON")?,
     });
 
     print!("{}", payload.to_string());

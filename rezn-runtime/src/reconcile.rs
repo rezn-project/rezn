@@ -22,8 +22,8 @@ pub async fn reconcile(db: &Db, orqos: &OrqosClient) -> Result<()> {
 
     tracing::debug!("Reconcile: read desired state from store");
 
-    let desired: DesiredMap =
-        serde_json::from_slice(&data).context("Failed to parse desired state as molecule map")?;
+    let desired: DesiredMap = serde_json::from_slice(&data)
+        .context("Failed to parse desired state as instruction map")?;
 
     tracing::debug!(
         "Reconcile: parsed {} items from desired state",
@@ -38,7 +38,7 @@ pub async fn reconcile(db: &Db, orqos: &OrqosClient) -> Result<()> {
                 if let Some(fields_val) = &item.fields {
                     let fields: PodFields = serde_json::from_value(fields_val.clone())
                         .with_context(|| {
-                            format!("Failed to parse pod fields in molecule '{mol_name}'")
+                            format!("Failed to parse pod fields in instruction '{mol_name}'")
                         })?;
 
                     desired_pods.push(PodSpec {

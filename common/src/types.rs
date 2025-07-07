@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-pub type DesiredMap = BTreeMap<String, Vec<Molecule>>;
+pub type DesiredMap = BTreeMap<String, Vec<Instruction>>;
 
 #[derive(Serialize, Deserialize, Debug, ToSchema)]
 pub struct Signature {
@@ -15,20 +15,20 @@ pub struct Signature {
 }
 
 #[derive(Serialize, Deserialize, Debug, ToSchema)]
-pub struct MoleculeWrapper {
-    pub program: Vec<Molecule>,
+pub struct InstructionWrapper {
+    pub program: Vec<Instruction>,
     pub signature: Signature,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct MoleculeMeta {
+pub struct InstructionMeta {
     pub sig_id: String,
     pub applied_at: DateTime<Utc>,
     pub atoms: Vec<(String, String)>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, ToSchema)]
-pub struct Molecule {
+pub struct Instruction {
     pub kind: String,
     pub name: String,
 
