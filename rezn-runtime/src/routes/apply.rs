@@ -108,7 +108,7 @@ pub async fn apply_handler(
 
     let now = chrono::Utc::now();
 
-    let atoms = program
+    let instructions = program
         .iter()
         .map(|item| {
             let kind = item.kind.as_str();
@@ -121,7 +121,7 @@ pub async fn apply_handler(
     let meta: InstructionMeta = InstructionMeta {
         sig_id: sig_b64.to_string(),
         applied_at: now,
-        atoms,
+        instructions,
     };
 
     let meta_key = format!("instruction/{}", name);
