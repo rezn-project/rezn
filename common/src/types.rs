@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -24,8 +24,25 @@ pub struct InstructionWrapper {
 pub struct InstructionMeta {
     pub sig_id: String,
     pub applied_at: DateTime<Utc>,
-    pub atoms: Vec<(String, String)>,
+    pub instructions: Vec<(String, String)>,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum EnvVar {
+    Raw(String),
+    FromSource { from: EnvSource, name: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum EnvSource {
+    Secret,
+    AwsSecretsManager,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+pub struct EnvMap(pub HashMap<String, EnvVar>);
 
 #[derive(Serialize, Deserialize, Debug, Clone, ToSchema)]
 pub struct Instruction {
@@ -45,6 +62,7 @@ pub struct PodFields {
     pub replicas: usize,
     pub ports: Vec<u16>,
     pub secure: Option<bool>,
+    pub env: Option<EnvMap>,
 }
 
 pub struct PodSpec {

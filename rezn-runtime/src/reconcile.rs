@@ -11,7 +11,7 @@ pub async fn reconcile(db: &Db, orqos: &OrqosClient) -> Result<()> {
     let data = match db.get("desired") {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
-            tracing::warn!("Warning: 'desired' state not found in the DB");
+            tracing::debug!("Warning: 'desired' state not found in the DB");
             return Ok(()); // or return Err(...) if it's mandatory
         }
         Err(e) => {
