@@ -7,6 +7,9 @@ mod routes;
 mod secret;
 mod stats;
 
+#[cfg(test)]
+mod test_support;
+
 use std::env;
 use std::sync::Arc;
 
@@ -109,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
             {
                 tracing::debug!("[reconcile] Begin");
                 if let Err(e) = reconcile(&*reconcile_state.db, &*reconcile_state.orqos).await {
-                    tracing::error!("[reconcile] Error: {}", e);
+                    tracing::error!("[reconcile] Error: {:#}", e);
                 }
 
                 is_reconciling_clone.store(false, Ordering::SeqCst);

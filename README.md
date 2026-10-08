@@ -2,6 +2,8 @@
 
 **The Infra Epoxy. Contracts that bind. Deployments that stick.**
 
+See the [development guide](docs/DEVELOPMENT.md) for local setup, the current Orqos Docker API, and regression checks.
+
 ---
 
 ## Why another tool?
