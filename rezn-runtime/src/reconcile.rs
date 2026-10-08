@@ -1,351 +1,392 @@
-use crate::orqos_client::{CreateReq, OrqosClient, PortMap};
-use anyhow::{Context, Result};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+};
+
+use anyhow::{ensure, Context, Result};
 use chrono::Utc;
-use common::types::{DesiredMap, PodFields, PodSpec};
-use sled::Db;
-use std::collections::HashMap;
+use common::types::{DesiredMap, PodFields};
+use serde::Serialize;
+use tokio::sync::{Mutex, RwLock};
+use utoipa::ToSchema;
 
-pub async fn reconcile(db: &Db, orqos: &OrqosClient) -> Result<()> {
-    tracing::debug!("Reconcile: starting");
+use crate::{
+    intent::{configuration, validate_name},
+    orqos_client::{ContainerSummary, CreateReq, OrqosClient, PortMap},
+    store::{self, StoredState},
+};
 
-    let data = match db.get("desired") {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => {
-            tracing::debug!("Warning: 'desired' state not found in the DB");
-            return Ok(()); // or return Err(...) if it's mandatory
-        }
-        Err(e) => {
-            tracing::warn!("Warning: failed to read 'desired' state: {}", e);
-            return Ok(());
-        }
-    };
+pub const OWNER: &str = "dev.rezn.owner";
+pub const MANAGED: &str = "dev.rezn.managed";
+pub const DEPLOYMENT: &str = "dev.rezn.deployment";
+pub const POD: &str = "dev.rezn.pod";
+pub const CONFIG: &str = "dev.rezn.configuration";
 
-    tracing::debug!("Reconcile: read desired state from store");
-
-    let desired: DesiredMap = serde_json::from_slice(&data)
-        .context("Failed to parse desired state as instruction map")?;
-
-    tracing::debug!(
-        "Reconcile: parsed {} items from desired state",
-        desired.len()
-    );
-
-    let mut desired_pods = Vec::<PodSpec>::new();
-
-    for (mol_name, atoms) in &desired {
-        for item in atoms {
-            if item.kind == "pod" {
-                if let Some(fields_val) = &item.fields {
-                    let fields: PodFields = serde_json::from_value(fields_val.clone())
-                        .with_context(|| {
-                            format!("Failed to parse pod fields in instruction '{mol_name}'")
-                        })?;
-
-                    desired_pods.push(PodSpec {
-                        mol_name: mol_name.clone(),
-                        name: item.name.clone(),
-                        image: fields.image,
-                        replicas: fields.replicas,
-                        ports: fields.ports,
-                    });
-                }
-            }
-        }
-    }
-
-    // Finish observing every workload before starting any mutations.
-    let mut observed_pods = vec![];
-    for pod in desired_pods {
-        let pod_label = format!("{}:{}", pod.mol_name, pod.name);
-
-        let running = orqos
-            .list_pod_containers(&pod_label)
-            .await
-            .context("Failed to query Orqos for running containers")?;
-
-        observed_pods.push((pod, pod_label, running));
-    }
-
-    let mut tasks = vec![];
-    for (pod, pod_label, running) in observed_pods {
-        // Clone all necessary data before moving into the async block
-        let mol_name = pod.mol_name.clone();
-        let pod_name = pod.name.clone();
-        let pod_image = pod.image.clone();
-        let pod_ports = pod.ports.clone();
-        let pod_replicas = pod.replicas;
-        let orqos = orqos.clone();
-        let mut labels: HashMap<String, String> = HashMap::new();
-
-        labels.insert("mol".to_string(), format!("{}", pod.mol_name));
-        labels.insert("pod".to_string(), pod_label.clone());
-
-        let running = running.clone();
-
-        let task = tokio::spawn(async move {
-            let matches: Vec<_> = running
-                .iter()
-                .filter(|c| {
-                    c.names.iter().any(|n| {
-                        n.trim_start_matches('/')
-                            .starts_with(&format!("{}-{}-", mol_name, pod_name))
-                    })
-                })
-                .collect();
-
-            if matches.len() < pod_replicas {
-                for _ in 0..(pod_replicas - matches.len()) {
-                    let cname: String = format!(
-                        "{}-{}-{}",
-                        mol_name,
-                        pod_name,
-                        Utc::now().timestamp_nanos_opt().unwrap_or_default()
-                    );
-                    let image = pod_image.clone();
-                    let ports = pod_ports.clone();
-                    let orqos = orqos.clone();
-
-                    let port_maps: Vec<PortMap> = ports
-                        .iter()
-                        .map(|p| PortMap {
-                            container: *p,
-                            host: 0,
-                        })
-                        .collect();
-
-                    let req = CreateReq {
-                        name: cname.clone(),
-                        image,
-                        ports: port_maps,
-                        labels: labels.clone(),
-                        cpu: None,
-                    };
-
-                    if let Err(e) = orqos.start_container(req).await {
-                        tracing::warn!("Failed to start {}: {:#}", cname, e);
-                    }
-                }
-            } else if matches.len() > pod_replicas {
-                for c in matches.iter().take(matches.len() - pod_replicas) {
-                    if let Some(name) = c.names.first().map(|s| s.trim_start_matches('/')) {
-                        if let Err(e) = orqos.stop_container(name).await {
-                            tracing::warn!("Failed to stop {}: {:#}", name, e);
-                        }
-
-                        if let Err(e) = orqos.remove_container(name).await {
-                            tracing::warn!("Failed to remove {}: {:#}", name, e);
-                        }
-                    } else {
-                        tracing::warn!("Container {} has no name?!", c.id);
-                    }
-                }
-            }
-        });
-
-        tasks.push(task);
-    }
-
-    // Await all pod reconcile tasks
-    for task in tasks {
-        if let Err(e) = task.await {
-            tracing::warn!("Pod reconcile task failed: {}", e);
-        }
-    }
-
-    Ok(())
+#[derive(Clone, Default)]
+struct Progress {
+    observation: Option<Observation>,
+    last_attempt: Option<String>,
+    stale: bool,
+    errors: Vec<String>,
+}
+#[derive(Clone)]
+struct Observation {
+    revision: u64,
+    at: String,
+    containers: Vec<ContainerSummary>,
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
+#[derive(Default)]
+pub struct Controller {
+    // Serializes passes, including observation and status publication.
+    gate: Mutex<()>,
+    // Apply and status share this lock so status describes one accepted revision.
+    pub intent: Mutex<()>,
+    progress: RwLock<Progress>,
+    pub trigger: tokio::sync::Notify,
+}
 
-    use anyhow::{ensure, Context};
-    use axum::http::{Method, StatusCode};
-    use serde_json::json;
+#[derive(Serialize, ToSchema)]
+pub struct Status {
+    pub owner: String,
+    pub desired_revision: u64,
+    pub observed_revision: Option<u64>,
+    pub last_observation: Option<String>,
+    pub last_attempt: Option<String>,
+    pub observation: String,
+    pub converged: bool,
+    pub errors: Vec<String>,
+    pub workloads: Vec<WorkloadStatus>,
+}
+#[derive(Serialize, ToSchema)]
+pub struct WorkloadStatus {
+    pub deployment: String,
+    pub pod: String,
+    pub desired_configuration: Option<String>,
+    pub desired: Option<PodFields>,
+    pub current_configurations: Vec<String>,
+    pub desired_replicas: usize,
+    /// Null until there has been a successful observation; stale values retain their timestamp.
+    pub running_replicas: Option<usize>,
+    pub containers: Vec<ContainerSummary>,
+}
 
-    use super::*;
-    use crate::{orqos_client::ContainerSummary, test_support::MockOrqos};
+fn desired_workloads(desired: &DesiredMap) -> BTreeMap<(String, String), PodFields> {
+    desired
+        .iter()
+        .flat_map(|(deployment, instructions)| {
+            instructions
+                .iter()
+                .map(move |i| ((deployment.clone(), i.name.clone()), i.fields.clone()))
+        })
+        .collect()
+}
 
-    fn desired_pod(image: &str, replicas: usize) -> serde_json::Value {
-        json!([{"kind": "pod", "name": "web", "fields": {
-            "image": image, "replicas": replicas, "ports": []
-        }}])
+// A server-side label filter is not ownership proof. Check returned labels locally.
+fn owned(state: &StoredState, containers: Vec<ContainerSummary>) -> Result<Vec<ContainerSummary>> {
+    let mut ids = HashSet::new();
+    let mut result = vec![];
+    for container in containers {
+        if container.labels.get(OWNER) != Some(&state.owner)
+            || container.labels.get(MANAGED).map(String::as_str) != Some("v1")
+        {
+            continue;
+        }
+        for label in [DEPLOYMENT, POD] {
+            validate_name(container.labels.get(label).with_context(|| {
+                format!("container {} lacks ownership label {label}", container.id)
+            })?)?;
+        }
+        ensure!(
+            container
+                .labels
+                .get(CONFIG)
+                .is_some_and(|s| store::is_identity(s)),
+            "container {} lacks a valid configuration identity",
+            container.id
+        );
+        ensure!(
+            !container.id.is_empty()
+                && container.id.len() <= 128
+                && container
+                    .id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)),
+            "invalid container ID in observation"
+        );
+        ensure!(
+            ids.insert(container.id.clone()),
+            "duplicate container ID in observation"
+        );
+        ensure!(
+            !container.image.is_empty()
+                && [
+                    "created",
+                    "restarting",
+                    "running",
+                    "removing",
+                    "paused",
+                    "exited",
+                    "dead"
+                ]
+                .contains(&container.state.as_str()),
+            "invalid container image/state in observation"
+        );
+        ensure!(
+            container.ports.iter().all(|p| p.private_port > 0
+                && ["tcp", "udp", "sctp"].contains(&p.protocol.as_str())
+                && p.public_port.is_none_or(|port| port > 0
+                    && p.ip
+                        .as_ref()
+                        .is_some_and(|ip| ip.parse::<std::net::IpAddr>().is_ok()))),
+            "invalid port mapping in container {} observation",
+            container.id
+        );
+        result.push(container);
     }
+    result.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(result)
+}
 
-    #[tokio::test]
-    async fn failed_list_prevents_all_mutations_and_next_pass_can_recover() {
-        // Exercise both scale-up and scale-down of the first workload when
-        // observation of a later workload fails.
-        for scale_up in [true, false] {
-            let unavailable = Arc::new(AtomicBool::new(true));
-            let failed = unavailable.clone();
-            let server = MockOrqos::start(move |request| {
-                if request.method == Method::GET {
-                    if request.query().get("label").map(String::as_str) == Some("pod=b:web") {
-                        return if failed.load(Ordering::SeqCst) {
-                            (
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "Docker temporarily unavailable".into(),
-                            )
-                        } else {
-                            (StatusCode::OK, "[]".into())
-                        };
-                    }
-                    return (
-                        StatusCode::OK,
-                        if scale_up {
-                            "[]".into()
-                        } else {
-                            json!([{"Id": "existing", "Names": ["/a-web-existing"]}]).to_string()
-                        },
-                    );
-                }
-                (StatusCode::NO_CONTENT, String::new())
+fn key(container: &ContainerSummary) -> (String, String) {
+    (
+        container.labels[DEPLOYMENT].clone(),
+        container.labels[POD].clone(),
+    )
+}
+
+fn matching(container: &ContainerSummary, fields: &PodFields) -> bool {
+    container.state == "running"
+        && container.labels[CONFIG] == configuration(fields)
+        && container.image == fields.image
+        && fields.ports.iter().all(|port| {
+            container.ports.iter().any(|mapping| {
+                mapping.private_port == *port
+                    && mapping.protocol == "tcp"
+                    && mapping.public_port.is_some_and(|p| p > 0)
             })
-            .await;
-            let db = sled::Config::new().temporary(true).open().unwrap();
-            db.insert(
-                "desired",
-                serde_json::to_vec(&json!({
-                    "a": desired_pod("nginx:alpine", usize::from(scale_up)),
-                    "b": desired_pod("nginx:alpine", 0),
-                }))
-                .unwrap(),
-            )
-            .unwrap();
+        })
+}
 
-            let error = format!("{:#}", reconcile(&db, &server.client).await.unwrap_err());
-            assert!(
-                error.contains("503") && error.contains("Docker temporarily unavailable"),
-                "{error}"
-            );
-            let requests = server.requests();
-            assert_eq!(requests.len(), 2);
-            assert!(requests.iter().all(|request| request.method == Method::GET));
+fn converged(desired: &DesiredMap, containers: &[ContainerSummary]) -> bool {
+    let workloads = desired_workloads(desired);
+    containers
+        .iter()
+        .all(|c| workloads.get(&key(c)).is_some_and(|f| matching(c, f)))
+        && workloads.iter().all(|(k, f)| {
+            containers
+                .iter()
+                .filter(|c| &key(c) == k && matching(c, f))
+                .count()
+                == f.replicas
+        })
+}
 
-            unavailable.store(false, Ordering::SeqCst);
-            reconcile(&db, &server.client).await.unwrap();
-            let requests = server.requests();
-            assert_eq!(requests.len(), if scale_up { 5 } else { 6 });
-            assert!(requests[..4]
-                .iter()
-                .all(|request| request.method == Method::GET));
-            let paths: Vec<_> = requests[4..]
-                .iter()
-                .map(|request| request.uri.path())
-                .collect();
-            if scale_up {
-                assert_eq!(paths, ["/docker/containers"]);
-            } else {
-                assert_eq!(
-                    paths,
-                    [
-                        "/docker/containers/a-web-existing/stop",
-                        "/docker/containers/a-web-existing/remove"
-                    ]
-                );
+impl Controller {
+    pub async fn status(&self, db: &sled::Db) -> Result<Status> {
+        let _intent = self.intent.lock().await;
+        let state = store::load(db)?;
+        let desired = state.desired()?;
+        let progress = self.progress.read().await;
+        let mut workloads = desired_workloads(&desired)
+            .into_iter()
+            .map(|(key, fields)| (key, Some(fields)))
+            .collect::<BTreeMap<_, _>>();
+        if let Some(observation) = &progress.observation {
+            for c in &observation.containers {
+                workloads.entry(key(c)).or_insert(None);
             }
         }
+        let observed = progress.observation.as_ref();
+        let pending = observed.is_some_and(|o| o.revision != state.revision);
+        Ok(Status {
+            owner: state.owner,
+            desired_revision: state.revision,
+            observed_revision: observed.map(|o| o.revision),
+            last_observation: observed.map(|o| o.at.clone()),
+            last_attempt: progress.last_attempt.clone(),
+            observation: if observed.is_none() {
+                "unknown"
+            } else if progress.stale {
+                "stale"
+            } else if pending {
+                "pending"
+            } else {
+                "fresh"
+            }
+            .into(),
+            converged: !progress.stale
+                && !pending
+                && progress.errors.is_empty()
+                && observed.is_some_and(|o| converged(&desired, &o.containers)),
+            errors: progress.errors.clone(),
+            workloads: workloads
+                .into_iter()
+                .map(|((deployment, pod), fields)| {
+                    let containers: Vec<_> = observed
+                        .map(|o| {
+                            o.containers
+                                .iter()
+                                .filter(|c| key(c) == (deployment.clone(), pod.clone()))
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let mut configurations = containers
+                        .iter()
+                        .map(|c| c.labels[CONFIG].clone())
+                        .collect::<Vec<_>>();
+                    configurations.sort();
+                    configurations.dedup();
+                    WorkloadStatus {
+                        deployment,
+                        pod,
+                        desired_configuration: fields.as_ref().map(configuration),
+                        desired_replicas: fields.as_ref().map(|f| f.replicas).unwrap_or(0),
+                        desired: fields,
+                        current_configurations: configurations,
+                        running_replicas: observed
+                            .map(|_| containers.iter().filter(|c| c.state == "running").count()),
+                        containers,
+                    }
+                })
+                .collect(),
+        })
     }
 
-    #[tokio::test]
-    #[ignore = "requires local Orqos with Docker enabled and pre-pulled nginx:alpine"]
-    async fn docker_reconciliation_smoke() -> Result<()> {
-        let url = std::env::var("ORQOS_API_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".into());
-        let endpoint = url::Url::parse(&url)?;
-        let loopback = match endpoint.host() {
-            Some(url::Host::Domain("localhost")) => true,
-            Some(url::Host::Ipv4(address)) => address.is_loopback(),
-            Some(url::Host::Ipv6(address)) => address.is_loopback(),
-            _ => false,
-        };
-        ensure!(
-            loopback,
-            "Docker smoke tests require a loopback Orqos endpoint"
-        );
-        let client = OrqosClient::new(&url);
-        let run = format!(
-            "rezn-smoke-{}-{}",
-            std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap()
-        );
-        let label = format!("{run}:web");
-        let db = sled::Config::new().temporary(true).open()?;
+    pub async fn reconcile(&self, db: &sled::Db, orqos: &OrqosClient) -> Result<()> {
+        let _pass = self.gate.lock().await;
+        self.progress.write().await.last_attempt = Some(Utc::now().to_rfc3339());
+        let result = self.pass(db, orqos).await;
+        if let Err(error) = &result {
+            let mut progress = self.progress.write().await;
+            progress.stale = true;
+            progress.errors = vec![format!("{error:#}")];
+        }
+        result
+    }
 
-        // Capture failures as Results so cleanup still runs after failed checks.
-        let scenario: Result<()> = async {
-            for replicas in [1, 2, 1, 0] {
-                db.insert("desired", serde_json::to_vec(&json!({
-                    run.clone(): desired_pod("nginx:alpine", replicas)
-                }))?)?;
-                reconcile(&db, &client).await?;
-                let before = client.list_pod_containers(&label).await?;
-                ensure!(before.len() == replicas,
-                    "Expected {replicas} replicas, found {}; pre-pull nginx:alpine into Orqos's Docker engine",
-                    before.len());
-                reconcile(&db, &client).await?;
-                let after = client.list_pod_containers(&label).await?;
-                let mut before_ids: Vec<_> = before.iter().map(|container| &container.id).collect();
-                let mut after_ids: Vec<_> = after.iter().map(|container| &container.id).collect();
-                before_ids.sort();
-                after_ids.sort();
-                ensure!(before_ids == after_ids, "Repeated reconciliation changed replica identities");
+    async fn observe(
+        &self,
+        state: &StoredState,
+        orqos: &OrqosClient,
+    ) -> Result<Vec<ContainerSummary>> {
+        let containers = owned(
+            state,
+            orqos
+                .list_owned_containers(&state.owner)
+                .await
+                .context("required Docker observation failed")?,
+        )?;
+        let mut progress = self.progress.write().await;
+        progress.observation = Some(Observation {
+            revision: state.revision,
+            at: Utc::now().to_rfc3339(),
+            containers: containers.clone(),
+        });
+        progress.stale = false;
+        Ok(containers)
+    }
+
+    async fn pass(&self, db: &sled::Db, orqos: &OrqosClient) -> Result<()> {
+        // Validate the complete persisted snapshot before observation or mutation.
+        let state = store::load(db)?;
+        let desired = state.desired()?;
+        let workloads = desired_workloads(&desired);
+        let containers = self.observe(&state, orqos).await?;
+        // If apply won the race during observation, start again with its snapshot.
+        ensure!(
+            store::load(db)?.revision == state.revision,
+            "intent changed during observation; retry pending revision"
+        );
+        let mut keep: BTreeMap<(String, String), usize> = BTreeMap::new();
+        let mut remove = vec![];
+        for c in &containers {
+            let k = key(c);
+            let count = keep.entry(k.clone()).or_default();
+            if workloads
+                .get(&k)
+                .is_some_and(|f| matching(c, f) && *count < f.replicas)
+            {
+                *count += 1;
+            } else {
+                remove.push(c);
+            }
+        }
+        let mutated = !remove.is_empty()
+            || workloads
+                .iter()
+                .any(|(k, f)| keep.get(k).copied().unwrap_or(0) < f.replicas);
+        let mutations: Result<()> = async {
+            for c in remove {
+                // Force removal handles running, stopped and failed-start debris alike.
+                orqos
+                    .remove_container(&c.id)
+                    .await
+                    .with_context(|| format!("removing owned container {}", c.id))?;
+            }
+            for ((deployment, pod), fields) in &workloads {
+                for _ in keep
+                    .get(&(deployment.clone(), pod.clone()))
+                    .copied()
+                    .unwrap_or(0)..fields.replicas
+                {
+                    let labels = HashMap::from([
+                        (OWNER.into(), state.owner.clone()),
+                        (MANAGED.into(), "v1".into()),
+                        (DEPLOYMENT.into(), deployment.clone()),
+                        (POD.into(), pod.clone()),
+                        (CONFIG.into(), configuration(fields)),
+                    ]);
+                    orqos
+                        .start_container(CreateReq {
+                            name: format!("rezn-{}", store::random_id()?),
+                            image: fields.image.clone(),
+                            cpu: None,
+                            ports: fields
+                                .ports
+                                .iter()
+                                .map(|p| PortMap {
+                                    container: *p,
+                                    host: 0,
+                                })
+                                .collect(),
+                            labels,
+                        })
+                        .await
+                        .with_context(|| format!("creating {deployment}/{pod}"))?;
+                }
             }
             Ok(())
-        }.await;
-
-        let cleanup = cleanup_smoke_containers(&url, &label, &run, &client).await;
-        match (scenario, cleanup) {
-            (Err(scenario), Err(cleanup)) => {
-                anyhow::bail!("Smoke check failed: {scenario:#}; cleanup failed: {cleanup:#}")
-            }
-            (Err(error), Ok(())) => Err(error),
-            (Ok(()), cleanup) => cleanup.context("Failed to clean up Docker smoke fixtures"),
         }
-    }
-
-    async fn cleanup_smoke_containers(
-        url: &str,
-        label: &str,
-        run: &str,
-        client: &OrqosClient,
-    ) -> Result<()> {
-        // Include stopped containers and containers whose start request failed.
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
-            .build()?;
-        let list = http
-            .get(format!("{url}/docker/containers"))
-            .query(&[("label", format!("pod={label}")), ("all", "true".into())]);
-        let containers = list
-            .try_clone()
-            .unwrap()
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Vec<ContainerSummary>>()
-            .await?;
-        let mut failures = vec![];
-        for container in containers {
-            ensure!(
-                container.names.iter().any(|name| name
-                    .trim_start_matches('/')
-                    .starts_with(&format!("{run}-web-"))),
-                "Refusing cleanup of container outside this smoke run: {}",
-                container.id
-            );
-            if let Err(error) = client.remove_container(&container.id).await {
-                failures.push(format!("{error:#}"));
+        .await;
+        let after = if mutated {
+            self.observe(&state, orqos).await
+        } else {
+            Ok(containers)
+        };
+        // Preserve both a mutation failure and a failed follow-up observation.
+        match (mutations, after) {
+            (Err(mutation), Err(observation)) => {
+                anyhow::bail!("{mutation:#}; follow-up observation: {observation:#}")
             }
+            (Err(error), _) | (_, Err(error)) => return Err(error),
+            (Ok(()), Ok(containers)) => ensure!(
+                converged(&desired, &containers),
+                "observed containers have not converged; retrying on next pass"
+            ),
         }
-        ensure!(failures.is_empty(), "{}", failures.join("; "));
-        let remaining = list
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Vec<ContainerSummary>>()
-            .await?;
-        ensure!(remaining.is_empty(), "Smoke fixtures remain after cleanup");
+        self.progress.write().await.errors.clear();
         Ok(())
+    }
+}
+
+pub async fn run(app: Arc<crate::AppState>, interval: std::time::Duration) {
+    let mut timer = tokio::time::interval(interval);
+    loop {
+        tokio::select! { _ = timer.tick() => {}, _ = app.controller.trigger.notified() => {} }
+        if let Err(error) = app.controller.reconcile(&app.db, &app.orqos).await {
+            tracing::error!("reconciliation failed: {error:#}");
+        }
     }
 }

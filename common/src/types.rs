@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -6,7 +6,8 @@ use utoipa::ToSchema;
 
 pub type DesiredMap = BTreeMap<String, Vec<Instruction>>;
 
-#[derive(Serialize, Deserialize, Debug, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, Debug, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Signature {
     pub algorithm: String,
     #[serde(rename = "pub")]
@@ -14,60 +15,33 @@ pub struct Signature {
     pub sig: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, ToSchema)]
+/// Keep submitted program values intact until canonical signature verification.
+#[derive(Clone, Serialize, Deserialize, Debug, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InstructionWrapper {
-    pub program: Vec<Instruction>,
+    pub program: Vec<serde_json::Value>,
     pub signature: Signature,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct InstructionMeta {
     pub sig_id: String,
     pub applied_at: DateTime<Utc>,
     pub instructions: Vec<(String, String)>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum EnvVar {
-    Raw(String),
-    FromSource { from: EnvSource, name: String },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum EnvSource {
-    Secret,
-    AwsSecretsManager,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
-pub struct EnvMap(pub HashMap<String, EnvVar>);
-
 #[derive(Serialize, Deserialize, Debug, Clone, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Instruction {
     pub kind: String,
     pub name: String,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fields: Option<serde_json::Value>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub options: Option<Vec<String>>,
+    pub fields: PodFields,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PodFields {
-    pub image: String,
-    pub replicas: usize,
-    pub ports: Vec<u16>,
-    pub secure: Option<bool>,
-    pub env: Option<EnvMap>,
-}
-
-pub struct PodSpec {
-    pub mol_name: String,
-    pub name: String,
     pub image: String,
     pub replicas: usize,
     pub ports: Vec<u16>,

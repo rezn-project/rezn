@@ -1,0 +1,5 @@
+pod "web" {
+  image = "nginx:alpine"
+  replicas = 1
+  ports = [80]
+}

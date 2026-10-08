@@ -5,3 +5,6 @@ conf
 snap.*
 identity.txt
 default.txt
+/rezn-local-v1
+/rezn-local-secrets
+__pycache__/

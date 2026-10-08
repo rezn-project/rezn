@@ -24,6 +24,14 @@ pub struct SecretStore {
 }
 
 impl SecretStore {
+    #[cfg(test)]
+    pub fn temporary() -> Self {
+        Self {
+            db: Config::new().temporary(true).open().unwrap(),
+            id: x25519::Identity::generate(),
+        }
+    }
+
     /// Open (or create) a store at `path`.
     pub fn open<P: AsRef<Path>>(path: P, id: x25519::Identity) -> Result<Self> {
         // make sure parent dirs exist

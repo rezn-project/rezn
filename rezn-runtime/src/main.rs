@@ -1,6 +1,8 @@
 mod age_keys;
+mod intent;
 mod orqos_client;
 mod reconcile;
+mod store;
 
 mod router;
 mod routes;
@@ -9,20 +11,19 @@ mod stats;
 
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod tests;
 
 use std::env;
 use std::sync::Arc;
 
-use crate::{
-    reconcile::reconcile, router::build_router, secret::SecretStore, stats::container_stats_handler,
-};
+use crate::{router::build_router, secret::SecretStore, stats::container_stats_handler};
 use sled::Db;
 use utoipa::ToSchema;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::{
     net::TcpListener,
-    sync::{broadcast, mpsc, RwLock},
+    sync::{broadcast, RwLock},
 };
 
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,7 @@ struct AppState {
     stats: Arc<RwLock<StatsMap>>,
     stats_tx: broadcast::Sender<serde_json::Value>,
     secret_store: SecretStore,
+    controller: Arc<reconcile::Controller>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -69,8 +71,7 @@ async fn main() -> anyhow::Result<()> {
         state_db_path_clone
     );
 
-    let (reconcile_state_tx, mut resoncile_state_rx) = mpsc::channel::<()>(1);
-    let is_reconciling = Arc::new(AtomicBool::new(false));
+    store::initialize(&db)?;
 
     let (stats_tx, _) = broadcast::channel(100);
 
@@ -98,49 +99,17 @@ async fn main() -> anyhow::Result<()> {
         stats: Arc::new(RwLock::new(BTreeMap::default())),
         stats_tx,
         secret_store,
+        controller: Arc::new(reconcile::Controller::default()),
     });
 
-    let reconcile_state = Arc::clone(&app_state);
-    let is_reconciling_clone = Arc::clone(&is_reconciling);
-    tokio::spawn(async move {
-        while let Some(_) = resoncile_state_rx.recv().await {
-            tracing::debug!("Received reconcile trigger");
-
-            if is_reconciling_clone
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                tracing::debug!("[reconcile] Begin");
-                if let Err(e) = reconcile(&*reconcile_state.db, &*reconcile_state.orqos).await {
-                    tracing::error!("[reconcile] Error: {:#}", e);
-                }
-
-                is_reconciling_clone.store(false, Ordering::SeqCst);
-                tracing::debug!("[reconcile] Done");
-            } else {
-                tracing::debug!("[reconcile] Already running — dropped request");
-            }
-        }
-    });
-
-    // Spawn periodic reconcile trigger
-    let tx_periodic = reconcile_state_tx.clone();
-    tokio::spawn(async move {
-        let interval = std::env::var("RECONCILE_INTERVAL")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(15);
-
-        tracing::info!("Starting periodic reconcile every {} seconds", interval);
-
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval));
-        loop {
-            tracing::debug!("Triggering periodic reconcile");
-
-            interval.tick().await;
-            let _ = tx_periodic.send(()).await;
-        }
-    });
+    let interval = env::var("RECONCILE_INTERVAL")
+        .unwrap_or_else(|_| "15".into())
+        .parse::<u64>()?;
+    anyhow::ensure!(interval > 0, "RECONCILE_INTERVAL must be positive seconds");
+    tokio::spawn(reconcile::run(
+        app_state.clone(),
+        std::time::Duration::from_secs(interval),
+    ));
 
     let container_stats_handler_clone = Arc::clone(&app_state);
 

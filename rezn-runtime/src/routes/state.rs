@@ -1,57 +1,31 @@
-use axum::body::Bytes;
-use axum::extract::State;
-use axum::response::{IntoResponse, Response};
-use axum::Json;
+use crate::{
+    routes::common::{app_error, AppError},
+    store, AppState,
+};
+use axum::{extract::State, Json};
 use common::types::DesiredMap;
-
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::routes::common::{app_error, AppError};
-use crate::AppState;
-
 #[utoipa::path(
-    get,
-    path = "/state",
-    responses(
-        (status = 200, body = Object)
-    ),
-    tag = "State",
+    get, path = "/state",
+    responses((status = 200, description = "Accepted desired intent, not runtime outcomes", body = Object), (status = 500, description = "Persisted state cannot be read or validated", body = String)), tag = "State"
 )]
 pub async fn get_state_handler(
     State(app): State<Arc<AppState>>,
 ) -> Result<Json<DesiredMap>, AppError> {
-    tracing::debug!("Retrieving current state");
-
-    let desired: DesiredMap = match app.db.get("desired").map_err(app_error)? {
-        Some(bytes) => match serde_json::from_slice(&bytes) {
-            Ok(map) => map,
-            Err(e) => {
-                tracing::warn!("Invalid 'desired' state, falling back to empty: {e}");
-                BTreeMap::new()
-            }
-        },
-        None => {
-            tracing::debug!("No 'desired' state found, returning empty");
-            BTreeMap::new()
-        }
-    };
-
-    Ok(Json(desired))
+    Ok(Json(
+        store::load(&app.db)
+            .and_then(|state| state.desired())
+            .map_err(app_error)?,
+    ))
 }
 
 #[utoipa::path(
-    get,
-    path = "/state/raw",
-    responses(
-        (status = 200, body = Object)
-    ),
-    tag = "State",
+    get, path = "/state/raw",
+    responses((status = 200, description = "Desired intent as JSON", body = Object), (status = 500, description = "Persisted state cannot be read or validated", body = String)), tag = "State"
 )]
-pub async fn get_state_raw_handler(State(app): State<Arc<AppState>>) -> Result<Response, AppError> {
-    let data = match app.db.get("desired").map_err(app_error)? {
-        Some(ivec) => Bytes::from(ivec.to_vec()),
-        None => Bytes::copy_from_slice(b"{}"),
-    };
-    Ok(([("Content-Type", "application/json")], Bytes::from(data)).into_response())
+pub async fn get_state_raw_handler(
+    State(app): State<Arc<AppState>>,
+) -> Result<Json<DesiredMap>, AppError> {
+    get_state_handler(State(app)).await
 }

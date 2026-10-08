@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use reqwest::{Client, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use utoipa::ToSchema;
 
 #[derive(Clone)]
 pub struct OrqosClient {
@@ -24,13 +25,26 @@ pub struct PortMap {
     pub host: u16,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ContainerSummary {
     #[serde(rename = "Id")]
     pub id: String,
-    #[serde(rename = "Names")]
-    pub names: Vec<String>,
+    pub labels: HashMap<String, String>,
+    pub image: String,
+    pub state: String,
+    pub ports: Vec<ObservedPort>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct ObservedPort {
+    #[serde(rename = "IP")]
+    pub ip: Option<String>,
+    pub private_port: u16,
+    pub public_port: Option<u16>,
+    #[serde(rename = "Type")]
+    pub protocol: String,
 }
 
 impl OrqosClient {
@@ -44,13 +58,16 @@ impl OrqosClient {
         }
     }
 
-    pub async fn list_pod_containers(&self, pod_label: &str) -> Result<Vec<ContainerSummary>> {
+    pub async fn list_owned_containers(&self, owner: &str) -> Result<Vec<ContainerSummary>> {
         let res = self
             .send_request(
                 "list containers",
                 self.client
                     .get(format!("{}/docker/containers", self.base_url))
-                    .query(&[("label", format!("pod={}", pod_label))]),
+                    .query(&[
+                        ("label", format!("dev.rezn.owner={owner}")),
+                        ("all", "true".into()),
+                    ]),
             )
             .await?
             .json::<Vec<ContainerSummary>>()
@@ -77,24 +94,22 @@ impl OrqosClient {
         Ok(())
     }
 
-    pub async fn stop_container(&self, name: &str) -> Result<()> {
+    #[cfg(test)]
+    pub async fn stop_container(&self, id: &str) -> Result<()> {
         self.send_request(
             "stop container",
             self.client
-                .post(format!("{}/docker/containers/{}/stop", self.base_url, name)),
+                .post(format!("{}/docker/containers/{}/stop", self.base_url, id)),
         )
         .await?;
         Ok(())
     }
 
-    pub async fn remove_container(&self, name: &str) -> Result<()> {
+    pub async fn remove_container(&self, id: &str) -> Result<()> {
         self.send_request(
             "remove container",
             self.client
-                .post(format!(
-                    "{}/docker/containers/{}/remove",
-                    self.base_url, name
-                ))
+                .post(format!("{}/docker/containers/{}/remove", self.base_url, id))
                 .json(&serde_json::json!({ "force": true })),
         )
         .await?;
@@ -146,14 +161,14 @@ mod tests {
                 |request| match (request.method.as_str(), request.uri.path()) {
                     ("GET", "/docker/containers") => (
                         StatusCode::OK,
-                        json!([{"Id": "container-1", "Names": ["/prod-web-1"]}]).to_string(),
+                        json!([{"Id": "container-1", "Labels": {}, "Image": "nginx:alpine", "State": "running", "Ports": [{"IP":"0.0.0.0", "PrivatePort":80, "PublicPort":32768, "Type":"tcp"}]}]).to_string(),
                     ),
                     ("POST", "/docker/containers") => (
                         StatusCode::OK,
                         json!({"id": "container-1", "name": "prod-web-1", "ports": {}}).to_string(),
                     ),
-                    ("POST", "/docker/containers/prod-web-1/stop")
-                    | ("POST", "/docker/containers/prod-web-1/remove") => {
+                    ("POST", "/docker/containers/container-1/stop")
+                    | ("POST", "/docker/containers/container-1/remove") => {
                         (StatusCode::NO_CONTENT, String::new())
                     }
                     _ => (StatusCode::NOT_FOUND, "Unknown route".into()),
@@ -161,24 +176,31 @@ mod tests {
             )
             .await;
 
-        let containers = server.client.list_pod_containers("prod:web").await.unwrap();
+        let containers = server
+            .client
+            .list_owned_containers("runtime-1")
+            .await
+            .unwrap();
         assert_eq!(containers.len(), 1);
         assert_eq!(containers[0].id, "container-1");
-        assert_eq!(containers[0].names, ["/prod-web-1"]);
+        assert_eq!(containers[0].ports[0].public_port, Some(32768));
         server
             .client
             .start_container(create_request())
             .await
             .unwrap();
-        server.client.stop_container("prod-web-1").await.unwrap();
-        server.client.remove_container("prod-web-1").await.unwrap();
+        server.client.stop_container("container-1").await.unwrap();
+        server.client.remove_container("container-1").await.unwrap();
 
         let requests = server.requests();
         assert_eq!(requests.len(), 4);
         assert_eq!(requests[0].method, Method::GET);
         assert_eq!(
             requests[0].query(),
-            HashMap::from([("label".into(), "pod=prod:web".into())])
+            HashMap::from([
+                ("label".into(), "dev.rezn.owner=runtime-1".into()),
+                ("all".into(), "true".into())
+            ])
         );
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&requests[1].body).unwrap(),
@@ -213,7 +235,7 @@ mod tests {
                     "list containers",
                     server
                         .client
-                        .list_pod_containers("prod:web")
+                        .list_owned_containers("runtime-1")
                         .await
                         .map(|_| ()),
                 ),
@@ -223,11 +245,11 @@ mod tests {
                 ),
                 (
                     "stop container",
-                    server.client.stop_container("prod-web-1").await,
+                    server.client.stop_container("container-1").await,
                 ),
                 (
                     "remove container",
-                    server.client.remove_container("prod-web-1").await,
+                    server.client.remove_container("container-1").await,
                 ),
             ];
             for (operation, result) in results {
@@ -244,7 +266,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_successful_list_is_an_error() {
         let server = MockOrqos::start(|_| (StatusCode::OK, "not JSON".into())).await;
-        let result = server.client.list_pod_containers("prod:web").await;
+        let result = server.client.list_owned_containers("runtime-1").await;
         assert!(result
             .err()
             .unwrap()
