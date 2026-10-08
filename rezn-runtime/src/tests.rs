@@ -834,3 +834,44 @@ async fn incomplete_or_invalid_observation_never_causes_replacement() {
     app.controller.reconcile(&app.db, &app.orqos).await.unwrap();
     assert_eq!(ids(&app).await, vec!["id1"]);
 }
+
+#[test]
+fn shared_jcs_and_ed25519_fixture_matches_the_dsl_verifier() {
+    use common::types::InstructionWrapper;
+    let raw = include_str!("../tests/fixtures/signatures/signed-program.json");
+    let mut wrapper: InstructionWrapper = serde_json::from_str(raw).unwrap();
+    let canonical = serde_json_canonicalizer::to_vec(&wrapper.program).unwrap();
+    assert_eq!(
+        canonical,
+        include_bytes!("../tests/fixtures/signatures/program.canonical.json")
+    );
+    crate::intent::verify(&wrapper).unwrap();
+    crate::intent::validate_program(&wrapper.program).unwrap();
+
+    // Both verifiers accept a different nested object ordering on the wire.
+    let reordered = format!(
+        r#"{{"signature":{},"program":[{{"name":"web","kind":"pod","fields":{{"replicas":1,"ports":[80,81],"image":"nginx:alpine"}}}},{{"name":"side","kind":"pod","fields":{{"replicas":0,"ports":[80],"image":"httpd:alpine"}}}}]}}"#,
+        serde_json::to_string(&wrapper.signature).unwrap()
+    );
+    let reordered: InstructionWrapper = serde_json::from_str(&reordered).unwrap();
+    crate::intent::verify(&reordered).unwrap();
+    let mut equivalent_number = wrapper.clone();
+    equivalent_number.program[0]["fields"]["replicas"] = json!(1.0);
+    crate::intent::verify(&equivalent_number).unwrap();
+
+    for field in ["image", "replicas", "ports", "secure"] {
+        let mut tampered = wrapper.clone();
+        tampered.program[0]["fields"][field] = match field {
+            "image" => json!("httpd:alpine"),
+            "replicas" => json!(2),
+            "ports" => json!([81, 80]),
+            _ => json!(false),
+        };
+        assert!(
+            crate::intent::verify(&tampered).is_err(),
+            "tampered {field}"
+        );
+    }
+    wrapper.program.reverse();
+    assert!(crate::intent::verify(&wrapper).is_err());
+}
