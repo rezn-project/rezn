@@ -1,0 +1,5 @@
+# Per-replica state volume, owned by the workload UID/GID from creation (fsGroup on first use only).
+[Volume]
+VolumeName=rezn-spike-worker-0
+User=1654
+Group=1654

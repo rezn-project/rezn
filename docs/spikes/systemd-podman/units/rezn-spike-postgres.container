@@ -1,0 +1,20 @@
+# PostgreSQL; the unit only counts as started once pg_isready succeeds (readiness-gated start).
+[Container]
+ContainerName=rezn-spike-postgres
+Pod=rezn-spike-pg.pod
+Image=docker.io/library/postgres:17-alpine
+Secret=rezn-spike-pg-password,type=env,target=POSTGRES_PASSWORD
+Volume=rezn-spike-pg-0.volume:/var/lib/postgresql/data
+HealthCmd=pg_isready -q -U postgres
+HealthInterval=5s
+HealthStartPeriod=60s
+Notify=healthy
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=180
+
+# Crash-loop backoff: 2s, growing over 5 steps to 60s.
+RestartSec=2s
+RestartSteps=5
+RestartMaxDelaySec=60s

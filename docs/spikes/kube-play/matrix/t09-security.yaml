@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Pod
+metadata: { name: rkp-sec }
+spec:
+  securityContext: { runAsNonRoot: true, runAsUser: 1654, runAsGroup: 1654, fsGroup: 2000, fsGroupChangePolicy: OnRootMismatch, supplementalGroups: [3000], seccompProfile: { type: RuntimeDefault } }
+  containers:
+    - name: main
+      image: docker.io/library/alpine:3.22
+      command: [sh, -c, "id; grep -E '^(CapEff|CapBnd|NoNewPrivs|Seccomp):' /proc/self/status; touch /x 2>/dev/null && echo ROOT-RW || echo root-ro; stat -c 'data %u:%g %a' /data; sleep 600"]
+      securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+      volumeMounts: [{ name: rkp-sec-data, mountPath: /data }]
+  volumes: [{ name: rkp-sec-data, persistentVolumeClaim: { claimName: rkp-sec-claim } }]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: rkp-sec-claim }
+spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 1Gi } } }

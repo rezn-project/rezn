@@ -1,0 +1,8 @@
+# Ordered replica 0 of "pg": stable hostname and service aliases (StatefulSet pod + headless/ClusterIP names).
+[Pod]
+PodName=rezn-spike-pg-0
+HostName=pg-0
+Network=rezn-spike.network
+NetworkAlias=pg
+NetworkAlias=pg.spike.svc
+ExitPolicy=continue

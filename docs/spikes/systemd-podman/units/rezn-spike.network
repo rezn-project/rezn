@@ -1,0 +1,3 @@
+# Namespace network: every pod of the spike joins it and resolves the others by alias.
+[Network]
+NetworkName=rezn-spike

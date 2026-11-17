@@ -1,0 +1,11 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: rkp-dep }
+spec:
+  replicas: 3
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: rkp-dep } }
+  template:
+    metadata: { labels: { app: rkp-dep } }
+    spec:
+      containers: [{ name: main, image: docker.io/library/alpine:3.22, command: [sh, -c, "hostname; sleep 600"] }]

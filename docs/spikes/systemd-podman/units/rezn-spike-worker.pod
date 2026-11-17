@@ -1,0 +1,6 @@
+# Ordered replica 0 of "worker": its hostname is its identity (worker-0 -> Node worker-0).
+[Pod]
+PodName=rezn-spike-worker-0
+HostName=worker-0
+Network=rezn-spike.network
+ExitPolicy=continue

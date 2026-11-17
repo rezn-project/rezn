@@ -1,0 +1,33 @@
+# The worker: starts after the sidecar is healthy; SIGTERM lets it finish the current item within StopTimeout.
+[Unit]
+Requires=rezn-spike-worker-creds.service
+After=rezn-spike-worker-creds.service
+
+[Container]
+ContainerName=rezn-spike-worker-0
+Pod=rezn-spike-worker.pod
+Image=docker.io/library/alpine:3.22
+User=1654
+Group=1654
+ReadOnly=true
+DropCapability=ALL
+NoNewPrivileges=true
+Volume=rezn-spike-worker-0.volume:/state
+Volume=rezn-spike-worker-creds.volume:/run/creds:ro
+Volume=@SPIKE_DIR@/scripts:/opt/spike:ro
+Secret=rezn-spike-worker-clients,type=mount,target=/run/client/client-secret-0,uid=1654,gid=1654,mode=0400
+Tmpfs=/tmp:size=64m,mode=1777
+Mount=type=tmpfs,destination=/run/status,tmpfs-size=1m,tmpfs-mode=0700,U=true
+Exec=/bin/sh /opt/spike/worker.sh
+HealthCmd=/bin/sh -c "grep -Eq '\"state\":\"(running|waiting)\"' /run/status/worker.json"
+HealthInterval=10s
+StopSignal=SIGTERM
+StopTimeout=40
+
+[Service]
+Restart=on-failure
+
+# Crash-loop backoff: 2s, growing over 5 steps to 60s.
+RestartSec=2s
+RestartSteps=5
+RestartMaxDelaySec=60s

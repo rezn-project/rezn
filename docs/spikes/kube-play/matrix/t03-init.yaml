@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Pod
+metadata: { name: rkp-init }
+spec:
+  initContainers:
+    - { name: first, image: docker.io/library/alpine:3.22, command: [sh, -c, "date +%s.%N > /shared/first; sleep 2"], volumeMounts: [{ name: shared, mountPath: /shared }] }
+    - { name: second, image: docker.io/library/alpine:3.22, command: [sh, -c, "date +%s.%N > /shared/second"], volumeMounts: [{ name: shared, mountPath: /shared }] }
+  containers:
+    - { name: main, image: docker.io/library/alpine:3.22, command: [sh, -c, "date +%s.%N > /shared/main; ls /shared; sleep 600"], volumeMounts: [{ name: shared, mountPath: /shared }] }
+  volumes: [{ name: shared, hostPath: { path: /tmp/rkp-t03-shared, type: DirectoryOrCreate } }]

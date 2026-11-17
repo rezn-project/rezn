@@ -1,0 +1,31 @@
+# Restartable sidecar: the unit is started only once its health check passes, so the worker waits for it.
+[Unit]
+Requires=rezn-spike-worker-init.service
+After=rezn-spike-worker-init.service
+
+[Container]
+ContainerName=rezn-spike-worker-0-creds
+Pod=rezn-spike-worker.pod
+Image=docker.io/library/alpine:3.22
+User=1654
+Group=1654
+ReadOnly=true
+DropCapability=ALL
+NoNewPrivileges=true
+Volume=rezn-spike-worker-0.volume:/state
+Volume=rezn-spike-worker-creds.volume:/run/creds
+Volume=@SPIKE_DIR@/scripts:/opt/spike:ro
+Secret=rezn-spike-worker-clients,type=mount,target=/run/client/client-secret-0,uid=1654,gid=1654,mode=0400
+Exec=/bin/sh /opt/spike/creds.sh
+HealthCmd=/bin/sh -c 'test -s /run/creds/worker/access-token && test -s /state/keys/recovery.key'
+HealthInterval=2s
+HealthStartPeriod=30s
+Notify=healthy
+
+[Service]
+Restart=always
+
+# Crash-loop backoff: 2s, growing over 5 steps to 60s.
+RestartSec=2s
+RestartSteps=5
+RestartMaxDelaySec=60s

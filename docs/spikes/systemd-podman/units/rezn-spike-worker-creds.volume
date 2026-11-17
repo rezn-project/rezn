@@ -1,0 +1,6 @@
+# Memory-backed scratch shared by the pod's containers (emptyDir medium: Memory, sizeLimit 1Mi).
+[Volume]
+VolumeName=rezn-spike-worker-0-creds
+Type=tmpfs
+Device=tmpfs
+Options=size=1m,mode=0700,uid=1654,gid=1654
