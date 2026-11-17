@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata: { name: rkp-svc-db }
+spec: { selector: { app: rkp-db }, ports: [{ port: 5432, targetPort: 5432 }] }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: rkp-db, labels: { app: rkp-db } }
+spec:
+  hostname: db-0
+  subdomain: rkp-svc-db
+  containers: [{ name: db, image: docker.io/library/alpine:3.22, command: [sh, -c, "while true; do echo hi | nc -l -p 5432; done"], ports: [{ containerPort: 5432 }] }]
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: rkp-client }
+spec:
+  containers:
+    - name: c
+      image: docker.io/library/alpine:3.22
+      command: [sh, -c, "sleep 3; hostname; for n in rkp-db db-0 db-0.rkp-svc-db rkp-svc-db rkp-svc-db.default.svc rkp-db-db; do printf '%s -> %s\n' $n \"$(getent hosts $n | awk '{print $1}')\"; done; sleep 600"]

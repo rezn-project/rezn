@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Pod
+metadata: { name: rkp-ed-a }
+spec:
+  containers:
+    - { name: c, image: docker.io/library/alpine:3.22, command: [sh, -c, "echo from-a > /scratch/a; echo from-a > /mem/a; sleep 600"], volumeMounts: [{ name: rkp-scratch, mountPath: /scratch }, { name: rkp-mem, mountPath: /mem }] }
+    - { name: d, image: docker.io/library/alpine:3.22, command: [sh, -c, "sleep 600"], volumeMounts: [{ name: rkp-scratch, mountPath: /scratch }, { name: rkp-mem, mountPath: /mem }] }
+  volumes:
+    - { name: rkp-scratch, emptyDir: { sizeLimit: 8Mi } }
+    - { name: rkp-mem, emptyDir: { medium: Memory, sizeLimit: 4Mi } }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: rkp-ed-b }
+spec:
+  containers:
+    - { name: c, image: docker.io/library/alpine:3.22, command: [sh, -c, "sleep 600"], volumeMounts: [{ name: rkp-scratch, mountPath: /scratch }, { name: rkp-mem, mountPath: /mem }] }
+  volumes:
+    - { name: rkp-scratch, emptyDir: {} }
+    - { name: rkp-mem, emptyDir: { medium: Memory } }

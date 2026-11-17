@@ -23,7 +23,7 @@ Rezn currently drives Docker containers through Orqos's Docker API.
 | --- | --- |
 | **A. Docker through Orqos** (status quo) | No pods, no supervision ordering, no jobs or timers, no secret files with owner and mode. Rezn would have to build a supervisor on top of Docker and keep it running for workloads to be restarted. |
 | **B. systemd + Podman (Quadlet units) through Orqos** | Pods with hostnames and shared network namespaces, one-shot init units, health-gated start (`Notify=healthy`), unit ordering, restart with exponential backoff, cgroup limits, timers, Podman secrets with owner and mode, networks with DNS aliases. systemd supervises independently of Rezn. Verified in #27. |
-| **C. `podman kube play`** | Silently drops StatefulSets and CronJobs, ignores ordering, Service names and NetworkPolicies, and shares `emptyDir` volumes across pods (#28). Not viable as an executor. |
+| **C. `podman kube play`** | Silently drops StatefulSets and CronJobs, ignores ordering, Service names, NetworkPolicies, readiness probes, native sidecars, `fsGroup` and Job retry limits, restarts without backoff, shares `emptyDir` and Secret volumes across pods, and panics on a Job-only manifest under Quadlet (#28). Podman 6.2.0 fixes some field mappings but none of the missing kinds or semantics. Not viable as an executor. |
 | **D. containerd + CNI** | A kubelet rewrite: images, sandboxes, networking, supervision and logs all built in Rezn. Highest cost, no supervision independent of Rezn. |
 | **E. Embed a Kubernetes distribution** (k3s) | Works, but makes Rezn a Kubernetes wrapper, which defeats the goal. |
 
