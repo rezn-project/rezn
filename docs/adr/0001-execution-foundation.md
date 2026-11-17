@@ -1,6 +1,6 @@
 # ADR 0001: Execution foundation
 
-- Status: proposed
+- Status: accepted (2026-11-17)
 - Date: 2026-11-17
 - Issue: [#29](https://github.com/rezn-project/rezn/issues/29); epic [#26](https://github.com/rezn-project/rezn/issues/26)
 - Evidence: [systemd + Podman spike](../spikes/systemd-podman/README.md) ([#27](https://github.com/rezn-project/rezn/issues/27)),
