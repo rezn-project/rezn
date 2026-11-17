@@ -2,6 +2,8 @@
 
 Rezn is a local Docker controller that accepts signed desired intent and converges containers through the existing Orqos Docker API.
 
+RawPair's native host workspace MVP is implemented in RawPair and Orqos, not Rezn. Rezn keeps its existing Docker role; see [the host workspace boundary](docs/HOST_WORKSPACES.md) for the scope split and possible later work.
+
 The executable subset is deliberately small: named `pod` instructions with an image, replica count and TCP container ports. Images must already exist in the selected Docker engine. Applying intent replaces one deployment's complete program; an empty signed program removes its workloads. Replica count zero is valid.
 
 The next program format, [IR v2](docs/IR-v2.md), is accepted, validated and stored by `/apply` (and checked offline by `reznctl validate`) but not executed yet; the [Kubernetes manifest subset](docs/KUBERNETES-SUBSET.md) it will import is specified. See the [roadmap](https://github.com/rezn-project/rezn/issues/25).
