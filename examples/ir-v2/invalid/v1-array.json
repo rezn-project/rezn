@@ -1,0 +1,13 @@
+[
+  {
+    "kind": "pod",
+    "name": "web",
+    "fields": {
+      "image": "nginx:alpine",
+      "replicas": 1,
+      "ports": [
+        80
+      ]
+    }
+  }
+]

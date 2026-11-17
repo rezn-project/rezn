@@ -4,6 +4,8 @@ Rezn is a local Docker controller that accepts signed desired intent and converg
 
 The executable subset is deliberately small: named `pod` instructions with an image, replica count and TCP container ports. Images must already exist in the selected Docker engine. Applying intent replaces one deployment's complete program; an empty signed program removes its workloads. Replica count zero is valid.
 
+The next program format, [IR v2](docs/IR-v2.md), and the [Kubernetes manifest subset](docs/KUBERNETES-SUBSET.md) it imports are specified but not executable yet; see the [roadmap](https://github.com/rezn-project/rezn/issues/25).
+
 ```json
 [{"kind":"pod","name":"web","fields":{"image":"nginx:alpine","replicas":1,"ports":[80]}}]
 ```

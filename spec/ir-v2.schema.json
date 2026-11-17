@@ -1,0 +1,544 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rezn.dev/schema/ir-v2.json",
+  "title": "Rezn IR v2 program",
+  "description": "Structure and value domains of a Rezn IR v2 program. Cross-references and uniqueness are specified in docs/IR-v2.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ir", "deployment", "namespace", "resources"],
+  "properties": {
+    "ir": { "const": "rezn.dev/v2" },
+    "deployment": { "$ref": "#/$defs/name" },
+    "namespace": { "$ref": "#/$defs/name" },
+    "resources": { "type": "array", "items": { "$ref": "#/$defs/resource" } }
+  },
+  "$defs": {
+    "name": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$" },
+    "shortName": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9]{0,50}[a-z0-9])?$" },
+    "portName": { "type": "string", "pattern": "^(?=.*[a-z])[a-z0-9]([-a-z0-9]{0,13}[a-z0-9])?$" },
+    "key": { "type": "string", "pattern": "^[-._a-zA-Z0-9]{1,253}$" },
+    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "portRef": { "oneOf": [{ "$ref": "#/$defs/port" }, { "$ref": "#/$defs/portName" }] },
+    "count": { "type": "integer", "minimum": 0 },
+    "positive": { "type": "integer", "minimum": 1 },
+    "id": { "type": "integer", "minimum": 0, "maximum": 4294967294 },
+    "mode": { "type": "integer", "minimum": 0, "maximum": 511 },
+    "absolutePath": { "type": "string", "pattern": "^/" },
+    "relativePath": { "type": "string", "minLength": 1, "not": { "pattern": "(^/|(^|/)\\.\\.(/|$))" } },
+    "image": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[^\\s/][^\\s]*$" },
+    "phase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["when", "on"],
+      "properties": {
+        "when": { "enum": ["before", "after"] },
+        "on": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["install", "upgrade"] } },
+        "weight": { "type": "integer" }
+      }
+    },
+    "resource": {
+      "type": "object",
+      "required": ["kind", "name", "fields"],
+      "properties": {
+        "kind": { "enum": ["replica_set", "ordered_replica_set", "job", "scheduled_job", "service", "volume_claim", "config", "secret", "ingress", "network_policy"] }
+      },
+      "oneOf": [
+        { "$ref": "#/$defs/kind_replica_set" },
+        { "$ref": "#/$defs/kind_ordered_replica_set" },
+        { "$ref": "#/$defs/kind_job" },
+        { "$ref": "#/$defs/kind_scheduled_job" },
+        { "$ref": "#/$defs/kind_service" },
+        { "$ref": "#/$defs/kind_volume_claim" },
+        { "$ref": "#/$defs/kind_config" },
+        { "$ref": "#/$defs/kind_secret" },
+        { "$ref": "#/$defs/kind_ingress" },
+        { "$ref": "#/$defs/kind_network_policy" }
+      ]
+    },
+    "kind_replica_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "replica_set" },
+        "name": { "$ref": "#/$defs/name" },
+        "phase": { "$ref": "#/$defs/phase" },
+        "fields": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["replicas", "pod"],
+          "properties": {
+            "replicas": { "$ref": "#/$defs/count" },
+            "pod": { "$ref": "#/$defs/pod" }
+          }
+        }
+      }
+    },
+    "kind_ordered_replica_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "ordered_replica_set" },
+        "name": { "$ref": "#/$defs/shortName" },
+        "phase": { "$ref": "#/$defs/phase" },
+        "fields": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["replicas", "service", "pod"],
+          "properties": {
+            "replicas": { "$ref": "#/$defs/count" },
+            "service": { "$ref": "#/$defs/name" },
+            "pod_management": { "enum": ["parallel", "ordered"] },
+            "volume_claims": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "bytes"],
+                "properties": { "name": { "$ref": "#/$defs/name" }, "bytes": { "$ref": "#/$defs/positive" } }
+              }
+            },
+            "retain": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": { "on_scale_down": { "type": "boolean" }, "on_removal": { "type": "boolean" } }
+            },
+            "pod": { "$ref": "#/$defs/pod" }
+          }
+        }
+      }
+    },
+    "jobFields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pod"],
+      "properties": {
+        "backoff_limit": { "$ref": "#/$defs/count" },
+        "pod": { "$ref": "#/$defs/pod" }
+      }
+    },
+    "kind_job": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "job" },
+        "name": { "$ref": "#/$defs/name" },
+        "phase": { "$ref": "#/$defs/phase" },
+        "fields": { "$ref": "#/$defs/jobFields" }
+      }
+    },
+    "kind_scheduled_job": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "scheduled_job" },
+        "name": { "$ref": "#/$defs/shortName" },
+        "phase": { "$ref": "#/$defs/phase" },
+        "fields": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schedule", "job"],
+          "properties": {
+            "schedule": { "type": "string", "pattern": "^[0-9*/,-]+( [0-9*/,-]+){4}$" },
+            "concurrency": { "enum": ["forbid", "replace", "allow"] },
+            "keep_succeeded": { "$ref": "#/$defs/count" },
+            "keep_failed": { "$ref": "#/$defs/count" },
+            "job": { "$ref": "#/$defs/jobFields" }
+          }
+        }
+      }
+    },
+    "kind_service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "service" },
+        "name": { "$ref": "#/$defs/name" },
+        "phase": { "$ref": "#/$defs/phase" },
+        "fields": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["target", "ports"],
+          "properties": {
+            "target": { "$ref": "#/$defs/name" },
+            "headless": { "type": "boolean" },
+            "ports": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "port", "target_port"],
+                "properties": {
+                  "name": { "$ref": "#/$defs/portName" },
+                  "port": { "$ref": "#/$defs/port" },
+                  "target_port": { "$ref": "#/$defs/portRef" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "kind_volume_claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "volume_claim" },
+        "name": { "$ref": "#/$defs/name" },
+        "phase": { "$ref": "#/$defs/phase" },
+        "fields": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bytes"],
+          "properties": { "bytes": { "$ref": "#/$defs/positive" } }
+        }
+      }
+    },
+    "kind_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "config" },
+        "name": { "$ref": "#/$defs/name" },
+        "phase": { "$ref": "#/$defs/phase" },
+        "fields": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["data"],
+          "properties": {
+            "data": { "type": "object", "propertyNames": { "$ref": "#/$defs/key" }, "additionalProperties": { "type": "string" } }
+          }
+        }
+      }
+    },
+    "kind_secret": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "secret" },
+        "name": { "$ref": "#/$defs/name" },
+        "phase": { "$ref": "#/$defs/phase" },
+        "fields": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "keys", "source"],
+          "properties": {
+            "type": { "enum": ["opaque", "tls"] },
+            "keys": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/key" } },
+            "source": { "$ref": "#/$defs/secretSource" }
+          },
+          "if": { "properties": { "type": { "const": "tls" } } },
+          "then": {
+            "properties": {
+              "keys": { "minItems": 2, "maxItems": 2, "items": { "enum": ["tls.crt", "tls.key"] } }
+            }
+          }
+        }
+      }
+    },
+    "secretSource": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "store": { "type": "object", "additionalProperties": false },
+        "seed_once": { "type": "object", "additionalProperties": false },
+        "random": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "$ref": "#/$defs/key" },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["length", "alphabet"],
+            "properties": {
+              "length": { "type": "integer", "minimum": 16, "maximum": 4096 },
+              "alphabet": { "enum": ["alphanumeric", "hex"] }
+            }
+          }
+        },
+        "ca": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["common_name", "days"],
+          "properties": { "common_name": { "type": "string", "minLength": 1 }, "days": { "$ref": "#/$defs/positive" } }
+        },
+        "certificate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ca", "dns_names", "days"],
+          "properties": {
+            "ca": { "$ref": "#/$defs/name" },
+            "dns_names": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+            "days": { "$ref": "#/$defs/positive" }
+          }
+        }
+      }
+    },
+    "kind_ingress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "ingress" },
+        "name": { "$ref": "#/$defs/name" },
+        "phase": { "$ref": "#/$defs/phase" },
+        "fields": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["hosts"],
+          "properties": {
+            "hosts": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["host", "paths"],
+                "properties": {
+                  "host": { "type": "string", "minLength": 1 },
+                  "paths": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["path", "service", "port"],
+                      "properties": {
+                        "path": { "$ref": "#/$defs/absolutePath" },
+                        "service": { "$ref": "#/$defs/name" },
+                        "port": { "$ref": "#/$defs/portName" }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "tls": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["hosts", "secret"],
+                "properties": {
+                  "hosts": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+                  "secret": { "$ref": "#/$defs/name" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "peer": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "workload": { "$ref": "#/$defs/name" },
+        "cidr": { "type": "string", "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$" }
+      }
+    },
+    "policyPorts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["port", "protocol"],
+        "properties": { "port": { "$ref": "#/$defs/port" }, "protocol": { "enum": ["tcp", "udp"] } }
+      }
+    },
+    "kind_network_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "network_policy" },
+        "name": { "$ref": "#/$defs/name" },
+        "phase": { "$ref": "#/$defs/phase" },
+        "fields": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["targets"],
+          "anyOf": [{ "required": ["ingress"] }, { "required": ["egress"] }],
+          "properties": {
+            "targets": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/name" } },
+            "ingress": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": { "from": { "type": "array", "items": { "$ref": "#/$defs/peer" } }, "ports": { "$ref": "#/$defs/policyPorts" } }
+              }
+            },
+            "egress": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": { "to": { "type": "array", "items": { "$ref": "#/$defs/peer" } }, "ports": { "$ref": "#/$defs/policyPorts" } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "pod": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["containers"],
+      "properties": {
+        "containers": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/container" } },
+        "init": { "type": "array", "items": { "$ref": "#/$defs/container" } },
+        "sidecars": { "type": "array", "items": { "$ref": "#/$defs/container" } },
+        "restart": { "enum": ["always", "on_failure", "never"] },
+        "grace_seconds": { "$ref": "#/$defs/count" },
+        "user": { "$ref": "#/$defs/id" },
+        "group": { "$ref": "#/$defs/id" },
+        "run_as_non_root": { "type": "boolean" },
+        "fs_group": { "$ref": "#/$defs/id" },
+        "fs_group_policy": { "const": "on_root_mismatch" },
+        "seccomp": { "const": "runtime_default" },
+        "image_pull_secrets": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/name" } },
+        "volumes": { "type": "array", "items": { "$ref": "#/$defs/volume" } }
+      }
+    },
+    "projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "$ref": "#/$defs/name" },
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["key", "path"],
+            "properties": { "key": { "$ref": "#/$defs/key" }, "path": { "$ref": "#/$defs/relativePath" } }
+          }
+        },
+        "mode": { "$ref": "#/$defs/mode" }
+      }
+    },
+    "volume": {
+      "type": "object",
+      "required": ["name"],
+      "minProperties": 2,
+      "maxProperties": 2,
+      "additionalProperties": false,
+      "properties": {
+        "name": { "$ref": "#/$defs/name" },
+        "scratch": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["medium", "bytes"],
+          "properties": { "medium": { "enum": ["disk", "memory"] }, "bytes": { "$ref": "#/$defs/positive" } }
+        },
+        "claim": { "$ref": "#/$defs/name" },
+        "config": { "$ref": "#/$defs/projection" },
+        "secret": { "$ref": "#/$defs/projection" }
+      }
+    },
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "oneOf": [{ "required": ["exec"] }, { "required": ["http"] }],
+      "properties": {
+        "exec": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "http": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "port", "scheme"],
+          "properties": {
+            "path": { "$ref": "#/$defs/absolutePath" },
+            "port": { "$ref": "#/$defs/portRef" },
+            "scheme": { "enum": ["http", "https"] }
+          }
+        },
+        "period_seconds": { "$ref": "#/$defs/positive" },
+        "timeout_seconds": { "$ref": "#/$defs/positive" },
+        "failure_threshold": { "$ref": "#/$defs/positive" }
+      }
+    },
+    "env": {
+      "type": "object",
+      "required": ["name"],
+      "minProperties": 2,
+      "maxProperties": 2,
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$" },
+        "value": { "type": "string" },
+        "secret": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "key"],
+          "properties": { "name": { "$ref": "#/$defs/name" }, "key": { "$ref": "#/$defs/key" } }
+        },
+        "pod_ip": { "const": true }
+      }
+    },
+    "container": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "image"],
+      "properties": {
+        "name": { "$ref": "#/$defs/name" },
+        "image": { "$ref": "#/$defs/image" },
+        "pull": { "enum": ["if_not_present", "always", "never"] },
+        "command": { "type": "array", "items": { "type": "string" } },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "env": { "type": "array", "items": { "$ref": "#/$defs/env" } },
+        "ports": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "port"],
+            "properties": { "name": { "$ref": "#/$defs/portName" }, "port": { "$ref": "#/$defs/port" } }
+          }
+        },
+        "startup": { "$ref": "#/$defs/probe" },
+        "readiness": { "$ref": "#/$defs/probe" },
+        "liveness": { "$ref": "#/$defs/probe" },
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cpu_request_millis": { "$ref": "#/$defs/positive" },
+            "cpu_limit_millis": { "$ref": "#/$defs/positive" },
+            "memory_request_bytes": { "$ref": "#/$defs/positive" },
+            "memory_limit_bytes": { "$ref": "#/$defs/positive" }
+          }
+        },
+        "security": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "user": { "$ref": "#/$defs/id" },
+            "group": { "$ref": "#/$defs/id" },
+            "run_as_non_root": { "type": "boolean" },
+            "read_only_root": { "type": "boolean" },
+            "allow_privilege_escalation": { "const": false },
+            "drop_capabilities": { "type": "array", "const": ["all"] }
+          }
+        },
+        "mounts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["volume", "path"],
+            "properties": {
+              "volume": { "$ref": "#/$defs/name" },
+              "path": { "$ref": "#/$defs/absolutePath" },
+              "read_only": { "type": "boolean" },
+              "sub_path": { "$ref": "#/$defs/relativePath" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

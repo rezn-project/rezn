@@ -56,6 +56,8 @@ That signing helper supports this ASCII/integer subset and generates a temporary
 
 ## Executable intent and apply contract
 
+This section describes IR v1, the only format Rezn executes today. [IR v2](IR-v2.md) is specified for M1; its schema, examples and the [Kubernetes subset](KUBERNETES-SUBSET.md) are checked by `python3 -m unittest discover -s scripts -p 'test_spec.py'` (needs `python3-jsonschema` and `python3-yaml`).
+
 `POST /apply` accepts `{ "name": "demo", "instruction_wrapper": { "program": [...], "signature": { "algorithm": "ed25519", "pub": "base64 public key", "sig": "base64 signature" } } }`.
 
 The signature covers JCS-canonicalized **submitted program values**, before typed validation. The original signed envelope is stored intact. Deployment and pod names must be 1–63 ASCII letters/digits, `-` or `_`, starting with a letter/digit. Pod names must be unique within a deployment; the same pod name in different deployments is independent.

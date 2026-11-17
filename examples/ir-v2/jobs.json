@@ -1,0 +1,63 @@
+{
+  "ir": "rezn.dev/v2",
+  "deployment": "batch",
+  "namespace": "batch",
+  "resources": [
+    {
+      "kind": "job",
+      "name": "prepare",
+      "fields": {
+        "backoff_limit": 3,
+        "pod": {
+          "restart": "never",
+          "containers": [
+            {
+              "name": "prepare",
+              "image": "docker.io/library/alpine:3.22",
+              "command": [
+                "/bin/sh",
+                "-c",
+                "echo prepared"
+              ]
+            }
+          ]
+        }
+      },
+      "phase": {
+        "when": "before",
+        "on": [
+          "install",
+          "upgrade"
+        ],
+        "weight": 0
+      }
+    },
+    {
+      "kind": "scheduled_job",
+      "name": "nightly",
+      "fields": {
+        "schedule": "30 2 * * *",
+        "concurrency": "forbid",
+        "keep_succeeded": 3,
+        "keep_failed": 1,
+        "job": {
+          "backoff_limit": 0,
+          "pod": {
+            "restart": "never",
+            "containers": [
+              {
+                "name": "report",
+                "image": "docker.io/library/alpine:3.22",
+                "command": [
+                  "/bin/sh",
+                  "-c",
+                  "date"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

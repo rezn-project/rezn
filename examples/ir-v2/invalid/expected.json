@@ -1,0 +1,16 @@
+{
+  "capability-add.json": "/resources/0",
+  "policy-without-direction.json": "/resources/2",
+  "probe-two-handlers.json": "/resources/0",
+  "quantity-string.json": "/resources/0",
+  "scratch-without-size.json": "/resources/0",
+  "secret-value-inline.json": "/resources/2",
+  "sub-path-escape.json": "/resources/0",
+  "tls-wrong-keys.json": "/resources/2",
+  "unknown-envelope-key.json": "",
+  "unknown-field.json": "/resources/0",
+  "uppercase-name.json": "/resources/0",
+  "v1-array.json": "",
+  "volume-two-sources.json": "/resources/0",
+  "wrong-ir.json": "/ir"
+}

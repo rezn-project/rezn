@@ -1,0 +1,15 @@
+name: Spec
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  spec:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Python checks
+      run: sudo apt-get update && sudo apt-get install -y python3-jsonschema python3-yaml
+    - name: IR v2 schema, examples and Kubernetes subset
+      run: python3 -m unittest discover -s scripts -p 'test_spec.py' -v
