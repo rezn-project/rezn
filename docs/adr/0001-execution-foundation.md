@@ -30,7 +30,7 @@ Rezn currently drives Docker containers through Orqos's Docker API.
 ## Decision
 
 Adopt **B**: Orqos renders and manages owned Quadlet units for Rezn's workloads, systemd supervises them and Podman
-runs them. Rezn renders Quadlet units from IR v2 itself; it does not use `podman kube play`.
+runs them. Rezn renders Quadlet units from [IR v2](../IR-v2.md) itself; it does not use `podman kube play`.
 
 Responsibilities:
 

@@ -1,0 +1,222 @@
+{
+  "subset": "rezn.dev/kubernetes-subset/v1",
+  "description": "The Kubernetes manifest subset Rezn imports. Every path not listed here, and every value outside a listed domain, is rejected. Paths are dotted; [] marks list elements. Pod specs and containers have their own tables. See docs/KUBERNETES-SUBSET.md.",
+  "types": {
+    "string": "any string",
+    "integer": "an integer",
+    "boolean": "true or false",
+    "name": "DNS-1123 label: lowercase letters, digits and '-', 1-63 characters, starting and ending with a letter or digit",
+    "key": "configuration or secret key: letters, digits, '-', '_' and '.', 1-253 characters",
+    "labels": "map of label keys to string values",
+    "base64map": "map of keys to base64 strings",
+    "stringmap": "map of keys to strings",
+    "cpu": "CPU quantity: integer or decimal cores, or an integer followed by m",
+    "bytes": "byte quantity: integer with an optional suffix k, M, G, T, Ki, Mi, Gi or Ti",
+    "port": "integer from 1 to 65535",
+    "portOrName": "port number or a container port name (DNS-1123 label of at most 15 characters)",
+    "cron": "five-field cron expression",
+    "cidr": "IPv4 CIDR",
+    "path": "absolute path",
+    "object": "an object whose members are listed separately (may be empty)",
+    "list": "a list whose elements are listed separately (may be empty)"
+  },
+  "metadata": {
+    "metadata.name": { "type": "name", "ir": "resources[].name" },
+    "metadata.labels": { "type": "labels", "disposition": "ignored", "ir": "-", "note": "Used only to resolve Service, NetworkPolicy and workload selectors during import." },
+    "metadata.annotations": { "type": "annotations", "ir": "resources[].phase", "note": "Only the annotations in the annotations table." }
+  },
+  "templateMetadata": {
+    "labels": { "type": "labels", "disposition": "ignored", "ir": "-", "note": "Matched by selectors during import." },
+    "annotations": { "type": "annotations", "ir": "-", "note": "Only checksum/* annotations." }
+  },
+  "annotations": {
+    "helm.sh/hook": { "type": "string", "enum": ["pre-install", "pre-upgrade", "pre-install,pre-upgrade", "post-install", "post-upgrade", "post-install,post-upgrade"], "disposition": "constrained", "ir": "resources[].phase.when, .on", "note": "pre-* → when: before; post-* → when: after; install/upgrade → on." },
+    "helm.sh/hook-weight": { "type": "integerString", "ir": "resources[].phase.weight" },
+    "helm.sh/hook-delete-policy": { "type": "string", "enum": ["before-hook-creation"], "disposition": "constrained", "ir": "-", "note": "Rezn's behaviour: a phased job is replaced each time its phase runs." },
+    "checksum/*": { "type": "string", "disposition": "ignored", "ir": "-", "note": "Rezn derives configuration identity from referenced config and secrets itself." }
+  },
+  "kinds": {
+    "Deployment": {
+      "apiVersion": "apps/v1",
+      "ir": "replica_set",
+      "podSpec": "spec.template.spec",
+      "fields": {
+        "spec.replicas": { "type": "integer", "ir": "fields.replicas" },
+        "spec.strategy.type": { "type": "string", "enum": ["Recreate"], "disposition": "constrained", "ir": "-", "note": "Replica sets are always replaced in one go." },
+        "spec.selector.matchLabels": { "type": "labels", "disposition": "ignored", "ir": "-", "note": "Must equal a subset of the template labels." },
+        "spec.template.metadata": { "type": "templateMetadata", "ir": "-" }
+      }
+    },
+    "StatefulSet": {
+      "apiVersion": "apps/v1",
+      "ir": "ordered_replica_set",
+      "podSpec": "spec.template.spec",
+      "fields": {
+        "spec.replicas": { "type": "integer", "ir": "fields.replicas" },
+        "spec.serviceName": { "type": "name", "ir": "fields.service", "note": "Must name a headless Service selecting this set." },
+        "spec.podManagementPolicy": { "type": "string", "enum": ["Parallel", "OrderedReady"], "ir": "fields.pod_management (parallel | ordered)" },
+        "spec.persistentVolumeClaimRetentionPolicy.whenDeleted": { "type": "string", "enum": ["Retain", "Delete"], "ir": "fields.retain.on_removal (Retain → true)" },
+        "spec.persistentVolumeClaimRetentionPolicy.whenScaled": { "type": "string", "enum": ["Retain", "Delete"], "ir": "fields.retain.on_scale_down (Retain → true)" },
+        "spec.selector.matchLabels": { "type": "labels", "disposition": "ignored", "ir": "-", "note": "Must equal a subset of the template labels." },
+        "spec.template.metadata": { "type": "templateMetadata", "ir": "-" },
+        "spec.volumeClaimTemplates[].metadata.name": { "type": "name", "ir": "fields.volume_claims[].name" },
+        "spec.volumeClaimTemplates[].metadata.labels": { "type": "labels", "disposition": "ignored", "ir": "-" },
+        "spec.volumeClaimTemplates[].spec.accessModes[]": { "type": "string", "enum": ["ReadWriteOnce"], "disposition": "constrained", "ir": "-" },
+        "spec.volumeClaimTemplates[].spec.resources.requests.storage": { "type": "bytes", "ir": "fields.volume_claims[].bytes" }
+      }
+    },
+    "Job": {
+      "apiVersion": "batch/v1",
+      "ir": "job",
+      "podSpec": "spec.template.spec",
+      "fields": {
+        "spec.backoffLimit": { "type": "integer", "ir": "fields.backoff_limit" },
+        "spec.template.metadata": { "type": "templateMetadata", "ir": "-" }
+      }
+    },
+    "CronJob": {
+      "apiVersion": "batch/v1",
+      "ir": "scheduled_job",
+      "podSpec": "spec.jobTemplate.spec.template.spec",
+      "fields": {
+        "spec.schedule": { "type": "cron", "ir": "fields.schedule" },
+        "spec.concurrencyPolicy": { "type": "string", "enum": ["Forbid", "Replace", "Allow"], "ir": "fields.concurrency (forbid | replace | allow)" },
+        "spec.successfulJobsHistoryLimit": { "type": "integer", "ir": "fields.keep_succeeded" },
+        "spec.failedJobsHistoryLimit": { "type": "integer", "ir": "fields.keep_failed" },
+        "spec.jobTemplate.spec.backoffLimit": { "type": "integer", "ir": "fields.job.backoff_limit" },
+        "spec.jobTemplate.spec.template.metadata": { "type": "templateMetadata", "ir": "-" }
+      }
+    },
+    "Service": {
+      "apiVersion": "v1",
+      "ir": "service",
+      "fields": {
+        "spec.type": { "type": "string", "enum": ["ClusterIP"], "disposition": "constrained", "ir": "-" },
+        "spec.clusterIP": { "type": "string", "enum": ["None"], "disposition": "constrained", "ir": "fields.headless = true", "note": "Absent means a normal service." },
+        "spec.selector": { "type": "labels", "ir": "fields.target", "note": "Must select exactly one workload in the program." },
+        "spec.ports[].name": { "type": "name", "ir": "fields.ports[].name" },
+        "spec.ports[].port": { "type": "port", "ir": "fields.ports[].port" },
+        "spec.ports[].targetPort": { "type": "portOrName", "ir": "fields.ports[].target_port" }
+      }
+    },
+    "Ingress": {
+      "apiVersion": "networking.k8s.io/v1",
+      "ir": "ingress",
+      "fields": {
+        "spec.ingressClassName": { "type": "string", "disposition": "ignored", "ir": "-", "note": "Rezn has one edge per host." },
+        "spec.rules[].host": { "type": "string", "ir": "fields.hosts[].host" },
+        "spec.rules[].http.paths[].path": { "type": "path", "ir": "fields.hosts[].paths[].path" },
+        "spec.rules[].http.paths[].pathType": { "type": "string", "enum": ["Prefix"], "disposition": "constrained", "ir": "-", "note": "Paths are prefixes." },
+        "spec.rules[].http.paths[].backend.service.name": { "type": "name", "ir": "fields.hosts[].paths[].service" },
+        "spec.rules[].http.paths[].backend.service.port.name": { "type": "name", "ir": "fields.hosts[].paths[].port" },
+        "spec.tls[].hosts[]": { "type": "string", "ir": "fields.tls[].hosts[]" },
+        "spec.tls[].secretName": { "type": "name", "ir": "fields.tls[].secret" }
+      }
+    },
+    "NetworkPolicy": {
+      "apiVersion": "networking.k8s.io/v1",
+      "ir": "network_policy",
+      "fields": {
+        "spec.podSelector.matchLabels": { "type": "labels", "ir": "fields.targets", "note": "Must select at least one workload." },
+        "spec.policyTypes[]": { "type": "string", "enum": ["Ingress", "Egress"], "ir": "presence of fields.ingress / fields.egress" },
+        "spec.ingress": { "type": "list", "ir": "fields.ingress", "note": "An empty list denies all inbound traffic." },
+        "spec.ingress[].from[].podSelector.matchLabels": { "type": "labels", "ir": "fields.ingress[].from[].workload" },
+        "spec.ingress[].ports[].port": { "type": "port", "ir": "fields.ingress[].ports[].port" },
+        "spec.ingress[].ports[].protocol": { "type": "string", "enum": ["TCP", "UDP"], "ir": "fields.ingress[].ports[].protocol (tcp | udp)" },
+        "spec.egress": { "type": "list", "ir": "fields.egress" },
+        "spec.egress[].to[].podSelector.matchLabels": { "type": "labels", "ir": "fields.egress[].to[].workload" },
+        "spec.egress[].to[].ipBlock.cidr": { "type": "cidr", "ir": "fields.egress[].to[].cidr" },
+        "spec.egress[].ports[].port": { "type": "port", "ir": "fields.egress[].ports[].port" },
+        "spec.egress[].ports[].protocol": { "type": "string", "enum": ["TCP", "UDP"], "ir": "fields.egress[].ports[].protocol (tcp | udp)" }
+      }
+    },
+    "ConfigMap": {
+      "apiVersion": "v1",
+      "ir": "config",
+      "fields": {
+        "data": { "type": "stringmap", "ir": "fields.data" }
+      }
+    },
+    "Secret": {
+      "apiVersion": "v1",
+      "ir": "secret",
+      "fields": {
+        "type": { "type": "string", "enum": ["Opaque", "kubernetes.io/tls"], "ir": "fields.type (opaque | tls)" },
+        "data": { "type": "base64map", "ir": "fields.keys; source seed_once", "note": "Values are pushed to Rezn's secret store at import and never enter the signed program." }
+      }
+    },
+    "PersistentVolumeClaim": {
+      "apiVersion": "v1",
+      "ir": "volume_claim",
+      "fields": {
+        "spec.accessModes[]": { "type": "string", "enum": ["ReadWriteOnce"], "disposition": "constrained", "ir": "-" },
+        "spec.resources.requests.storage": { "type": "bytes", "ir": "fields.bytes" }
+      }
+    }
+  },
+  "podSpec": {
+    "automountServiceAccountToken": { "type": "boolean", "enum": [false], "disposition": "ignored", "ir": "-", "note": "Rezn has no service accounts; true is rejected." },
+    "restartPolicy": { "type": "string", "enum": ["Always", "OnFailure", "Never"], "ir": "pod.restart (always | on_failure | never)", "note": "Jobs: OnFailure or Never." },
+    "terminationGracePeriodSeconds": { "type": "integer", "ir": "pod.grace_seconds", "note": "Default 30 s, as in Kubernetes." },
+    "imagePullSecrets[].name": { "type": "name", "ir": "pod.image_pull_secrets[]" },
+    "securityContext.runAsUser": { "type": "integer", "ir": "pod.user" },
+    "securityContext.runAsGroup": { "type": "integer", "ir": "pod.group" },
+    "securityContext.runAsNonRoot": { "type": "boolean", "ir": "pod.run_as_non_root" },
+    "securityContext.fsGroup": { "type": "integer", "ir": "pod.fs_group" },
+    "securityContext.fsGroupChangePolicy": { "type": "string", "enum": ["OnRootMismatch"], "disposition": "constrained", "ir": "pod.fs_group_policy (on_root_mismatch)" },
+    "securityContext.seccompProfile.type": { "type": "string", "enum": ["RuntimeDefault"], "disposition": "constrained", "ir": "pod.seccomp (runtime_default)" },
+    "volumes[].name": { "type": "name", "ir": "pod.volumes[].name" },
+    "volumes[].emptyDir": { "type": "object", "requires": ["sizeLimit"], "ir": "pod.volumes[].scratch", "note": "A size limit is required; the volume lives as long as the pod." },
+    "volumes[].emptyDir.medium": { "type": "string", "enum": ["Memory"], "ir": "pod.volumes[].scratch.medium (memory; absent → disk)" },
+    "volumes[].emptyDir.sizeLimit": { "type": "bytes", "ir": "pod.volumes[].scratch.bytes" },
+    "volumes[].persistentVolumeClaim.claimName": { "type": "name", "ir": "pod.volumes[].claim" },
+    "volumes[].configMap.name": { "type": "name", "ir": "pod.volumes[].config.name" },
+    "volumes[].configMap.items[].key": { "type": "key", "ir": "pod.volumes[].config.items[].key" },
+    "volumes[].configMap.items[].path": { "type": "string", "ir": "pod.volumes[].config.items[].path" },
+    "volumes[].secret.secretName": { "type": "name", "ir": "pod.volumes[].secret.name" },
+    "volumes[].secret.defaultMode": { "type": "integer", "ir": "pod.volumes[].secret.mode", "note": "Files owned by root with group fs_group, as in Kubernetes." },
+    "volumes[].secret.items[].key": { "type": "key", "ir": "pod.volumes[].secret.items[].key" },
+    "volumes[].secret.items[].path": { "type": "string", "ir": "pod.volumes[].secret.items[].path" }
+  },
+  "container": {
+    "name": { "type": "name", "ir": "name" },
+    "image": { "type": "string", "ir": "image", "note": "Rezn's image reference grammar." },
+    "imagePullPolicy": { "type": "string", "enum": ["IfNotPresent", "Always", "Never"], "ir": "pull (if_not_present | always | never)", "note": "Absent: Always for :latest or untagged images, otherwise IfNotPresent (Kubernetes rule), written explicitly by import." },
+    "command[]": { "type": "string", "ir": "command[]" },
+    "args[]": { "type": "string", "ir": "args[]" },
+    "env[].name": { "type": "string", "ir": "env[].name" },
+    "env[].value": { "type": "string", "ir": "env[].value" },
+    "env[].valueFrom.secretKeyRef.name": { "type": "name", "ir": "env[].secret.name" },
+    "env[].valueFrom.secretKeyRef.key": { "type": "key", "ir": "env[].secret.key" },
+    "env[].valueFrom.fieldRef.fieldPath": { "type": "string", "enum": ["status.podIP"], "disposition": "constrained", "ir": "env[].pod_ip = true" },
+    "ports[].name": { "type": "name", "ir": "ports[].name" },
+    "ports[].containerPort": { "type": "port", "ir": "ports[].port" },
+    "resources.requests.cpu": { "type": "cpu", "ir": "resources.cpu_request_millis" },
+    "resources.limits.cpu": { "type": "cpu", "ir": "resources.cpu_limit_millis" },
+    "resources.requests.memory": { "type": "bytes", "ir": "resources.memory_request_bytes" },
+    "resources.limits.memory": { "type": "bytes", "ir": "resources.memory_limit_bytes" },
+    "securityContext.readOnlyRootFilesystem": { "type": "boolean", "ir": "security.read_only_root" },
+    "securityContext.allowPrivilegeEscalation": { "type": "boolean", "enum": [false], "disposition": "constrained", "ir": "security.allow_privilege_escalation = false" },
+    "securityContext.capabilities.drop[]": { "type": "string", "enum": ["ALL"], "disposition": "constrained", "ir": "security.drop_capabilities = [\"all\"]" },
+    "securityContext.runAsNonRoot": { "type": "boolean", "ir": "security.run_as_non_root" },
+    "volumeMounts[].name": { "type": "name", "ir": "mounts[].volume" },
+    "volumeMounts[].mountPath": { "type": "path", "ir": "mounts[].path" },
+    "volumeMounts[].readOnly": { "type": "boolean", "ir": "mounts[].read_only" },
+    "volumeMounts[].subPath": { "type": "string", "ir": "mounts[].sub_path" },
+    "livenessProbe": { "type": "probe", "ir": "liveness" },
+    "readinessProbe": { "type": "probe", "ir": "readiness" },
+    "startupProbe": { "type": "probe", "ir": "startup" }
+  },
+  "initContainer": {
+    "restartPolicy": { "type": "string", "enum": ["Always"], "ir": "moves the container to pod.sidecars", "note": "A restartable init container is a sidecar: it starts before the main containers and keeps running." }
+  },
+  "probe": {
+    "exec.command[]": { "type": "string", "ir": "exec[]" },
+    "httpGet.path": { "type": "path", "ir": "http.path" },
+    "httpGet.port": { "type": "portOrName", "ir": "http.port" },
+    "httpGet.scheme": { "type": "string", "enum": ["HTTP", "HTTPS"], "ir": "http.scheme (http | https)" },
+    "periodSeconds": { "type": "integer", "ir": "period_seconds", "note": "Default 10." },
+    "timeoutSeconds": { "type": "integer", "ir": "timeout_seconds", "note": "Default 1." },
+    "failureThreshold": { "type": "integer", "ir": "failure_threshold", "note": "Default 3." }
+  }
+}

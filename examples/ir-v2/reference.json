@@ -1,0 +1,2343 @@
+{
+  "ir": "rezn.dev/v2",
+  "deployment": "reference",
+  "namespace": "reference",
+  "resources": [
+    {
+      "kind": "secret",
+      "name": "ca",
+      "fields": {
+        "type": "tls",
+        "keys": [
+          "tls.crt",
+          "tls.key"
+        ],
+        "source": {
+          "ca": {
+            "common_name": "reference CA",
+            "days": 3650
+          }
+        }
+      }
+    },
+    {
+      "kind": "secret",
+      "name": "api-tls",
+      "fields": {
+        "type": "tls",
+        "keys": [
+          "tls.crt",
+          "tls.key"
+        ],
+        "source": {
+          "certificate": {
+            "ca": "ca",
+            "dns_names": [
+              "api",
+              "api.reference",
+              "api.reference.svc"
+            ],
+            "days": 3650
+          }
+        }
+      }
+    },
+    {
+      "kind": "secret",
+      "name": "idp-tls",
+      "fields": {
+        "type": "tls",
+        "keys": [
+          "tls.crt",
+          "tls.key"
+        ],
+        "source": {
+          "certificate": {
+            "ca": "ca",
+            "dns_names": [
+              "idp",
+              "idp.reference",
+              "idp.reference.svc"
+            ],
+            "days": 3650
+          }
+        }
+      }
+    },
+    {
+      "kind": "secret",
+      "name": "objects-tls",
+      "fields": {
+        "type": "tls",
+        "keys": [
+          "tls.crt",
+          "tls.key"
+        ],
+        "source": {
+          "certificate": {
+            "ca": "ca",
+            "dns_names": [
+              "objects",
+              "objects.reference",
+              "objects.reference.svc"
+            ],
+            "days": 3650
+          }
+        }
+      }
+    },
+    {
+      "kind": "secret",
+      "name": "db",
+      "fields": {
+        "type": "opaque",
+        "keys": [
+          "password"
+        ],
+        "source": {
+          "random": {
+            "password": {
+              "length": 32,
+              "alphabet": "alphanumeric"
+            }
+          }
+        }
+      },
+      "phase": {
+        "when": "before",
+        "on": [
+          "install"
+        ],
+        "weight": -20
+      }
+    },
+    {
+      "kind": "secret",
+      "name": "app",
+      "fields": {
+        "type": "opaque",
+        "keys": [
+          "console-client",
+          "object-access-key",
+          "object-secret-key",
+          "backup-key"
+        ],
+        "source": {
+          "random": {
+            "console-client": {
+              "length": 40,
+              "alphabet": "alphanumeric"
+            },
+            "object-access-key": {
+              "length": 40,
+              "alphabet": "alphanumeric"
+            },
+            "object-secret-key": {
+              "length": 40,
+              "alphabet": "alphanumeric"
+            },
+            "backup-key": {
+              "length": 40,
+              "alphabet": "alphanumeric"
+            }
+          }
+        }
+      }
+    },
+    {
+      "kind": "secret",
+      "name": "registry",
+      "fields": {
+        "type": "opaque",
+        "keys": [
+          ".dockerconfigjson"
+        ],
+        "source": {
+          "store": {}
+        }
+      }
+    },
+    {
+      "kind": "config",
+      "name": "api",
+      "fields": {
+        "data": {
+          "settings.json": "{\"Logging\":{\"LogLevel\":{\"Default\":\"Information\"}}}"
+        }
+      }
+    },
+    {
+      "kind": "config",
+      "name": "trust",
+      "fields": {
+        "data": {
+          "ca.crt": "",
+          "revision.json": "{\"keys\":[]}"
+        }
+      }
+    },
+    {
+      "kind": "volume_claim",
+      "name": "api-state",
+      "fields": {
+        "bytes": 2147483648
+      }
+    },
+    {
+      "kind": "volume_claim",
+      "name": "console-keys",
+      "fields": {
+        "bytes": 268435456
+      }
+    },
+    {
+      "kind": "volume_claim",
+      "name": "backups",
+      "fields": {
+        "bytes": 21474836480
+      }
+    },
+    {
+      "kind": "ordered_replica_set",
+      "name": "db",
+      "fields": {
+        "replicas": 1,
+        "service": "db",
+        "pod_management": "ordered",
+        "volume_claims": [
+          {
+            "name": "data",
+            "bytes": 2147483648
+          }
+        ],
+        "retain": {
+          "on_scale_down": true,
+          "on_removal": true
+        },
+        "pod": {
+          "user": 999,
+          "group": 999,
+          "fs_group": 999,
+          "fs_group_policy": "on_root_mismatch",
+          "seccomp": "runtime_default",
+          "volumes": [
+            {
+              "name": "data",
+              "claim": "data"
+            },
+            {
+              "name": "run",
+              "scratch": {
+                "medium": "memory",
+                "bytes": 16777216
+              }
+            }
+          ],
+          "containers": [
+            {
+              "name": "postgres",
+              "image": "docker.io/library/postgres:17.6-bookworm",
+              "pull": "if_not_present",
+              "env": [
+                {
+                  "name": "POSTGRES_DB",
+                  "value": "app"
+                },
+                {
+                  "name": "POSTGRES_USER",
+                  "value": "app"
+                },
+                {
+                  "name": "POSTGRES_PASSWORD",
+                  "secret": {
+                    "name": "db",
+                    "key": "password"
+                  }
+                },
+                {
+                  "name": "PGDATA",
+                  "value": "/var/lib/postgresql/data/pgdata"
+                }
+              ],
+              "ports": [
+                {
+                  "name": "postgres",
+                  "port": 5432
+                }
+              ],
+              "readiness": {
+                "exec": [
+                  "/bin/sh",
+                  "-c",
+                  "pg_isready -q -U app -d app"
+                ],
+                "period_seconds": 5
+              },
+              "liveness": {
+                "exec": [
+                  "/bin/sh",
+                  "-c",
+                  "pg_isready -q -U app -d app"
+                ],
+                "period_seconds": 10
+              },
+              "resources": {
+                "cpu_request_millis": 50,
+                "cpu_limit_millis": 1000,
+                "memory_request_bytes": 134217728,
+                "memory_limit_bytes": 536870912
+              },
+              "mounts": [
+                {
+                  "volume": "data",
+                  "path": "/var/lib/postgresql/data"
+                },
+                {
+                  "volume": "run",
+                  "path": "/var/run/postgresql"
+                }
+              ],
+              "security": {
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "phase": {
+        "when": "before",
+        "on": [
+          "install"
+        ],
+        "weight": -10
+      }
+    },
+    {
+      "kind": "service",
+      "name": "db",
+      "fields": {
+        "target": "db",
+        "headless": true,
+        "ports": [
+          {
+            "name": "postgres",
+            "port": 5432,
+            "target_port": "postgres"
+          }
+        ]
+      },
+      "phase": {
+        "when": "before",
+        "on": [
+          "install"
+        ],
+        "weight": -10
+      }
+    },
+    {
+      "kind": "job",
+      "name": "migrate",
+      "fields": {
+        "backoff_limit": 6,
+        "pod": {
+          "user": 10001,
+          "group": 10001,
+          "fs_group": 10001,
+          "fs_group_policy": "on_root_mismatch",
+          "run_as_non_root": true,
+          "seccomp": "runtime_default",
+          "restart": "never",
+          "volumes": [
+            {
+              "name": "tmp",
+              "scratch": {
+                "medium": "disk",
+                "bytes": 33554432
+              }
+            }
+          ],
+          "init": [
+            {
+              "name": "wait-for-db",
+              "image": "docker.io/library/postgres:17.6-bookworm",
+              "command": [
+                "/bin/sh",
+                "-c",
+                "until pg_isready -h db -U app; do sleep 2; done"
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ],
+          "containers": [
+            {
+              "name": "migrate",
+              "image": "registry.example.com/shop/migrations@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "args": [
+                "apply",
+                "--confirm",
+                "0000000000000000000000000000000000000000000000000000000000000000"
+              ],
+              "env": [
+                {
+                  "name": "DB_PASSWORD",
+                  "secret": {
+                    "name": "db",
+                    "key": "password"
+                  }
+                }
+              ],
+              "resources": {
+                "cpu_request_millis": 100,
+                "cpu_limit_millis": 1000,
+                "memory_request_bytes": 134217728,
+                "memory_limit_bytes": 268435456
+              },
+              "mounts": [
+                {
+                  "volume": "tmp",
+                  "path": "/tmp"
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ]
+        }
+      },
+      "phase": {
+        "when": "before",
+        "on": [
+          "install",
+          "upgrade"
+        ],
+        "weight": 0
+      }
+    },
+    {
+      "kind": "replica_set",
+      "name": "api",
+      "fields": {
+        "replicas": 1,
+        "pod": {
+          "user": 10001,
+          "group": 10001,
+          "fs_group": 10001,
+          "fs_group_policy": "on_root_mismatch",
+          "run_as_non_root": true,
+          "seccomp": "runtime_default",
+          "grace_seconds": 30,
+          "image_pull_secrets": [
+            "registry"
+          ],
+          "volumes": [
+            {
+              "name": "trust",
+              "config": {
+                "name": "trust"
+              }
+            },
+            {
+              "name": "trust-bundle",
+              "scratch": {
+                "medium": "memory",
+                "bytes": 1048576
+              }
+            },
+            {
+              "name": "settings",
+              "config": {
+                "name": "api",
+                "items": [
+                  {
+                    "key": "settings.json",
+                    "path": "settings.json"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "tls",
+              "secret": {
+                "name": "api-tls",
+                "mode": 288
+              }
+            },
+            {
+              "name": "state",
+              "claim": "api-state"
+            },
+            {
+              "name": "tmp",
+              "scratch": {
+                "medium": "disk",
+                "bytes": 134217728
+              }
+            },
+            {
+              "name": "spool",
+              "scratch": {
+                "medium": "disk",
+                "bytes": 536870912
+              }
+            }
+          ],
+          "init": [
+            {
+              "name": "trust-bundle",
+              "image": "registry.example.com/shop/credentials@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "command": [
+                "/bin/sh",
+                "-c",
+                "cat /etc/ssl/certs/ca-certificates.crt /run/trust/ca.crt > /run/trust-bundle/ca.pem"
+              ],
+              "mounts": [
+                {
+                  "volume": "trust",
+                  "path": "/run/trust",
+                  "read_only": true
+                },
+                {
+                  "volume": "trust-bundle",
+                  "path": "/run/trust-bundle"
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ],
+          "containers": [
+            {
+              "name": "api",
+              "image": "registry.example.com/shop/api@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "pull": "if_not_present",
+              "env": [
+                {
+                  "name": "SSL_CERT_FILE",
+                  "value": "/run/trust-bundle/ca.pem"
+                },
+                {
+                  "name": "DB_PASSWORD",
+                  "secret": {
+                    "name": "db",
+                    "key": "password"
+                  }
+                },
+                {
+                  "name": "OBJECT_SECRET_KEY",
+                  "secret": {
+                    "name": "app",
+                    "key": "object-secret-key"
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "name": "http",
+                  "port": 8080
+                },
+                {
+                  "name": "https",
+                  "port": 8443
+                }
+              ],
+              "startup": {
+                "http": {
+                  "path": "/health/live",
+                  "port": "http",
+                  "scheme": "http"
+                },
+                "period_seconds": 5,
+                "failure_threshold": 60
+              },
+              "liveness": {
+                "http": {
+                  "path": "/health/live",
+                  "port": "http",
+                  "scheme": "http"
+                },
+                "period_seconds": 10,
+                "timeout_seconds": 3
+              },
+              "readiness": {
+                "http": {
+                  "path": "/health/ready",
+                  "port": "http",
+                  "scheme": "http"
+                },
+                "period_seconds": 10,
+                "timeout_seconds": 3
+              },
+              "resources": {
+                "cpu_request_millis": 100,
+                "cpu_limit_millis": 1000,
+                "memory_request_bytes": 402653184,
+                "memory_limit_bytes": 1073741824
+              },
+              "mounts": [
+                {
+                  "volume": "settings",
+                  "path": "/app/settings.json",
+                  "sub_path": "settings.json",
+                  "read_only": true
+                },
+                {
+                  "volume": "tls",
+                  "path": "/run/api-tls",
+                  "read_only": true
+                },
+                {
+                  "volume": "state",
+                  "path": "/var/lib/app/state"
+                },
+                {
+                  "volume": "tmp",
+                  "path": "/tmp"
+                },
+                {
+                  "volume": "spool",
+                  "path": "/var/lib/app/spool"
+                },
+                {
+                  "volume": "trust-bundle",
+                  "path": "/run/trust-bundle",
+                  "read_only": true
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "kind": "service",
+      "name": "api",
+      "fields": {
+        "target": "api",
+        "ports": [
+          {
+            "name": "http",
+            "port": 8080,
+            "target_port": "http"
+          },
+          {
+            "name": "https",
+            "port": 8443,
+            "target_port": "https"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "replica_set",
+      "name": "console",
+      "fields": {
+        "replicas": 1,
+        "pod": {
+          "user": 10001,
+          "group": 10001,
+          "fs_group": 10001,
+          "fs_group_policy": "on_root_mismatch",
+          "run_as_non_root": true,
+          "seccomp": "runtime_default",
+          "image_pull_secrets": [
+            "registry"
+          ],
+          "volumes": [
+            {
+              "name": "trust",
+              "config": {
+                "name": "trust"
+              }
+            },
+            {
+              "name": "trust-bundle",
+              "scratch": {
+                "medium": "memory",
+                "bytes": 1048576
+              }
+            },
+            {
+              "name": "keys",
+              "claim": "console-keys"
+            },
+            {
+              "name": "tmp",
+              "scratch": {
+                "medium": "disk",
+                "bytes": 67108864
+              }
+            }
+          ],
+          "init": [
+            {
+              "name": "trust-bundle",
+              "image": "registry.example.com/shop/credentials@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "command": [
+                "/bin/sh",
+                "-c",
+                "cat /etc/ssl/certs/ca-certificates.crt /run/trust/ca.crt > /run/trust-bundle/ca.pem"
+              ],
+              "mounts": [
+                {
+                  "volume": "trust",
+                  "path": "/run/trust",
+                  "read_only": true
+                },
+                {
+                  "volume": "trust-bundle",
+                  "path": "/run/trust-bundle"
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ],
+          "containers": [
+            {
+              "name": "console",
+              "image": "registry.example.com/shop/console@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "env": [
+                {
+                  "name": "SSL_CERT_FILE",
+                  "value": "/run/trust-bundle/ca.pem"
+                },
+                {
+                  "name": "OIDC_CLIENT_SECRET",
+                  "secret": {
+                    "name": "app",
+                    "key": "console-client"
+                  }
+                },
+                {
+                  "name": "PUBLIC_ORIGIN",
+                  "value": "https://console.reference.localhost"
+                }
+              ],
+              "ports": [
+                {
+                  "name": "http",
+                  "port": 8080
+                }
+              ],
+              "liveness": {
+                "http": {
+                  "path": "/health/live",
+                  "port": "http",
+                  "scheme": "http"
+                }
+              },
+              "readiness": {
+                "http": {
+                  "path": "/health/ready",
+                  "port": "http",
+                  "scheme": "http"
+                }
+              },
+              "resources": {
+                "cpu_request_millis": 50,
+                "cpu_limit_millis": 1000,
+                "memory_request_bytes": 201326592,
+                "memory_limit_bytes": 536870912
+              },
+              "mounts": [
+                {
+                  "volume": "keys",
+                  "path": "/var/lib/console/keys"
+                },
+                {
+                  "volume": "tmp",
+                  "path": "/tmp"
+                },
+                {
+                  "volume": "trust-bundle",
+                  "path": "/run/trust-bundle",
+                  "read_only": true
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "kind": "service",
+      "name": "console",
+      "fields": {
+        "target": "console",
+        "ports": [
+          {
+            "name": "http",
+            "port": 8080,
+            "target_port": "http"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "replica_set",
+      "name": "idp",
+      "fields": {
+        "replicas": 1,
+        "pod": {
+          "user": 1000,
+          "group": 1000,
+          "fs_group": 1000,
+          "fs_group_policy": "on_root_mismatch",
+          "run_as_non_root": true,
+          "seccomp": "runtime_default",
+          "volumes": [
+            {
+              "name": "tls",
+              "secret": {
+                "name": "idp-tls",
+                "mode": 288
+              }
+            },
+            {
+              "name": "data",
+              "scratch": {
+                "medium": "disk",
+                "bytes": 268435456
+              }
+            }
+          ],
+          "containers": [
+            {
+              "name": "idp",
+              "image": "registry.example.com/identity/provider:26.0",
+              "args": [
+                "start",
+                "--import-realm"
+              ],
+              "ports": [
+                {
+                  "name": "https",
+                  "port": 8443
+                },
+                {
+                  "name": "management",
+                  "port": 9000
+                }
+              ],
+              "startup": {
+                "http": {
+                  "path": "/health/started",
+                  "port": "management",
+                  "scheme": "https"
+                },
+                "period_seconds": 5,
+                "failure_threshold": 60
+              },
+              "readiness": {
+                "http": {
+                  "path": "/health/ready",
+                  "port": "management",
+                  "scheme": "https"
+                }
+              },
+              "liveness": {
+                "http": {
+                  "path": "/health/live",
+                  "port": "management",
+                  "scheme": "https"
+                }
+              },
+              "resources": {
+                "cpu_request_millis": 100,
+                "cpu_limit_millis": 2000,
+                "memory_request_bytes": 536870912,
+                "memory_limit_bytes": 1073741824
+              },
+              "mounts": [
+                {
+                  "volume": "tls",
+                  "path": "/run/idp-tls",
+                  "read_only": true
+                },
+                {
+                  "volume": "data",
+                  "path": "/opt/idp/data"
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "kind": "service",
+      "name": "idp",
+      "fields": {
+        "target": "idp",
+        "ports": [
+          {
+            "name": "https",
+            "port": 8443,
+            "target_port": "https"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "ordered_replica_set",
+      "name": "objects",
+      "fields": {
+        "replicas": 1,
+        "service": "objects",
+        "pod_management": "parallel",
+        "volume_claims": [
+          {
+            "name": "data",
+            "bytes": 4294967296
+          }
+        ],
+        "retain": {
+          "on_scale_down": true,
+          "on_removal": true
+        },
+        "pod": {
+          "user": 10001,
+          "group": 10001,
+          "fs_group": 10001,
+          "fs_group_policy": "on_root_mismatch",
+          "run_as_non_root": true,
+          "seccomp": "runtime_default",
+          "volumes": [
+            {
+              "name": "data",
+              "claim": "data"
+            },
+            {
+              "name": "tls",
+              "secret": {
+                "name": "objects-tls",
+                "mode": 288
+              }
+            }
+          ],
+          "containers": [
+            {
+              "name": "objects",
+              "image": "registry.example.com/storage/objects:4.0",
+              "env": [
+                {
+                  "name": "POD_IP",
+                  "pod_ip": true
+                },
+                {
+                  "name": "ACCESS_KEY",
+                  "secret": {
+                    "name": "app",
+                    "key": "object-access-key"
+                  }
+                },
+                {
+                  "name": "SECRET_KEY",
+                  "secret": {
+                    "name": "app",
+                    "key": "object-secret-key"
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "name": "s3",
+                  "port": 8333
+                }
+              ],
+              "readiness": {
+                "http": {
+                  "path": "/healthz",
+                  "port": "s3",
+                  "scheme": "https"
+                }
+              },
+              "liveness": {
+                "http": {
+                  "path": "/healthz",
+                  "port": "s3",
+                  "scheme": "https"
+                }
+              },
+              "resources": {
+                "cpu_request_millis": 50,
+                "cpu_limit_millis": 1000,
+                "memory_request_bytes": 134217728,
+                "memory_limit_bytes": 536870912
+              },
+              "mounts": [
+                {
+                  "volume": "data",
+                  "path": "/data"
+                },
+                {
+                  "volume": "tls",
+                  "path": "/run/tls",
+                  "read_only": true
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "kind": "service",
+      "name": "objects",
+      "fields": {
+        "target": "objects",
+        "headless": true,
+        "ports": [
+          {
+            "name": "s3",
+            "port": 8333,
+            "target_port": "s3"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "secret",
+      "name": "worker-a-clients",
+      "fields": {
+        "type": "opaque",
+        "keys": [
+          "client-secret-0",
+          "client-secret-1"
+        ],
+        "source": {
+          "random": {
+            "client-secret-0": {
+              "length": 40,
+              "alphabet": "alphanumeric"
+            },
+            "client-secret-1": {
+              "length": 40,
+              "alphabet": "alphanumeric"
+            }
+          }
+        }
+      }
+    },
+    {
+      "kind": "ordered_replica_set",
+      "name": "worker-a",
+      "fields": {
+        "replicas": 1,
+        "service": "worker-a",
+        "pod_management": "parallel",
+        "volume_claims": [
+          {
+            "name": "state",
+            "bytes": 1073741824
+          }
+        ],
+        "retain": {
+          "on_scale_down": true,
+          "on_removal": true
+        },
+        "pod": {
+          "user": 10001,
+          "group": 10001,
+          "fs_group": 10001,
+          "fs_group_policy": "on_root_mismatch",
+          "run_as_non_root": true,
+          "seccomp": "runtime_default",
+          "grace_seconds": 40,
+          "image_pull_secrets": [
+            "registry"
+          ],
+          "volumes": [
+            {
+              "name": "trust",
+              "config": {
+                "name": "trust"
+              }
+            },
+            {
+              "name": "trust-bundle",
+              "scratch": {
+                "medium": "memory",
+                "bytes": 1048576
+              }
+            },
+            {
+              "name": "state",
+              "claim": "state"
+            },
+            {
+              "name": "credentials",
+              "scratch": {
+                "medium": "memory",
+                "bytes": 1048576
+              }
+            },
+            {
+              "name": "clients",
+              "secret": {
+                "name": "worker-a-clients",
+                "mode": 288
+              }
+            },
+            {
+              "name": "status",
+              "scratch": {
+                "medium": "disk",
+                "bytes": 1048576
+              }
+            },
+            {
+              "name": "tmp",
+              "scratch": {
+                "medium": "disk",
+                "bytes": 67108864
+              }
+            }
+          ],
+          "init": [
+            {
+              "name": "trust-bundle",
+              "image": "registry.example.com/shop/credentials@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "command": [
+                "/bin/sh",
+                "-c",
+                "cat /etc/ssl/certs/ca-certificates.crt /run/trust/ca.crt > /run/trust-bundle/ca.pem"
+              ],
+              "mounts": [
+                {
+                  "volume": "trust",
+                  "path": "/run/trust",
+                  "read_only": true
+                },
+                {
+                  "volume": "trust-bundle",
+                  "path": "/run/trust-bundle"
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            },
+            {
+              "name": "prepare-state",
+              "image": "registry.example.com/shop/credentials@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "command": [
+                "/bin/sh",
+                "-c",
+                "set -eu; umask 077; for d in /state/data /state/keys /run/credentials/worker; do mkdir -p $d; chmod 0700 $d; chmod g-s $d; done"
+              ],
+              "mounts": [
+                {
+                  "volume": "state",
+                  "path": "/state"
+                },
+                {
+                  "volume": "credentials",
+                  "path": "/run/credentials"
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ],
+          "sidecars": [
+            {
+              "name": "credentials",
+              "image": "registry.example.com/shop/credentials@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "env": [
+                {
+                  "name": "SSL_CERT_FILE",
+                  "value": "/run/trust-bundle/ca.pem"
+                },
+                {
+                  "name": "CLIENT_SECRET_FILE",
+                  "value": "/run/clients/client-secret-{ordinal}"
+                },
+                {
+                  "name": "TOKEN_ENDPOINT",
+                  "value": "https://idp:8443/token"
+                }
+              ],
+              "startup": {
+                "exec": [
+                  "/bin/sh",
+                  "-c",
+                  "test -s /run/credentials/worker/access-token && test -s /state/keys/recovery.key"
+                ],
+                "period_seconds": 5,
+                "failure_threshold": 120
+              },
+              "resources": {
+                "cpu_request_millis": 10,
+                "cpu_limit_millis": 200,
+                "memory_request_bytes": 50331648,
+                "memory_limit_bytes": 134217728
+              },
+              "mounts": [
+                {
+                  "volume": "credentials",
+                  "path": "/run/credentials"
+                },
+                {
+                  "volume": "state",
+                  "path": "/state"
+                },
+                {
+                  "volume": "clients",
+                  "path": "/run/clients",
+                  "read_only": true
+                },
+                {
+                  "volume": "trust-bundle",
+                  "path": "/run/trust-bundle",
+                  "read_only": true
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ],
+          "containers": [
+            {
+              "name": "worker",
+              "image": "registry.example.com/shop/worker@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "args": [
+                "--server",
+                "https://api.reference.svc:8443",
+                "--token-file",
+                "/run/credentials/worker/access-token",
+                "--state-root",
+                "/state/data",
+                "--status-file",
+                "/run/status/worker.json",
+                "--shutdown-grace-seconds",
+                "25"
+              ],
+              "env": [
+                {
+                  "name": "SSL_CERT_FILE",
+                  "value": "/run/trust-bundle/ca.pem"
+                }
+              ],
+              "readiness": {
+                "exec": [
+                  "/bin/sh",
+                  "-c",
+                  "grep -Eq '\"state\":\"(running|waiting)\"' /run/status/worker.json"
+                ],
+                "period_seconds": 10
+              },
+              "resources": {
+                "cpu_request_millis": 50,
+                "cpu_limit_millis": 1000,
+                "memory_request_bytes": 134217728,
+                "memory_limit_bytes": 536870912
+              },
+              "mounts": [
+                {
+                  "volume": "credentials",
+                  "path": "/run/credentials",
+                  "read_only": true
+                },
+                {
+                  "volume": "state",
+                  "path": "/state"
+                },
+                {
+                  "volume": "status",
+                  "path": "/run/status"
+                },
+                {
+                  "volume": "tmp",
+                  "path": "/tmp"
+                },
+                {
+                  "volume": "trust-bundle",
+                  "path": "/run/trust-bundle",
+                  "read_only": true
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "kind": "service",
+      "name": "worker-a",
+      "fields": {
+        "target": "worker-a",
+        "headless": true,
+        "ports": []
+      }
+    },
+    {
+      "kind": "network_policy",
+      "name": "worker-a",
+      "fields": {
+        "targets": [
+          "worker-a"
+        ],
+        "ingress": [],
+        "egress": [
+          {
+            "to": [
+              {
+                "workload": "api"
+              }
+            ],
+            "ports": [
+              {
+                "port": 8443,
+                "protocol": "tcp"
+              }
+            ]
+          },
+          {
+            "ports": [
+              {
+                "port": 53,
+                "protocol": "udp"
+              },
+              {
+                "port": 53,
+                "protocol": "tcp"
+              }
+            ]
+          },
+          {
+            "to": [
+              {
+                "workload": "idp"
+              }
+            ],
+            "ports": [
+              {
+                "port": 8443,
+                "protocol": "tcp"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "kind": "secret",
+      "name": "worker-b-clients",
+      "fields": {
+        "type": "opaque",
+        "keys": [
+          "client-secret-0",
+          "client-secret-1"
+        ],
+        "source": {
+          "random": {
+            "client-secret-0": {
+              "length": 40,
+              "alphabet": "alphanumeric"
+            },
+            "client-secret-1": {
+              "length": 40,
+              "alphabet": "alphanumeric"
+            }
+          }
+        }
+      }
+    },
+    {
+      "kind": "ordered_replica_set",
+      "name": "worker-b",
+      "fields": {
+        "replicas": 1,
+        "service": "worker-b",
+        "pod_management": "parallel",
+        "volume_claims": [
+          {
+            "name": "state",
+            "bytes": 1073741824
+          }
+        ],
+        "retain": {
+          "on_scale_down": true,
+          "on_removal": true
+        },
+        "pod": {
+          "user": 10001,
+          "group": 10001,
+          "fs_group": 10001,
+          "fs_group_policy": "on_root_mismatch",
+          "run_as_non_root": true,
+          "seccomp": "runtime_default",
+          "grace_seconds": 40,
+          "image_pull_secrets": [
+            "registry"
+          ],
+          "volumes": [
+            {
+              "name": "trust",
+              "config": {
+                "name": "trust"
+              }
+            },
+            {
+              "name": "trust-bundle",
+              "scratch": {
+                "medium": "memory",
+                "bytes": 1048576
+              }
+            },
+            {
+              "name": "state",
+              "claim": "state"
+            },
+            {
+              "name": "credentials",
+              "scratch": {
+                "medium": "memory",
+                "bytes": 1048576
+              }
+            },
+            {
+              "name": "clients",
+              "secret": {
+                "name": "worker-b-clients",
+                "mode": 288
+              }
+            },
+            {
+              "name": "status",
+              "scratch": {
+                "medium": "disk",
+                "bytes": 1048576
+              }
+            },
+            {
+              "name": "tmp",
+              "scratch": {
+                "medium": "disk",
+                "bytes": 67108864
+              }
+            }
+          ],
+          "init": [
+            {
+              "name": "trust-bundle",
+              "image": "registry.example.com/shop/credentials@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "command": [
+                "/bin/sh",
+                "-c",
+                "cat /etc/ssl/certs/ca-certificates.crt /run/trust/ca.crt > /run/trust-bundle/ca.pem"
+              ],
+              "mounts": [
+                {
+                  "volume": "trust",
+                  "path": "/run/trust",
+                  "read_only": true
+                },
+                {
+                  "volume": "trust-bundle",
+                  "path": "/run/trust-bundle"
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            },
+            {
+              "name": "prepare-state",
+              "image": "registry.example.com/shop/credentials@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "command": [
+                "/bin/sh",
+                "-c",
+                "set -eu; umask 077; for d in /state/data /state/keys /run/credentials/worker; do mkdir -p $d; chmod 0700 $d; chmod g-s $d; done"
+              ],
+              "mounts": [
+                {
+                  "volume": "state",
+                  "path": "/state"
+                },
+                {
+                  "volume": "credentials",
+                  "path": "/run/credentials"
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ],
+          "sidecars": [
+            {
+              "name": "credentials",
+              "image": "registry.example.com/shop/credentials@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "env": [
+                {
+                  "name": "SSL_CERT_FILE",
+                  "value": "/run/trust-bundle/ca.pem"
+                },
+                {
+                  "name": "CLIENT_SECRET_FILE",
+                  "value": "/run/clients/client-secret-{ordinal}"
+                },
+                {
+                  "name": "TOKEN_ENDPOINT",
+                  "value": "https://idp:8443/token"
+                }
+              ],
+              "startup": {
+                "exec": [
+                  "/bin/sh",
+                  "-c",
+                  "test -s /run/credentials/worker/access-token && test -s /state/keys/recovery.key"
+                ],
+                "period_seconds": 5,
+                "failure_threshold": 120
+              },
+              "resources": {
+                "cpu_request_millis": 10,
+                "cpu_limit_millis": 200,
+                "memory_request_bytes": 50331648,
+                "memory_limit_bytes": 134217728
+              },
+              "mounts": [
+                {
+                  "volume": "credentials",
+                  "path": "/run/credentials"
+                },
+                {
+                  "volume": "state",
+                  "path": "/state"
+                },
+                {
+                  "volume": "clients",
+                  "path": "/run/clients",
+                  "read_only": true
+                },
+                {
+                  "volume": "trust-bundle",
+                  "path": "/run/trust-bundle",
+                  "read_only": true
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ],
+          "containers": [
+            {
+              "name": "worker",
+              "image": "registry.example.com/shop/worker@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "args": [
+                "--server",
+                "https://api.reference.svc:8443",
+                "--token-file",
+                "/run/credentials/worker/access-token",
+                "--state-root",
+                "/state/data",
+                "--status-file",
+                "/run/status/worker.json",
+                "--shutdown-grace-seconds",
+                "25"
+              ],
+              "env": [
+                {
+                  "name": "SSL_CERT_FILE",
+                  "value": "/run/trust-bundle/ca.pem"
+                }
+              ],
+              "readiness": {
+                "exec": [
+                  "/bin/sh",
+                  "-c",
+                  "grep -Eq '\"state\":\"(running|waiting)\"' /run/status/worker.json"
+                ],
+                "period_seconds": 10
+              },
+              "resources": {
+                "cpu_request_millis": 50,
+                "cpu_limit_millis": 1000,
+                "memory_request_bytes": 134217728,
+                "memory_limit_bytes": 536870912
+              },
+              "mounts": [
+                {
+                  "volume": "credentials",
+                  "path": "/run/credentials",
+                  "read_only": true
+                },
+                {
+                  "volume": "state",
+                  "path": "/state"
+                },
+                {
+                  "volume": "status",
+                  "path": "/run/status"
+                },
+                {
+                  "volume": "tmp",
+                  "path": "/tmp"
+                },
+                {
+                  "volume": "trust-bundle",
+                  "path": "/run/trust-bundle",
+                  "read_only": true
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "kind": "service",
+      "name": "worker-b",
+      "fields": {
+        "target": "worker-b",
+        "headless": true,
+        "ports": []
+      }
+    },
+    {
+      "kind": "network_policy",
+      "name": "worker-b",
+      "fields": {
+        "targets": [
+          "worker-b"
+        ],
+        "ingress": [],
+        "egress": [
+          {
+            "to": [
+              {
+                "workload": "api"
+              }
+            ],
+            "ports": [
+              {
+                "port": 8443,
+                "protocol": "tcp"
+              }
+            ]
+          },
+          {
+            "ports": [
+              {
+                "port": 53,
+                "protocol": "udp"
+              },
+              {
+                "port": 53,
+                "protocol": "tcp"
+              }
+            ]
+          },
+          {
+            "to": [
+              {
+                "workload": "idp"
+              }
+            ],
+            "ports": [
+              {
+                "port": 8443,
+                "protocol": "tcp"
+              }
+            ]
+          },
+          {
+            "ports": [
+              {
+                "port": 443,
+                "protocol": "tcp"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "kind": "secret",
+      "name": "worker-c-clients",
+      "fields": {
+        "type": "opaque",
+        "keys": [
+          "client-secret-0",
+          "client-secret-1"
+        ],
+        "source": {
+          "random": {
+            "client-secret-0": {
+              "length": 40,
+              "alphabet": "alphanumeric"
+            },
+            "client-secret-1": {
+              "length": 40,
+              "alphabet": "alphanumeric"
+            }
+          }
+        }
+      }
+    },
+    {
+      "kind": "ordered_replica_set",
+      "name": "worker-c",
+      "fields": {
+        "replicas": 1,
+        "service": "worker-c",
+        "pod_management": "parallel",
+        "volume_claims": [
+          {
+            "name": "state",
+            "bytes": 1073741824
+          }
+        ],
+        "retain": {
+          "on_scale_down": true,
+          "on_removal": true
+        },
+        "pod": {
+          "user": 10001,
+          "group": 10001,
+          "fs_group": 10001,
+          "fs_group_policy": "on_root_mismatch",
+          "run_as_non_root": true,
+          "seccomp": "runtime_default",
+          "grace_seconds": 40,
+          "image_pull_secrets": [
+            "registry"
+          ],
+          "volumes": [
+            {
+              "name": "trust",
+              "config": {
+                "name": "trust"
+              }
+            },
+            {
+              "name": "trust-bundle",
+              "scratch": {
+                "medium": "memory",
+                "bytes": 1048576
+              }
+            },
+            {
+              "name": "state",
+              "claim": "state"
+            },
+            {
+              "name": "credentials",
+              "scratch": {
+                "medium": "memory",
+                "bytes": 1048576
+              }
+            },
+            {
+              "name": "clients",
+              "secret": {
+                "name": "worker-c-clients",
+                "mode": 288
+              }
+            },
+            {
+              "name": "status",
+              "scratch": {
+                "medium": "disk",
+                "bytes": 1048576
+              }
+            },
+            {
+              "name": "tmp",
+              "scratch": {
+                "medium": "disk",
+                "bytes": 67108864
+              }
+            }
+          ],
+          "init": [
+            {
+              "name": "trust-bundle",
+              "image": "registry.example.com/shop/credentials@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "command": [
+                "/bin/sh",
+                "-c",
+                "cat /etc/ssl/certs/ca-certificates.crt /run/trust/ca.crt > /run/trust-bundle/ca.pem"
+              ],
+              "mounts": [
+                {
+                  "volume": "trust",
+                  "path": "/run/trust",
+                  "read_only": true
+                },
+                {
+                  "volume": "trust-bundle",
+                  "path": "/run/trust-bundle"
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            },
+            {
+              "name": "prepare-state",
+              "image": "registry.example.com/shop/credentials@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "command": [
+                "/bin/sh",
+                "-c",
+                "set -eu; umask 077; for d in /state/data /state/keys /run/credentials/worker; do mkdir -p $d; chmod 0700 $d; chmod g-s $d; done"
+              ],
+              "mounts": [
+                {
+                  "volume": "state",
+                  "path": "/state"
+                },
+                {
+                  "volume": "credentials",
+                  "path": "/run/credentials"
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ],
+          "sidecars": [
+            {
+              "name": "credentials",
+              "image": "registry.example.com/shop/credentials@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "env": [
+                {
+                  "name": "SSL_CERT_FILE",
+                  "value": "/run/trust-bundle/ca.pem"
+                },
+                {
+                  "name": "CLIENT_SECRET_FILE",
+                  "value": "/run/clients/client-secret-{ordinal}"
+                },
+                {
+                  "name": "TOKEN_ENDPOINT",
+                  "value": "https://idp:8443/token"
+                }
+              ],
+              "startup": {
+                "exec": [
+                  "/bin/sh",
+                  "-c",
+                  "test -s /run/credentials/worker/access-token && test -s /state/keys/recovery.key"
+                ],
+                "period_seconds": 5,
+                "failure_threshold": 120
+              },
+              "resources": {
+                "cpu_request_millis": 10,
+                "cpu_limit_millis": 200,
+                "memory_request_bytes": 50331648,
+                "memory_limit_bytes": 134217728
+              },
+              "mounts": [
+                {
+                  "volume": "credentials",
+                  "path": "/run/credentials"
+                },
+                {
+                  "volume": "state",
+                  "path": "/state"
+                },
+                {
+                  "volume": "clients",
+                  "path": "/run/clients",
+                  "read_only": true
+                },
+                {
+                  "volume": "trust-bundle",
+                  "path": "/run/trust-bundle",
+                  "read_only": true
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ],
+          "containers": [
+            {
+              "name": "worker",
+              "image": "registry.example.com/shop/worker@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "args": [
+                "--server",
+                "https://api.reference.svc:8443",
+                "--token-file",
+                "/run/credentials/worker/access-token",
+                "--state-root",
+                "/state/data",
+                "--status-file",
+                "/run/status/worker.json",
+                "--shutdown-grace-seconds",
+                "25"
+              ],
+              "env": [
+                {
+                  "name": "SSL_CERT_FILE",
+                  "value": "/run/trust-bundle/ca.pem"
+                }
+              ],
+              "readiness": {
+                "exec": [
+                  "/bin/sh",
+                  "-c",
+                  "grep -Eq '\"state\":\"(running|waiting)\"' /run/status/worker.json"
+                ],
+                "period_seconds": 10
+              },
+              "resources": {
+                "cpu_request_millis": 50,
+                "cpu_limit_millis": 1000,
+                "memory_request_bytes": 134217728,
+                "memory_limit_bytes": 536870912
+              },
+              "mounts": [
+                {
+                  "volume": "credentials",
+                  "path": "/run/credentials",
+                  "read_only": true
+                },
+                {
+                  "volume": "state",
+                  "path": "/state"
+                },
+                {
+                  "volume": "status",
+                  "path": "/run/status"
+                },
+                {
+                  "volume": "tmp",
+                  "path": "/tmp"
+                },
+                {
+                  "volume": "trust-bundle",
+                  "path": "/run/trust-bundle",
+                  "read_only": true
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "kind": "service",
+      "name": "worker-c",
+      "fields": {
+        "target": "worker-c",
+        "headless": true,
+        "ports": []
+      }
+    },
+    {
+      "kind": "network_policy",
+      "name": "worker-c",
+      "fields": {
+        "targets": [
+          "worker-c"
+        ],
+        "ingress": [],
+        "egress": [
+          {
+            "to": [
+              {
+                "workload": "api"
+              }
+            ],
+            "ports": [
+              {
+                "port": 8443,
+                "protocol": "tcp"
+              }
+            ]
+          },
+          {
+            "ports": [
+              {
+                "port": 53,
+                "protocol": "udp"
+              },
+              {
+                "port": 53,
+                "protocol": "tcp"
+              }
+            ]
+          },
+          {
+            "to": [
+              {
+                "workload": "idp"
+              }
+            ],
+            "ports": [
+              {
+                "port": 8443,
+                "protocol": "tcp"
+              }
+            ]
+          },
+          {
+            "ports": [
+              {
+                "port": 443,
+                "protocol": "tcp"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "kind": "job",
+      "name": "seed",
+      "fields": {
+        "backoff_limit": 2,
+        "pod": {
+          "user": 10001,
+          "group": 10001,
+          "fs_group": 10001,
+          "fs_group_policy": "on_root_mismatch",
+          "run_as_non_root": true,
+          "seccomp": "runtime_default",
+          "restart": "never",
+          "containers": [
+            {
+              "name": "seed",
+              "image": "registry.example.com/shop/seed@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "env": [
+                {
+                  "name": "DB_PASSWORD",
+                  "secret": {
+                    "name": "db",
+                    "key": "password"
+                  }
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ]
+        }
+      },
+      "phase": {
+        "when": "after",
+        "on": [
+          "install"
+        ],
+        "weight": 0
+      }
+    },
+    {
+      "kind": "scheduled_job",
+      "name": "backup",
+      "fields": {
+        "schedule": "30 2 * * *",
+        "concurrency": "forbid",
+        "keep_succeeded": 3,
+        "keep_failed": 1,
+        "job": {
+          "backoff_limit": 0,
+          "pod": {
+            "user": 10001,
+            "group": 10001,
+            "fs_group": 10001,
+            "fs_group_policy": "on_root_mismatch",
+            "run_as_non_root": true,
+            "seccomp": "runtime_default",
+            "restart": "never",
+            "volumes": [
+              {
+                "name": "packages",
+                "claim": "backups"
+              },
+              {
+                "name": "work",
+                "scratch": {
+                  "medium": "disk",
+                  "bytes": 2147483648
+                }
+              }
+            ],
+            "containers": [
+              {
+                "name": "backup",
+                "image": "registry.example.com/shop/recovery@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "args": [
+                  "backup",
+                  "--rpo-minutes",
+                  "60"
+                ],
+                "env": [
+                  {
+                    "name": "PACKAGE_KEY",
+                    "secret": {
+                      "name": "app",
+                      "key": "backup-key"
+                    }
+                  },
+                  {
+                    "name": "DB_PASSWORD",
+                    "secret": {
+                      "name": "db",
+                      "key": "password"
+                    }
+                  }
+                ],
+                "resources": {
+                  "cpu_request_millis": 100,
+                  "cpu_limit_millis": 1000,
+                  "memory_request_bytes": 268435456,
+                  "memory_limit_bytes": 1073741824
+                },
+                "mounts": [
+                  {
+                    "volume": "packages",
+                    "path": "/var/lib/recovery/packages"
+                  },
+                  {
+                    "volume": "work",
+                    "path": "/var/lib/recovery/work"
+                  }
+                ],
+                "security": {
+                  "read_only_root": true,
+                  "allow_privilege_escalation": false,
+                  "drop_capabilities": [
+                    "all"
+                  ],
+                  "run_as_non_root": true
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "kind": "secret",
+      "name": "edge-tls",
+      "fields": {
+        "type": "tls",
+        "keys": [
+          "tls.crt",
+          "tls.key"
+        ],
+        "source": {
+          "store": {}
+        }
+      }
+    },
+    {
+      "kind": "ingress",
+      "name": "public",
+      "fields": {
+        "hosts": [
+          {
+            "host": "api.reference.localhost",
+            "paths": [
+              {
+                "path": "/",
+                "service": "api",
+                "port": "http"
+              }
+            ]
+          },
+          {
+            "host": "console.reference.localhost",
+            "paths": [
+              {
+                "path": "/",
+                "service": "console",
+                "port": "http"
+              }
+            ]
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "api.reference.localhost",
+              "console.reference.localhost"
+            ],
+            "secret": "edge-tls"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "network_policy",
+      "name": "objects",
+      "fields": {
+        "targets": [
+          "objects"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "workload": "objects"
+              }
+            ]
+          },
+          {
+            "from": [
+              {
+                "workload": "api"
+              },
+              {
+                "workload": "backup"
+              }
+            ],
+            "ports": [
+              {
+                "port": 8333,
+                "protocol": "tcp"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

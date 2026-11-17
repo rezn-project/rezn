@@ -1,0 +1,53 @@
+{
+  "ir": "rezn.dev/v2",
+  "deployment": "hello",
+  "namespace": "hello",
+  "resources": [
+    {
+      "kind": "replica_set",
+      "name": "web",
+      "fields": {
+        "replicas": 2,
+        "pod": {
+          "containers": [
+            {
+              "name": "web",
+              "image": "docker.io/library/nginx:1.27-alpine",
+              "pull": "if_not_present",
+              "ports": [
+                {
+                  "name": "http",
+                  "port": 80
+                }
+              ],
+              "readiness": {
+                "http": {
+                  "path": "/",
+                  "port": "http",
+                  "scheme": "http"
+                }
+              },
+              "resources": {
+                "memory_limit_bytes": "256Mi"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "kind": "service",
+      "name": "web",
+      "fields": {
+        "target": "web",
+        "ports": [
+          {
+            "name": "http",
+            "port": 80,
+            "target_port": "http"
+          }
+        ]
+      }
+    }
+  ]
+}
