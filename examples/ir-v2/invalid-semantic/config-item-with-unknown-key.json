@@ -1,0 +1,196 @@
+{
+  "ir": "rezn.dev/v2",
+  "deployment": "vault",
+  "namespace": "vault",
+  "resources": [
+    {
+      "kind": "secret",
+      "name": "operator-token",
+      "fields": {
+        "type": "opaque",
+        "keys": [
+          "token"
+        ],
+        "source": {
+          "store": {}
+        }
+      }
+    },
+    {
+      "kind": "secret",
+      "name": "registry",
+      "fields": {
+        "type": "opaque",
+        "keys": [
+          ".dockerconfigjson"
+        ],
+        "source": {
+          "store": {}
+        }
+      }
+    },
+    {
+      "kind": "secret",
+      "name": "imported",
+      "fields": {
+        "type": "opaque",
+        "keys": [
+          "a",
+          "b"
+        ],
+        "source": {
+          "seed_once": {}
+        }
+      }
+    },
+    {
+      "kind": "secret",
+      "name": "ca",
+      "fields": {
+        "type": "tls",
+        "keys": [
+          "tls.crt",
+          "tls.key"
+        ],
+        "source": {
+          "ca": {
+            "common_name": "vault CA",
+            "days": 3650
+          }
+        }
+      }
+    },
+    {
+      "kind": "secret",
+      "name": "app-tls",
+      "fields": {
+        "type": "tls",
+        "keys": [
+          "tls.crt",
+          "tls.key"
+        ],
+        "source": {
+          "certificate": {
+            "ca": "ca",
+            "dns_names": [
+              "app",
+              "app.vault.svc"
+            ],
+            "days": 825
+          }
+        }
+      }
+    },
+    {
+      "kind": "config",
+      "name": "app",
+      "fields": {
+        "data": {
+          "settings.json": "{\"level\":\"info\"}"
+        }
+      }
+    },
+    {
+      "kind": "volume_claim",
+      "name": "app-state",
+      "fields": {
+        "bytes": 536870912
+      }
+    },
+    {
+      "kind": "replica_set",
+      "name": "app",
+      "fields": {
+        "replicas": 1,
+        "pod": {
+          "user": 10001,
+          "group": 10001,
+          "fs_group": 10001,
+          "fs_group_policy": "on_root_mismatch",
+          "run_as_non_root": true,
+          "seccomp": "runtime_default",
+          "image_pull_secrets": [
+            "registry"
+          ],
+          "volumes": [
+            {
+              "name": "settings",
+              "config": {
+                "name": "app",
+                "items": [
+                  {
+                    "key": "missing.json",
+                    "path": "settings.json"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "tls",
+              "secret": {
+                "name": "app-tls",
+                "mode": 288
+              }
+            },
+            {
+              "name": "state",
+              "claim": "app-state"
+            },
+            {
+              "name": "tmp",
+              "scratch": {
+                "medium": "disk",
+                "bytes": 67108864
+              }
+            }
+          ],
+          "containers": [
+            {
+              "name": "app",
+              "image": "registry.example.com/shop/app@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "pull": "if_not_present",
+              "env": [
+                {
+                  "name": "TOKEN",
+                  "secret": {
+                    "name": "operator-token",
+                    "key": "token"
+                  }
+                }
+              ],
+              "mounts": [
+                {
+                  "volume": "settings",
+                  "path": "/app/settings.json",
+                  "sub_path": "settings.json",
+                  "read_only": true
+                },
+                {
+                  "volume": "tls",
+                  "path": "/run/tls",
+                  "read_only": true
+                },
+                {
+                  "volume": "state",
+                  "path": "/var/lib/app"
+                },
+                {
+                  "volume": "tmp",
+                  "path": "/tmp"
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

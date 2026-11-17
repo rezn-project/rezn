@@ -56,7 +56,17 @@ That signing helper supports this ASCII/integer subset and generates a temporary
 
 ## Executable intent and apply contract
 
-This section describes IR v1, the only format Rezn executes today. [IR v2](IR-v2.md) is specified for M1; its schema, examples and the [Kubernetes subset](KUBERNETES-SUBSET.md) are checked by `python3 -m unittest discover -s scripts -p 'test_spec.py'` (needs `python3-jsonschema` and `python3-yaml`).
+`/apply` accepts two program shapes. An **array** is IR v1, described in this section and executed through the Docker backend. An **object** is [IR v2](IR-v2.md): Rezn verifies its signature, validates it completely (the rules of `docs/IR-v2.md`, reported as `JSON-pointer: message` in the HTTP 400 body), requires its `deployment` to equal the `/apply` name (lowercase, at most 63 characters), and stores it. IR v2 programs are **not executed yet**: `/status` lists them under `unexecuted` until the systemd/Podman backend exists ([#30](https://github.com/rezn-project/rezn/issues/30)). Applying an IR v2 program to a deployment name that held IR v1 removes that deployment's IR v1 containers, like any removed workload.
+
+Validate an IR v2 program offline, bare or inside a signed envelope:
+
+```bash
+cargo run --locked -p reznctl -- validate examples/ir-v2/reference.json
+```
+
+The schema, examples and the [Kubernetes subset](KUBERNETES-SUBSET.md) are also checked by `python3 -m unittest discover -s scripts -p 'test_spec.py'` (needs `python3-jsonschema` and `python3-yaml`); the Rust validator's conformance tests are `cargo test -p common`.
+
+The IR v1 contract:
 
 `POST /apply` accepts `{ "name": "demo", "instruction_wrapper": { "program": [...], "signature": { "algorithm": "ed25519", "pub": "base64 public key", "sig": "base64 signature" } } }`.
 
@@ -70,7 +80,7 @@ Invalid signatures or executable intent return HTTP 400 with the reason. Malform
 
 ## Observable status
 
-`GET /state` and existing `GET /state/raw` return accepted desired instructions keyed by deployment. Corrupt, missing or invalid persisted state returns HTTP 500, never an empty map. `GET /status` reports:
+`GET /state` and existing `GET /state/raw` return accepted desired intent keyed by deployment: an IR v1 instruction array or the IR v2 program object as signed. Corrupt, missing or invalid persisted state returns HTTP 500, never an empty map. `GET /status` reports:
 
 | Field | Meaning |
 | --- | --- |
@@ -80,6 +90,7 @@ Invalid signatures or executable intent return HTTP 400 with the reason. Malform
 | `observation` | `unknown` before any successful listing; `stale` after a failed pass; `pending` when observation belongs to an older revision; otherwise `fresh` |
 | `converged` | True only when the observed revision equals desired, every owned container matches desired configuration and is running, all replica counts match, and the pass has no errors |
 | `errors` | Last pass's validation, observation, mutation or convergence errors; cleared after a successful pass |
+| `unexecuted` | IR v2 deployments that are stored and valid but not executed yet; `converged` stays false while any are listed |
 | `workloads[]` | Deployment/pod, desired fields and configuration hash, current configuration hashes, desired/running replica counts and observed containers |
 
 Container entries use Docker listing names: `Id`, `Image`, `State`, `Labels`, `Ports`. Current configuration hashes are in `current_configurations` and the container's `dev.rezn.configuration` label; actual images and port mappings are in its `Image` and `Ports`. Each port mapping has `IP`, `PrivatePort`, `PublicPort`, `Type`. Unpublished ports have null `PublicPort`. Read allocated host ports from these observations: the create response's requested `host: 0` is not an allocated port.
@@ -90,7 +101,9 @@ OpenAPI and Swagger are available at `/api/openapi.json` and `/swagger`.
 
 ## State format and ownership
 
-The state database now stores one JSON value at `controller/v1`: `format: 1`, a random 256-bit `owner`, a monotonic `revision`, and deployments containing their original signed envelope and instruction metadata (`sig_id`, `applied_at`, instruction names/kinds). One atomic sled insertion stores intent and metadata together, followed by a durable flush before HTTP acceptance. Rezn validates the entire record, signatures and executable fields before any reconciliation mutation.
+The state database now stores one JSON value at `controller/v1`: `format` (below), a random 256-bit `owner`, a monotonic `revision`, and deployments containing their original signed envelope and instruction metadata (`sig_id`, `applied_at`, instruction names/kinds). One atomic sled insertion stores intent and metadata together, followed by a durable flush before HTTP acceptance. Rezn validates the entire record, signatures and executable fields before any reconciliation mutation.
+
+**Format 1 → 2.** Format 1 holds only IR v1 programs. The first accepted IR v2 program rewrites the record as format 2 in the same atomic insertion; format 2 holds either version. The migration is forward-only: a binary that only knows format 1 refuses a format 2 database instead of misreading it, and a format 1 record that contains an IR v2 program is refused as invalid. Databases that never receive an IR v2 program stay at format 1.
 
 There is no automatic legacy migration or implicit adoption. Databases using the old `desired`/`instruction/*` keys without the new record are refused; select a fresh database explicitly and handle old containers manually. Copying the same state database to another controller duplicates its ownership identity, so run only one process against that identity. A restart with the original database preserves ownership; losing the database leaves those resources unproven and untouched by a new controller.
 

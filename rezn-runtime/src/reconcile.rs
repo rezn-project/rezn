@@ -56,6 +56,9 @@ pub struct Status {
     pub observation: String,
     pub converged: bool,
     pub errors: Vec<String>,
+    /// IR v2 deployments that are stored and valid but not executed: the systemd/Podman executor does not exist
+    /// yet. While any are listed, the controller does not report convergence.
+    pub unexecuted: Vec<String>,
     pub workloads: Vec<WorkloadStatus>,
 }
 #[derive(Serialize, ToSchema)]
@@ -188,7 +191,7 @@ impl Controller {
         let state = store::load(db)?;
         let desired = state.desired()?;
         let progress = self.progress.read().await;
-        let mut workloads = desired_workloads(&desired)
+        let mut workloads = desired_workloads(&desired.v1)
             .into_iter()
             .map(|(key, fields)| (key, Some(fields)))
             .collect::<BTreeMap<_, _>>();
@@ -218,8 +221,10 @@ impl Controller {
             converged: !progress.stale
                 && !pending
                 && progress.errors.is_empty()
-                && observed.is_some_and(|o| converged(&desired, &o.containers)),
+                && desired.v2.is_empty()
+                && observed.is_some_and(|o| converged(&desired.v1, &o.containers)),
             errors: progress.errors.clone(),
+            unexecuted: desired.v2.keys().cloned().collect(),
             workloads: workloads
                 .into_iter()
                 .map(|((deployment, pod), fields)| {
@@ -291,7 +296,8 @@ impl Controller {
     async fn pass(&self, db: &sled::Db, orqos: &OrqosClient) -> Result<()> {
         // Validate the complete persisted snapshot before observation or mutation.
         let state = store::load(db)?;
-        let desired = state.desired()?;
+        // Only IR v1 is executed here; IR v2 deployments are reported as unexecuted by status.
+        let desired = state.desired()?.v1;
         let workloads = desired_workloads(&desired);
         let containers = self.observe(&state, orqos).await?;
         // If apply won the race during observation, start again with its snapshot.

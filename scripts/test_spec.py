@@ -56,6 +56,16 @@ class IrV2Schema(unittest.TestCase):
                 self.assertTrue(paths, "should be invalid")
                 self.assertTrue(any(p == at or p.startswith(at + "/") for p in paths), f"failed at {paths}, expected {at!r}")
 
+    def test_semantic_examples_are_schema_valid(self):
+        """Cross-reference rules need the validator: these pass the schema and fail in Rezn."""
+        directory = ROOT / "examples" / "ir-v2" / "invalid-semantic"
+        expected = load(directory / "expected.json")
+        files = sorted(p for p in directory.glob("*.json") if p.name != "expected.json")
+        self.assertEqual(sorted(expected), [p.name for p in files])
+        for file in files:
+            with self.subTest(file.name):
+                self.assertEqual([pointer(e) for e in self.validator.iter_errors(load(file))], [])
+
 
 class KubernetesSubset(unittest.TestCase):
     @classmethod
