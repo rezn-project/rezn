@@ -76,10 +76,11 @@ impl Drop for MockOrqos {
     }
 }
 
-pub fn signed(program: Vec<serde_json::Value>) -> common::types::InstructionWrapper {
+pub fn signed(program: impl Into<serde_json::Value>) -> common::types::InstructionWrapper {
     use base64::{engine::general_purpose::STANDARD, Engine};
     use ed25519_dalek::{Signer, SigningKey};
     let key = SigningKey::from_bytes(&[42; 32]);
+    let program = program.into();
     let bytes = serde_json_canonicalizer::to_vec(&program).unwrap();
     common::types::InstructionWrapper {
         program,

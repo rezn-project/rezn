@@ -16,10 +16,11 @@ pub struct Signature {
 }
 
 /// Keep submitted program values intact until canonical signature verification.
+/// `program` is an array (IR v1) or an object (IR v2, see `crate::ir_v2`).
 #[derive(Clone, Serialize, Deserialize, Debug, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InstructionWrapper {
-    pub program: Vec<serde_json::Value>,
+    pub program: serde_json::Value,
     pub signature: Signature,
 }
 

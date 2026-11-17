@@ -369,9 +369,11 @@ dependencies = [
 name = "common"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "utoipa",
  "utoipa-swagger-ui",
 ]

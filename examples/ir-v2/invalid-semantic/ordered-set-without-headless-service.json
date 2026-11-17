@@ -1,0 +1,122 @@
+{
+  "ir": "rezn.dev/v2",
+  "deployment": "cache",
+  "namespace": "cache",
+  "resources": [
+    {
+      "kind": "secret",
+      "name": "cache-password",
+      "fields": {
+        "type": "opaque",
+        "keys": [
+          "password"
+        ],
+        "source": {
+          "random": {
+            "password": {
+              "length": 32,
+              "alphabet": "alphanumeric"
+            }
+          }
+        }
+      }
+    },
+    {
+      "kind": "ordered_replica_set",
+      "name": "cache",
+      "fields": {
+        "replicas": 3,
+        "service": "cache",
+        "pod_management": "parallel",
+        "volume_claims": [
+          {
+            "name": "data",
+            "bytes": 1073741824
+          }
+        ],
+        "retain": {
+          "on_scale_down": true,
+          "on_removal": true
+        },
+        "pod": {
+          "user": 10001,
+          "group": 10001,
+          "fs_group": 10001,
+          "fs_group_policy": "on_root_mismatch",
+          "run_as_non_root": true,
+          "seccomp": "runtime_default",
+          "grace_seconds": 30,
+          "volumes": [
+            {
+              "name": "data",
+              "claim": "data"
+            }
+          ],
+          "containers": [
+            {
+              "name": "cache",
+              "image": "docker.io/library/redis:7.4-alpine",
+              "args": [
+                "--requirepass",
+                "$(PASSWORD)",
+                "--dir",
+                "/data"
+              ],
+              "env": [
+                {
+                  "name": "PASSWORD",
+                  "secret": {
+                    "name": "cache-password",
+                    "key": "password"
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "name": "redis",
+                  "port": 6379
+                }
+              ],
+              "readiness": {
+                "exec": [
+                  "redis-cli",
+                  "ping"
+                ],
+                "period_seconds": 5
+              },
+              "mounts": [
+                {
+                  "volume": "data",
+                  "path": "/data"
+                }
+              ],
+              "security": {
+                "read_only_root": true,
+                "allow_privilege_escalation": false,
+                "drop_capabilities": [
+                  "all"
+                ],
+                "run_as_non_root": true
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "kind": "service",
+      "name": "cache",
+      "fields": {
+        "target": "cache",
+        "headless": false,
+        "ports": [
+          {
+            "name": "redis",
+            "port": 6379,
+            "target_port": "redis"
+          }
+        ]
+      }
+    }
+  ]
+}

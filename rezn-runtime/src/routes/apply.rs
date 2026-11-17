@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
-    intent::{validate_name, validate_program, verify},
+    intent::{validate_envelope, Validated},
     routes::common::{app_error, AppError},
     store::{self, Deployment},
     AppState,
@@ -27,7 +27,7 @@ pub struct Accepted {
 
 #[utoipa::path(
     post, path = "/apply",
-    request_body(content = ApplyPayload, description = "Replace one deployment with a signed executable pod program. The signature covers the canonical submitted program; the deployment name is unsigned.", content_type = "application/json"),
+    request_body(content = ApplyPayload, description = "Replace one deployment with a signed program: an IR v1 instruction array (executed) or an IR v2 program object (validated and stored; not yet executed, see /status unexecuted). The signature covers the canonical submitted program; an IR v1 deployment name is unsigned, an IR v2 program signs its deployment and namespace.", content_type = "application/json"),
     responses(
         (status = 202, description = "Intent stored durably; inspect /status for convergence", body = Accepted),
         (status = 400, description = "Invalid signature or unsupported intent", body = String),
@@ -40,16 +40,12 @@ pub async fn apply_handler(
     Json(payload): Json<ApplyPayload>,
 ) -> Result<(StatusCode, Json<Accepted>), AppError> {
     let invalid = |e: anyhow::Error| (StatusCode::BAD_REQUEST, format!("{e:#}"));
-    validate_name(&payload.name).map_err(invalid)?;
-    verify(&payload.instruction_wrapper).map_err(invalid)?;
-    let instructions = validate_program(&payload.instruction_wrapper.program).map_err(invalid)?;
+    let validated =
+        validate_envelope(&payload.name, &payload.instruction_wrapper).map_err(invalid)?;
     let meta = InstructionMeta {
         sig_id: payload.instruction_wrapper.signature.sig.clone(),
         applied_at: chrono::Utc::now(),
-        instructions: instructions
-            .iter()
-            .map(|i| (i.kind.clone(), i.name.clone()))
-            .collect(),
+        instructions: validated.instructions(),
     };
     let _intent = app.controller.intent.lock().await;
     let mut state = store::load(&app.db).map_err(app_error)?;
@@ -57,6 +53,10 @@ pub async fn apply_handler(
         .revision
         .checked_add(1)
         .ok_or_else(|| app_error("revision exhausted"))?;
+    if matches!(validated, Validated::V2(_)) {
+        // Forward-only migration: the first IR v2 program moves the database to format 2 in this same write.
+        state.format = state.format.max(store::FORMAT_V2);
+    }
     state.deployments.insert(
         payload.name,
         Deployment {

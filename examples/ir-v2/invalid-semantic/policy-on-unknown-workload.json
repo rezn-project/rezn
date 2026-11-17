@@ -1,0 +1,115 @@
+{
+  "ir": "rezn.dev/v2",
+  "deployment": "site",
+  "namespace": "site",
+  "resources": [
+    {
+      "kind": "secret",
+      "name": "site-tls",
+      "fields": {
+        "type": "tls",
+        "keys": [
+          "tls.crt",
+          "tls.key"
+        ],
+        "source": {
+          "store": {}
+        }
+      }
+    },
+    {
+      "kind": "replica_set",
+      "name": "frontend",
+      "fields": {
+        "replicas": 1,
+        "pod": {
+          "containers": [
+            {
+              "name": "frontend",
+              "image": "docker.io/library/nginx:1.27-alpine",
+              "ports": [
+                {
+                  "name": "http",
+                  "port": 80
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "kind": "service",
+      "name": "frontend",
+      "fields": {
+        "target": "frontend",
+        "ports": [
+          {
+            "name": "http",
+            "port": 80,
+            "target_port": "http"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "ingress",
+      "name": "site",
+      "fields": {
+        "hosts": [
+          {
+            "host": "www.example.com",
+            "paths": [
+              {
+                "path": "/",
+                "service": "frontend",
+                "port": "http"
+              }
+            ]
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "www.example.com"
+            ],
+            "secret": "site-tls"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "network_policy",
+      "name": "frontend",
+      "fields": {
+        "targets": [
+          "backend"
+        ],
+        "ingress": [
+          {
+            "ports": [
+              {
+                "port": 80,
+                "protocol": "tcp"
+              }
+            ]
+          }
+        ],
+        "egress": [
+          {
+            "ports": [
+              {
+                "port": 53,
+                "protocol": "udp"
+              },
+              {
+                "port": 53,
+                "protocol": "tcp"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -170,7 +170,7 @@ async fn validation_is_atomic_and_signature_uses_the_entire_submitted_program() 
     for name in ["", "unsafe/name", "bad:label"] {
         let response = client
             .post(format!("{}/apply", http.url))
-            .json(&json!({"name":name,"instruction_wrapper":signed(vec![])}))
+            .json(&json!({"name":name,"instruction_wrapper":signed(json!([]))}))
             .send()
             .await
             .unwrap();
@@ -189,7 +189,7 @@ async fn validation_is_atomic_and_signature_uses_the_entire_submitted_program() 
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
-    let mut unsupported_envelope = json!({"name":"prod","instruction_wrapper":signed(vec![])});
+    let mut unsupported_envelope = json!({"name":"prod","instruction_wrapper":signed(json!([]))});
     unsupported_envelope["instruction_wrapper"]["future"] = json!(1);
     assert_eq!(
         client
@@ -419,7 +419,7 @@ async fn corrupt_missing_legacy_and_semantically_invalid_state_never_become_dele
     let mut invalid: Value = serde_json::from_slice(&original).unwrap();
     invalid["deployments"]["prod"]["envelope"] = json!(signed(vec![pod("web", "nginx", 1, &[0])]));
     let mut wrong_format: Value = serde_json::from_slice(&original).unwrap();
-    wrong_format["format"] = json!(2);
+    wrong_format["format"] = json!(3);
     let mut missing_deployments: Value = serde_json::from_slice(&original).unwrap();
     missing_deployments["deployments"] = json!({});
     for bytes in [
@@ -445,7 +445,7 @@ async fn corrupt_missing_legacy_and_semantically_invalid_state_never_become_dele
                 State(app.clone()),
                 Json(ApplyPayload {
                     name: "prod".into(),
-                    instruction_wrapper: signed(vec![])
+                    instruction_wrapper: signed(json!([]))
                 })
             )
             .await
@@ -586,7 +586,7 @@ fn supported_example_is_valid_and_canonically_equivalent_input_verifies() {
     let wrapper: common::types::InstructionWrapper =
         serde_json::from_str(include_str!("../../examples/test.ir.json")).unwrap();
     crate::intent::verify(&wrapper).unwrap();
-    crate::intent::validate_program(&wrapper.program).unwrap();
+    crate::intent::validate_program(wrapper.program.as_array().unwrap()).unwrap();
     // Construct another wire serialization of the actual signed fixture.
     let reordered = format!(
         r#"{{"signature":{},"program":[{{"name":"web","kind":"pod","fields":{{"replicas":1,"ports":[80],"image":"nginx:alpine"}}}}]}}"#,
@@ -846,7 +846,7 @@ fn shared_jcs_and_ed25519_fixture_matches_the_dsl_verifier() {
         include_bytes!("../tests/fixtures/signatures/program.canonical.json")
     );
     crate::intent::verify(&wrapper).unwrap();
-    crate::intent::validate_program(&wrapper.program).unwrap();
+    crate::intent::validate_program(wrapper.program.as_array().unwrap()).unwrap();
 
     // Both verifiers accept a different nested object ordering on the wire.
     let reordered = format!(
@@ -872,6 +872,195 @@ fn shared_jcs_and_ed25519_fixture_matches_the_dsl_verifier() {
             "tampered {field}"
         );
     }
-    wrapper.program.reverse();
+    wrapper.program.as_array_mut().unwrap().reverse();
     assert!(crate::intent::verify(&wrapper).is_err());
+}
+
+fn example_v2(name: &str) -> Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../examples/ir-v2")
+        .join(name);
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+fn stored(app: &Arc<crate::AppState>) -> Value {
+    serde_json::from_slice(&app.db.get(STATE_KEY).unwrap().unwrap()).unwrap()
+}
+
+async fn rejected(
+    app: &Arc<crate::AppState>,
+    name: &str,
+    wrapper: common::types::InstructionWrapper,
+) -> String {
+    let (status, message) = apply_handler(
+        State(app.clone()),
+        Json(ApplyPayload {
+            name: name.into(),
+            instruction_wrapper: wrapper,
+        }),
+    )
+    .await
+    .err()
+    .expect("apply should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{message}");
+    message
+}
+
+#[tokio::test]
+async fn ir_v2_programs_are_stored_with_format_2_and_reported_unexecuted() {
+    let (backend, _) = backend().await;
+    let app = app(backend.client.clone(), None);
+    let http = HttpRezn::start(app.clone()).await;
+    apply(&app, "prod", vec![pod("web", "nginx", 1, &[80])]).await;
+    app.controller.reconcile(&app.db, &app.orqos).await.unwrap();
+    assert_eq!(ids(&app).await.len(), 1);
+    assert_eq!(stored(&app)["format"], 1);
+
+    let program = example_v2("minimal.json");
+    let response = apply_handler(
+        State(app.clone()),
+        Json(ApplyPayload {
+            name: "hello".into(),
+            instruction_wrapper: signed(program.clone()),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.0, StatusCode::ACCEPTED);
+    let state = stored(&app);
+    assert_eq!(state["format"], 2);
+    assert_eq!(
+        state["deployments"]["hello"]["envelope"]["program"],
+        program
+    );
+    assert_eq!(
+        state["deployments"]["hello"]["meta"]["instructions"],
+        json!([["replica_set", "web"], ["service", "web"]])
+    );
+
+    let desired: Value = reqwest::get(format!("{}/state", http.url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(desired["hello"], program);
+    assert_eq!(desired["prod"], json!([pod("web", "nginx", 1, &[80])]));
+
+    app.controller.reconcile(&app.db, &app.orqos).await.unwrap();
+    let status = app.controller.status(&app.db).await.unwrap();
+    assert_eq!(status.unexecuted, vec!["hello".to_string()]);
+    assert!(!status.converged, "IR v2 deployments are not executed yet");
+    assert_eq!(
+        status
+            .workloads
+            .iter()
+            .map(|w| w.containers.len())
+            .sum::<usize>(),
+        1
+    );
+    let http_status: Value = reqwest::get(format!("{}/status", http.url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(http_status["unexecuted"], json!(["hello"]));
+
+    // A restart re-verifies the stored v2 envelope from the format 2 database.
+    let reloaded = store::load(&app.db).unwrap().desired().unwrap();
+    assert!(reloaded.v2.contains_key("hello") && reloaded.v1.contains_key("prod"));
+    store::initialize(&app.db).unwrap();
+}
+
+#[tokio::test]
+async fn invalid_ir_v2_submissions_change_nothing() {
+    let (backend, _) = backend().await;
+    let app = app(backend.client.clone(), None);
+    apply(&app, "prod", vec![pod("web", "nginx", 1, &[])]).await;
+    let before = app.db.get(STATE_KEY).unwrap();
+    let program = example_v2("minimal.json");
+
+    assert!(rejected(&app, "other", signed(program.clone()))
+        .await
+        .contains("does not match"));
+    let mut upper = program.clone();
+    upper["deployment"] = json!("Hello");
+    assert!(rejected(&app, "Hello", signed(upper))
+        .await
+        .contains("lowercase"));
+    let mut dangling = program.clone();
+    dangling["resources"][1]["fields"]["target"] = json!("nothing");
+    assert!(rejected(&app, "hello", signed(dangling))
+        .await
+        .contains("/resources/1/fields/target"));
+    let mut tampered = signed(program.clone());
+    tampered.program["resources"][0]["fields"]["replicas"] = json!(3);
+    assert!(rejected(&app, "hello", tampered)
+        .await
+        .contains("signature"));
+    let mut v1_object = signed(program);
+    v1_object.program = json!("not a program");
+    assert!(rejected(&app, "hello", v1_object)
+        .await
+        .contains("array (IR v1) or an object (IR v2)"));
+
+    assert_eq!(app.db.get(STATE_KEY).unwrap(), before);
+    assert_eq!(stored(&app)["format"], 1);
+    assert!(backend.requests().is_empty());
+}
+
+#[test]
+fn format_1_state_refuses_ir_v2_programs() {
+    let db = sled::Config::new().temporary(true).open().unwrap();
+    store::initialize(&db).unwrap();
+    let mut state: Value = serde_json::from_slice(&db.get(STATE_KEY).unwrap().unwrap()).unwrap();
+    let wrapper = signed(example_v2("minimal.json"));
+    state["revision"] = json!(1);
+    state["deployments"]["hello"] = json!({
+        "envelope": wrapper,
+        "meta": {"sig_id": wrapper.signature.sig, "applied_at": "2026-11-17T00:00:00Z",
+                 "instructions": [["replica_set", "web"], ["service", "web"]]}
+    });
+    let mut as_format_2 = state.clone();
+    as_format_2["format"] = json!(2);
+    assert!(store::StoredState::decode(&serde_json::to_vec(&as_format_2).unwrap()).is_ok());
+    let Err(error) = store::StoredState::decode(&serde_json::to_vec(&state).unwrap()) else {
+        panic!("format 1 state with an IR v2 program must be refused");
+    };
+    assert!(format!("{error:#}").contains("format 1"), "{error:#}");
+}
+
+#[tokio::test]
+async fn replacing_an_ir_v1_deployment_with_ir_v2_removes_only_its_containers() {
+    let (backend, _) = backend().await;
+    let app = app(backend.client.clone(), None);
+    apply(&app, "prod", vec![pod("web", "nginx", 2, &[])]).await;
+    apply(&app, "other", vec![pod("api", "nginx", 1, &[])]).await;
+    app.controller.reconcile(&app.db, &app.orqos).await.unwrap();
+    assert_eq!(ids(&app).await.len(), 3);
+
+    let mut program = example_v2("minimal.json");
+    program["deployment"] = json!("prod");
+    program["namespace"] = json!("prod");
+    let response = apply_handler(
+        State(app.clone()),
+        Json(ApplyPayload {
+            name: "prod".into(),
+            instruction_wrapper: signed(program),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.0, StatusCode::ACCEPTED);
+    app.controller.reconcile(&app.db, &app.orqos).await.unwrap();
+    let status = app.controller.status(&app.db).await.unwrap();
+    assert_eq!(status.unexecuted, vec!["prod".to_string()]);
+    let remaining: Vec<_> = status
+        .workloads
+        .iter()
+        .filter(|w| !w.containers.is_empty())
+        .map(|w| (w.deployment.clone(), w.containers.len()))
+        .collect();
+    assert_eq!(remaining, vec![("other".to_string(), 1)]);
 }

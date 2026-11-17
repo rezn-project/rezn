@@ -1,0 +1,16 @@
+{
+  "certificate-ca-is-not-a-ca.json": "/resources/4/fields/source/certificate/ca",
+  "config-item-with-unknown-key.json": "/resources/7/fields/pod/volumes/0/config/items/0/key",
+  "duplicate-workload-name.json": "/resources/2/name",
+  "ingress-tls-on-opaque-secret.json": "/resources/3/fields/tls/0/secret",
+  "job-with-restart-always.json": "/resources/0/fields/pod/restart",
+  "mount-of-undeclared-volume.json": "/resources/0/fields/pod/containers/0/mounts/0/volume",
+  "ordered-set-without-headless-service.json": "/resources/1/fields/service",
+  "policy-on-unknown-workload.json": "/resources/4/fields/targets/0",
+  "probe-port-of-another-container.json": "/resources/0/fields/pod/containers/0/readiness/http/port",
+  "pull-secret-without-dockerconfigjson.json": "/resources/7/fields/pod/image_pull_secrets/0",
+  "target-port-not-a-container-port.json": "/resources/1/fields/ports/0/target_port",
+  "undeclared-secret-key.json": "/resources/1/fields/pod/containers/0/env/0/secret",
+  "unknown-service-target.json": "/resources/1/fields/target",
+  "user-0-with-run-as-non-root.json": "/resources/0/fields/pod/containers/0"
+}

@@ -1,8 +1,9 @@
 # Rezn IR v2
 
-Status: specification for M0 ([#32](https://github.com/rezn-project/rezn/issues/32)). Rezn still executes only
-[IR v1](DEVELOPMENT.md#executable-intent-and-apply-contract); the reconciler, the Kubernetes import
-([#83](https://github.com/rezn-project/rezn/issues/83)) and the Orqos workload backend adopt IR v2 in M1.
+Status: specified in M0 ([#32](https://github.com/rezn-project/rezn/issues/32)). `/apply` verifies, validates and
+stores IR v2 programs, and `reznctl validate` checks them offline ([#39](https://github.com/rezn-project/rezn/issues/39));
+Rezn still executes only [IR v1](DEVELOPMENT.md#executable-intent-and-apply-contract). The reconciler, the Kubernetes
+import ([#83](https://github.com/rezn-project/rezn/issues/83)) and the Orqos workload backend adopt IR v2 in M1.
 
 IR v2 is the signed program format that every front end produces: the Kubernetes manifest import (from the
 [supported subset](KUBERNETES-SUBSET.md)) and the Rezn DSL. It is Rezn's own vocabulary with Kubernetes semantics
