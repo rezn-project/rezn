@@ -1,0 +1,3 @@
+# Per-replica state volume (volumeClaimTemplates); kept when the pod is removed.
+[Volume]
+VolumeName=rezn-spike-pg-0

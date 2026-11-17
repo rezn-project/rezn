@@ -1,0 +1,22 @@
+# Init container: runs once per pod start, before the sidecar, and must succeed.
+# It does not touch the memory volume: a Podman tmpfs volume is unmounted (and emptied) when no running
+# container uses it, so content an init container writes there is gone before the sidecar starts.
+[Unit]
+Requires=rezn-spike-postgres.service
+After=rezn-spike-postgres.service
+
+[Container]
+ContainerName=rezn-spike-worker-0-init
+Pod=rezn-spike-worker.pod
+Image=docker.io/library/alpine:3.22
+User=1654
+Group=1654
+ReadOnly=true
+DropCapability=ALL
+NoNewPrivileges=true
+Volume=rezn-spike-worker-0.volume:/state
+Exec=/bin/sh -c 'set -eu; umask 077; for d in /state/data /state/keys; do mkdir -p "$d"; chmod 0700 "$d"; chmod g-s "$d"; done; echo "init: prepared owner-only directories"'
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
