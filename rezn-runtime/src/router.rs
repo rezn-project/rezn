@@ -13,8 +13,6 @@ use crate::{
         get_secrets::{get_secret_handler, get_secrets_handler},
         put_secret::put_secret_handler,
         state::{get_state_handler, get_state_raw_handler},
-        stats::get_stats_handler,
-        stats_ws::stats_ws_handler,
         status::get_status_handler,
     },
     AppState,
@@ -28,8 +26,6 @@ use crate::{
         crate::routes::state::get_state_handler,
         crate::routes::status::get_status_handler,
         crate::routes::state::get_state_raw_handler,
-        crate::routes::stats::get_stats_handler,
-        crate::routes::stats_ws::stats_ws_handler,
         crate::routes::get_secrets::get_secret_handler,
         crate::routes::get_secrets::get_secrets_handler,
         crate::routes::put_secret::put_secret_handler,
@@ -45,8 +41,6 @@ pub(crate) fn build_router(app: Arc<AppState>) -> Router {
         .route("/secret", delete(delete_secret_handler))
         .route("/secrets", post(put_secret_handler))
         .route("/apply", post(apply_handler))
-        .route("/stats", get(get_stats_handler))
-        .route("/stats/ws", get(stats_ws_handler))
         .route("/status", get(get_status_handler))
         .route("/state", get(get_state_handler))
         .route("/state/raw", get(get_state_raw_handler))

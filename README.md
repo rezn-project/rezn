@@ -1,29 +1,34 @@
 # Rezn
 
-Rezn is a local Docker controller that accepts signed desired intent and converges containers through the existing Orqos Docker API.
+Rezn is a declarative workload controller aiming to replace Kubernetes on a single Linux host. It accepts signed
+[IR v2](docs/IR-v2.md) programs and reconciles them into systemd/Podman pods through
+[Orqos](https://github.com/orqos-project/orqos)'s workload backend ([ADR 0001](docs/adr/0001-execution-foundation.md)).
+See the [roadmap](https://github.com/rezn-project/rezn/issues/25).
 
-RawPair's native host workspace MVP is implemented in RawPair and Orqos, not Rezn. Rezn keeps its existing Docker role; see [the host workspace boundary](docs/HOST_WORKSPACES.md) for the scope split and possible later work.
-
-The executable subset is deliberately small: named `pod` instructions with an image, replica count and TCP container ports. Images must already exist in the selected Docker engine. Applying intent replaces one deployment's complete program; an empty signed program removes its workloads. Replica count zero is valid.
-
-The next program format, [IR v2](docs/IR-v2.md), is accepted, validated and stored by `/apply` (and checked offline by `reznctl validate`) but not executed yet; the [Kubernetes manifest subset](docs/KUBERNETES-SUBSET.md) it will import is specified. See the [roadmap](https://github.com/rezn-project/rezn/issues/25).
-
-```json
-[{"kind":"pod","name":"web","fields":{"image":"nginx:alpine","replicas":1,"ports":[80]}}]
-```
-
-The [supported signed example](examples/test.ir.json) contains only executable fields. With Docker-only Orqos and Rezn running locally:
+What runs today is deliberately narrow: `replica_set` resources of plain containers (image, command, arguments,
+literal environment values, grace period) and inert `config` resources. Each replica is one Podman pod with its own
+network and user namespace, supervised by systemd with restart backoff. Scaling touches the highest ordinals,
+changed specs roll one replica at a time, and stopped pods are started again. A program that needs anything else
+(services, secrets, volumes, probes, jobs and so on) is stored but left **unexecuted**, and `/status` names every
+blocking field with the issue that adds it. Nothing is silently dropped. IR v1 programs are refused; the
+[Kubernetes manifest subset](docs/KUBERNETES-SUBSET.md) is specified for import.
 
 ```bash
-cargo run --locked -p reznctl -- http://127.0.0.1:4000/apply demo examples/test.ir.json
-curl -s http://127.0.0.1:4000/state
+python3 scripts/signed_program.py examples/ir-v2/runnable.json > /tmp/demo.signed.json
+cargo run --locked -p reznctl -- http://127.0.0.1:4000/apply demo /tmp/demo.signed.json
 curl -s http://127.0.0.1:4000/status
 ```
 
-`/apply` returns HTTP 202 when intent is stored, before deployment completes. `/state` reports desired intent; `/status` reports observed replicas, configuration identities, container states, allocated host ports, timestamps and errors. Reconciliation runs after apply and periodically, replacing changed or stopped containers and cleaning up removed workloads. Unchanged reapplication preserves container IDs. Replacement permits downtime and new host ports.
+`/apply` returns HTTP 202 when intent is stored, before deployment completes. `/state` reports the accepted
+programs; `/status` reports observation freshness, convergence, errors, unexecuted deployments with reasons, and
+every pod with its state, container restarts and whether it runs the current spec. Reconciliation runs after each
+apply and periodically.
 
-Each database has a persistent ownership identity. Rezn checks ownership labels before mutating a container and never adopts containers by name. The state format is new: legacy databases require an explicitly chosen fresh database, with old resources handled separately. See [development, status and state-format documentation](docs/DEVELOPMENT.md).
+Each state database has a persistent ownership identity, carried in labels on every pod Rezn creates and proven
+from them before any change; Rezn never adopts pods it cannot prove. See the
+[development guide](docs/DEVELOPMENT.md) for running Orqos and Rezn, the apply and status contracts, the state
+format and the live acceptance against real systemd and Podman.
 
-Signatures verify canonical program integrity against the **caller-supplied public key**. They do not establish signer trust, bind the deployment name, or prevent replay. This is a local development MVP. Kubernetes, Podman certification, rolling updates, automatic image pulls and metrics/UI improvements are deferred.
-
-Build checks and the reproducible live Docker acceptance command are in the [development guide](docs/DEVELOPMENT.md). The separate DSL compiler's signing/verifying discrepancy is recorded in [signature follow-up notes](docs/SIGNATURES.md).
+Signatures verify canonical program integrity against the **caller-supplied public key**. They do not establish
+signer trust or prevent replay; see [signature limits](docs/SIGNATURES.md). RawPair's native workspaces use Orqos's
+host API, not Rezn ([scope](docs/HOST_WORKSPACES.md)).

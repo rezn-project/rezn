@@ -1,27 +1,21 @@
 use std::{collections::BTreeMap, fs::File, io::Read};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use common::{
     ir_v2::Program,
-    types::{DesiredMap, InstructionMeta, InstructionWrapper},
+    types::{InstructionMeta, InstructionWrapper},
 };
 use serde::{Deserialize, Serialize};
 use sled::Db;
 
-use crate::intent::{validate_envelope, Validated};
+use crate::intent::{instructions, validate_envelope};
 
 pub const STATE_KEY: &str = "controller/v1";
-/// Format 1 holds only IR v1 programs. Storing the first IR v2 program rewrites the state as format 2, which holds
-/// either; binaries that only know format 1 then refuse the database instead of misreading it.
+/// Format 1 held IR v1 programs, which Rezn no longer executes: a format 1 database loads only while it holds no
+/// deployment, and the next apply rewrites it as format 2. Format 2 holds IR v2 programs; binaries that only know
+/// format 1 refuse it instead of misreading it.
 pub const FORMAT_V1: u32 = 1;
 pub const FORMAT_V2: u32 = 2;
-
-/// Validated desired intent, split by IR version.
-#[derive(Default)]
-pub struct Desired {
-    pub v1: DesiredMap,
-    pub v2: BTreeMap<String, Program>,
-}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,7 +53,8 @@ impl StoredState {
         Ok(state)
     }
 
-    pub fn desired(&self) -> Result<Desired> {
+    /// Every deployment's validated IR v2 program.
+    pub fn desired(&self) -> Result<BTreeMap<String, Program>> {
         ensure!(
             matches!(self.format, FORMAT_V1 | FORMAT_V2) && is_identity(&self.owner),
             "invalid controller format/ownership identity"
@@ -68,44 +63,39 @@ impl StoredState {
             (self.revision == 0) == self.deployments.is_empty(),
             "inconsistent controller revision/deployment records"
         );
-        let mut desired = Desired::default();
+        let mut desired = BTreeMap::new();
         for (name, deployment) in &self.deployments {
-            let validated = validate_envelope(name, &deployment.envelope)
+            ensure!(
+                !deployment.envelope.program.is_array(),
+                "deployment {name:?} holds an IR v1 program, which this Rezn no longer executes; start with a new state database (its Docker containers are left untouched)"
+            );
+            ensure!(
+                self.format == FORMAT_V2,
+                "format {} controller state contains an IR v2 program",
+                self.format
+            );
+            let program = validate_envelope(name, &deployment.envelope)
                 .with_context(|| format!("invalid persisted deployment {name:?}"))?;
             ensure!(
                 deployment.meta.sig_id == deployment.envelope.signature.sig
-                    && deployment.meta.instructions == validated.instructions(),
+                    && deployment.meta.instructions == instructions(&program),
                 "inconsistent persisted instruction metadata"
             );
-            match validated {
-                Validated::V1(instructions) => {
-                    desired.v1.insert(name.clone(), instructions);
-                }
-                Validated::V2(program) => {
-                    if self.format == FORMAT_V1 {
-                        bail!("format 1 controller state contains an IR v2 program");
-                    }
-                    desired.v2.insert(name.clone(), program);
-                }
-            }
+            desired.insert(name.clone(), program);
         }
         Ok(desired)
     }
 
-    /// Each deployment's accepted program as JSON: IR v1 instruction arrays, IR v2 program objects.
+    /// Each deployment's accepted IR v2 program object, as signed.
     pub fn programs(&self) -> Result<BTreeMap<String, serde_json::Value>> {
-        let desired = self.desired()?;
-        let mut programs = BTreeMap::new();
-        for (name, instructions) in desired.v1 {
-            programs.insert(name, serde_json::to_value(instructions)?);
-        }
-        for name in desired.v2.into_keys() {
-            programs.insert(
-                name.clone(),
-                self.deployments[&name].envelope.program.clone(),
-            );
-        }
-        Ok(programs)
+        Ok(self
+            .desired()?
+            .into_keys()
+            .map(|name| {
+                let program = self.deployments[&name].envelope.program.clone();
+                (name, program)
+            })
+            .collect())
     }
 }
 
@@ -123,7 +113,7 @@ pub fn initialize(db: &Db) -> Result<()> {
     }
     ensure!(db.is_empty(), "legacy/unrecognized state database: use a new isolated database; no migration or adoption is performed");
     let state = StoredState {
-        format: FORMAT_V1,
+        format: FORMAT_V2,
         owner: random_id()?,
         revision: 0,
         deployments: BTreeMap::new(),

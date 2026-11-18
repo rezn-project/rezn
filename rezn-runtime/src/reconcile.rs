@@ -1,26 +1,30 @@
+//! The controller: makes Orqos's workload pods match the stored IR v2 programs.
+//!
+//! One serialized pass observes every pod this database owns, plans a bounded set of changes (creations,
+//! one-at-a-time replacements, removals), applies them and observes again. Ownership is proven from each pod's
+//! labels and ID before anything is changed; a malformed proof stops the whole pass.
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
 };
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use chrono::Utc;
-use common::types::{DesiredMap, PodFields};
+use common::ir_v2::{self, Kind};
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 use utoipa::ToSchema;
 
 use crate::{
-    intent::{configuration, validate_name},
-    orqos_client::{ContainerSummary, CreateReq, OrqosClient, PortMap},
+    orqos_client::{ContainerStatus, OrqosClient, PodSpec, PodStatus},
     store::{self, StoredState},
+    workload::{self, Workload, DEPLOYMENT, KIND, NAMESPACE, ORDINAL, OWNER, RESOURCE},
 };
 
-pub const OWNER: &str = "dev.rezn.owner";
-pub const MANAGED: &str = "dev.rezn.managed";
-pub const DEPLOYMENT: &str = "dev.rezn.deployment";
-pub const POD: &str = "dev.rezn.pod";
-pub const CONFIG: &str = "dev.rezn.configuration";
+/// (deployment, kind, resource) of one replica set.
+type WorkloadKey = (String, Kind, String);
+/// Unexecuted deployments and the reasons each cannot run.
+type Reasons = BTreeMap<String, Vec<String>>;
 
 #[derive(Clone, Default)]
 struct Progress {
@@ -29,11 +33,32 @@ struct Progress {
     stale: bool,
     errors: Vec<String>,
 }
+
 #[derive(Clone)]
 struct Observation {
     revision: u64,
     at: String,
-    containers: Vec<ContainerSummary>,
+    pods: Vec<Owned>,
+}
+
+/// A pod proven to belong to this database.
+#[derive(Clone, Debug)]
+pub struct Owned {
+    pub deployment: String,
+    pub kind: Kind,
+    pub resource: String,
+    pub ordinal: u32,
+    pub status: PodStatus,
+}
+
+impl Owned {
+    fn workload(&self) -> WorkloadKey {
+        (self.deployment.clone(), self.kind, self.resource.clone())
+    }
+
+    fn running(&self) -> bool {
+        self.status.state == "running"
+    }
 }
 
 #[derive(Default)]
@@ -56,154 +81,257 @@ pub struct Status {
     pub observation: String,
     pub converged: bool,
     pub errors: Vec<String>,
-    /// IR v2 deployments that are stored and valid but not executed: the systemd/Podman executor does not exist
-    /// yet. While any are listed, the controller does not report convergence.
-    pub unexecuted: Vec<String>,
+    /// Deployments whose program needs features the workload backend does not provide yet. Nothing of theirs is
+    /// created, changed or removed; pods of an earlier revision keep running. `converged` stays false.
+    pub unexecuted: Vec<Unexecuted>,
     pub workloads: Vec<WorkloadStatus>,
 }
+
+#[derive(Serialize, ToSchema)]
+pub struct Unexecuted {
+    pub deployment: String,
+    /// `JSON pointer: reason (issue)` for every blocking feature.
+    pub reasons: Vec<String>,
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct WorkloadStatus {
     pub deployment: String,
-    pub pod: String,
-    pub desired_configuration: Option<String>,
-    pub desired: Option<PodFields>,
-    pub current_configurations: Vec<String>,
-    pub desired_replicas: usize,
-    /// Null until there has been a successful observation; stale values retain their timestamp.
+    pub kind: String,
+    pub resource: String,
+    /// Null for pods awaiting removal and for deployments that are not executed.
+    pub desired_replicas: Option<usize>,
+    /// Null until there has been a successful observation; stale values keep their timestamp.
     pub running_replicas: Option<usize>,
-    pub containers: Vec<ContainerSummary>,
+    pub pods: Vec<PodView>,
 }
 
-fn desired_workloads(desired: &DesiredMap) -> BTreeMap<(String, String), PodFields> {
-    desired
-        .iter()
-        .flat_map(|(deployment, instructions)| {
-            instructions
-                .iter()
-                .map(move |i| ((deployment.clone(), i.name.clone()), i.fields.clone()))
-        })
-        .collect()
+#[derive(Serialize, ToSchema)]
+pub struct PodView {
+    pub id: String,
+    pub ordinal: u32,
+    pub hostname: String,
+    /// Orqos's summary: `running`, `starting`, `restarting`, `degraded`, `failed` or `stopped`.
+    pub state: String,
+    /// The pod runs the desired spec of the accepted revision.
+    pub current: bool,
+    pub containers: Vec<ContainerStatus>,
+    /// Orqos's last operation error for the pod.
+    pub error: Option<String>,
 }
 
-// A server-side label filter is not ownership proof. Check returned labels locally.
-fn owned(state: &StoredState, containers: Vec<ContainerSummary>) -> Result<Vec<ContainerSummary>> {
+/// One change to Orqos, in the order planned.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Action {
+    Remove(String),
+    Apply(String, PodSpec),
+}
+
+/// Desired workloads of every executable deployment, and the reasons of the others.
+fn desired(state: &StoredState) -> Result<(Vec<Workload>, Reasons)> {
+    let mut workloads = Vec::new();
+    let mut unexecuted = BTreeMap::new();
+    for (name, program) in state.desired()? {
+        match workload::translate(&state.owner, &program) {
+            Ok(w) => workloads.extend(w),
+            Err(reasons) => {
+                unexecuted.insert(name, reasons);
+            }
+        }
+    }
+    Ok((workloads, unexecuted))
+}
+
+/// Proves ownership locally: a server-side listing is no proof. Pods of other owners are ignored; a pod claiming
+/// this owner with malformed labels, or an ID that does not match them, fails the observation.
+pub fn owned(owner: &str, pods: Vec<PodStatus>) -> Result<Vec<Owned>> {
     let mut ids = HashSet::new();
-    let mut result = vec![];
-    for container in containers {
-        if container.labels.get(OWNER) != Some(&state.owner)
-            || container.labels.get(MANAGED).map(String::as_str) != Some("v1")
-        {
+    let mut result = Vec::new();
+    for pod in pods {
+        let labels = &pod.spec.labels;
+        if labels.get(OWNER).map(String::as_str) != Some(owner) {
             continue;
         }
-        for label in [DEPLOYMENT, POD] {
-            validate_name(container.labels.get(label).with_context(|| {
-                format!("container {} lacks ownership label {label}", container.id)
-            })?)?;
-        }
+        let label = |key: &str| {
+            labels
+                .get(key)
+                .with_context(|| format!("pod {} lacks ownership label {key}", pod.id))
+        };
+        let deployment = label(DEPLOYMENT)?.clone();
+        let resource = label(RESOURCE)?.clone();
         ensure!(
-            container
-                .labels
-                .get(CONFIG)
-                .is_some_and(|s| store::is_identity(s)),
-            "container {} lacks a valid configuration identity",
-            container.id
+            ir_v2::is_name(&deployment, 63)
+                && ir_v2::is_name(label(NAMESPACE)?, 63)
+                && ir_v2::is_name(&resource, 63),
+            "pod {} has malformed ownership labels",
+            pod.id
+        );
+        let kind = match label(KIND)?.as_str() {
+            "replica_set" => Kind::ReplicaSet,
+            "ordered_replica_set" => Kind::OrderedReplicaSet,
+            other => bail!("pod {} has an unknown kind label {other:?}", pod.id),
+        };
+        let ordinal_label = label(ORDINAL)?;
+        let ordinal: u32 = ordinal_label
+            .parse()
+            .ok()
+            .filter(|n: &u32| n.to_string() == *ordinal_label)
+            .with_context(|| format!("pod {} has a malformed ordinal label", pod.id))?;
+        ensure!(
+            pod.id == workload::pod_id(owner, &deployment, kind.as_str(), &resource, ordinal),
+            "pod {} claims this owner but its ID does not match its labels",
+            pod.id
         );
         ensure!(
-            !container.id.is_empty()
-                && container.id.len() <= 128
-                && container
-                    .id
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)),
-            "invalid container ID in observation"
+            ids.insert(pod.id.clone()),
+            "duplicate pod {} in observation",
+            pod.id
         );
-        ensure!(
-            ids.insert(container.id.clone()),
-            "duplicate container ID in observation"
-        );
-        ensure!(
-            !container.image.is_empty()
-                && [
-                    "created",
-                    "restarting",
-                    "running",
-                    "removing",
-                    "paused",
-                    "exited",
-                    "dead"
-                ]
-                .contains(&container.state.as_str()),
-            "invalid container image/state in observation"
-        );
-        ensure!(
-            container.ports.iter().all(|p| p.private_port > 0
-                && ["tcp", "udp", "sctp"].contains(&p.protocol.as_str())
-                && p.public_port.is_none_or(|port| port > 0
-                    && p.ip
-                        .as_ref()
-                        .is_some_and(|ip| ip.parse::<std::net::IpAddr>().is_ok()))),
-            "invalid port mapping in container {} observation",
-            container.id
-        );
-        result.push(container);
+        result.push(Owned {
+            deployment,
+            kind,
+            resource,
+            ordinal,
+            status: pod,
+        });
     }
-    result.sort_by(|a, b| a.id.cmp(&b.id));
+    result.sort_by_key(|p| (p.workload(), p.ordinal));
     Ok(result)
 }
 
-fn key(container: &ContainerSummary) -> (String, String) {
-    (
-        container.labels[DEPLOYMENT].clone(),
-        container.labels[POD].clone(),
-    )
-}
-
-fn matching(container: &ContainerSummary, fields: &PodFields) -> bool {
-    container.state == "running"
-        && container.labels[CONFIG] == configuration(fields)
-        && container.image == fields.image
-        && fields.ports.iter().all(|port| {
-            container.ports.iter().any(|mapping| {
-                mapping.private_port == *port
-                    && mapping.protocol == "tcp"
-                    && mapping.public_port.is_some_and(|p| p > 0)
-            })
-        })
-}
-
-fn converged(desired: &DesiredMap, containers: &[ContainerSummary]) -> bool {
-    let workloads = desired_workloads(desired);
-    containers
+/// Plans one pass. Per replica set:
+/// - pods beyond the replica count, or of removed resources, are removed (sequential sets: the highest ordinal
+///   only, once all others run);
+/// - missing ordinals are created (sequential sets: the lowest only, once all lower ones run);
+/// - pods with an outdated spec are replaced: any that are not running at once, a running one (the highest
+///   ordinal first) only when every other desired pod of the set exists and runs;
+/// - pods Orqos reports `stopped` are applied again, which starts them.
+///
+/// Pods of unexecuted deployments are left alone.
+pub fn plan(workloads: &[Workload], unexecuted: &Reasons, observed: &[Owned]) -> Vec<Action> {
+    let mut removals = Vec::new();
+    let mut applies = Vec::new();
+    let mut by_workload: BTreeMap<WorkloadKey, BTreeMap<u32, &Owned>> = BTreeMap::new();
+    for pod in observed {
+        by_workload
+            .entry(pod.workload())
+            .or_default()
+            .insert(pod.ordinal, pod);
+    }
+    let desired: BTreeSet<_> = workloads
         .iter()
-        .all(|c| workloads.get(&key(c)).is_some_and(|f| matching(c, f)))
-        && workloads.iter().all(|(k, f)| {
-            containers
+        .map(|w| (w.deployment.clone(), w.kind, w.resource.clone()))
+        .collect();
+    for (key, pods) in &by_workload {
+        if !desired.contains(key) && !unexecuted.contains_key(&key.0) {
+            removals.extend(pods.values().map(|p| Action::Remove(p.status.id.clone())));
+        }
+    }
+    for w in workloads {
+        let key = (w.deployment.clone(), w.kind, w.resource.clone());
+        let empty = BTreeMap::new();
+        let existing = by_workload.get(&key).unwrap_or(&empty);
+        let replicas = w.pods.len() as u32;
+        let extra: Vec<&Owned> = existing.range(replicas..).map(|(_, p)| *p).collect();
+        let others_run = |except: u32| {
+            existing
                 .iter()
-                .filter(|c| &key(c) == k && matching(c, f))
-                .count()
-                == f.replicas
+                .filter(|(ordinal, _)| **ordinal != except)
+                .all(|(_, p)| p.running())
+        };
+        if w.sequential {
+            if let Some(highest) = extra.last() {
+                if others_run(highest.ordinal) {
+                    removals.push(Action::Remove(highest.status.id.clone()));
+                }
+            }
+        } else {
+            removals.extend(extra.iter().map(|p| Action::Remove(p.status.id.clone())));
+        }
+
+        let mut running_replacement = None;
+        for desired in &w.pods {
+            match existing.get(&desired.ordinal) {
+                None => {
+                    let lower_run =
+                        (0..desired.ordinal).all(|o| existing.get(&o).is_some_and(|p| p.running()));
+                    if !w.sequential || (lower_run && extra.is_empty()) {
+                        applies.push(Action::Apply(desired.id.clone(), desired.spec.clone()));
+                    }
+                    if w.sequential {
+                        break;
+                    }
+                }
+                Some(pod) if pod.status.spec != desired.spec => {
+                    if !pod.running() {
+                        applies.push(Action::Apply(desired.id.clone(), desired.spec.clone()));
+                    } else {
+                        running_replacement = Some(desired);
+                    }
+                }
+                Some(pod) if pod.status.state == "stopped" => {
+                    applies.push(Action::Apply(desired.id.clone(), desired.spec.clone()));
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some(desired) = running_replacement {
+            let all_present = w.pods.iter().all(|p| existing.contains_key(&p.ordinal));
+            if all_present && extra.is_empty() && others_run(desired.ordinal) {
+                applies.push(Action::Apply(desired.id.clone(), desired.spec.clone()));
+            }
+        }
+    }
+    removals.extend(applies);
+    removals
+}
+
+/// Every desired pod of the executed deployments exists with its spec and runs, and they own nothing else.
+fn executed_converged(workloads: &[Workload], unexecuted: &Reasons, observed: &[Owned]) -> bool {
+    let desired: BTreeMap<&str, &PodSpec> = workloads
+        .iter()
+        .flat_map(|w| w.pods.iter().map(|p| (p.id.as_str(), &p.spec)))
+        .collect();
+    let executed: Vec<&Owned> = observed
+        .iter()
+        .filter(|p| !unexecuted.contains_key(&p.deployment))
+        .collect();
+    executed.len() == desired.len()
+        && executed.iter().all(|p| {
+            p.running()
+                && desired
+                    .get(p.status.id.as_str())
+                    .is_some_and(|spec| **spec == p.status.spec)
         })
+}
+
+/// Converged: every deployment is executed and matches what Orqos runs.
+fn converged(workloads: &[Workload], unexecuted: &Reasons, observed: &[Owned]) -> bool {
+    unexecuted.is_empty() && executed_converged(workloads, unexecuted, observed)
 }
 
 impl Controller {
     pub async fn status(&self, db: &sled::Db) -> Result<Status> {
         let _intent = self.intent.lock().await;
         let state = store::load(db)?;
-        let desired = state.desired()?;
+        let (workloads, unexecuted) = desired(&state)?;
         let progress = self.progress.read().await;
-        let mut workloads = desired_workloads(&desired.v1)
-            .into_iter()
-            .map(|(key, fields)| (key, Some(fields)))
-            .collect::<BTreeMap<_, _>>();
-        if let Some(observation) = &progress.observation {
-            for c in &observation.containers {
-                workloads.entry(key(c)).or_insert(None);
-            }
-        }
         let observed = progress.observation.as_ref();
         let pending = observed.is_some_and(|o| o.revision != state.revision);
+        let mut rows: BTreeMap<WorkloadKey, (Option<&Workload>, Vec<&Owned>)> = workloads
+            .iter()
+            .map(|w| {
+                (
+                    (w.deployment.clone(), w.kind, w.resource.clone()),
+                    (Some(w), vec![]),
+                )
+            })
+            .collect();
+        for pod in observed.map(|o| o.pods.as_slice()).unwrap_or_default() {
+            rows.entry(pod.workload()).or_default().1.push(pod);
+        }
         Ok(Status {
-            owner: state.owner,
+            owner: state.owner.clone(),
             desired_revision: state.revision,
             observed_revision: observed.map(|o| o.revision),
             last_observation: observed.map(|o| o.at.clone()),
@@ -221,38 +349,40 @@ impl Controller {
             converged: !progress.stale
                 && !pending
                 && progress.errors.is_empty()
-                && desired.v2.is_empty()
-                && observed.is_some_and(|o| converged(&desired.v1, &o.containers)),
+                && observed.is_some_and(|o| converged(&workloads, &unexecuted, &o.pods)),
             errors: progress.errors.clone(),
-            unexecuted: desired.v2.keys().cloned().collect(),
-            workloads: workloads
+            unexecuted: unexecuted
+                .iter()
+                .map(|(deployment, reasons)| Unexecuted {
+                    deployment: deployment.clone(),
+                    reasons: reasons.clone(),
+                })
+                .collect(),
+            workloads: rows
                 .into_iter()
-                .map(|((deployment, pod), fields)| {
-                    let containers: Vec<_> = observed
-                        .map(|o| {
-                            o.containers
-                                .iter()
-                                .filter(|c| key(c) == (deployment.clone(), pod.clone()))
-                                .cloned()
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let mut configurations = containers
-                        .iter()
-                        .map(|c| c.labels[CONFIG].clone())
-                        .collect::<Vec<_>>();
-                    configurations.sort();
-                    configurations.dedup();
+                .map(|((deployment, kind, resource), (workload, pods))| {
+                    let desired_spec = |id: &str| {
+                        workload.and_then(|w| w.pods.iter().find(|p| p.id == id).map(|p| &p.spec))
+                    };
                     WorkloadStatus {
                         deployment,
-                        pod,
-                        desired_configuration: fields.as_ref().map(configuration),
-                        desired_replicas: fields.as_ref().map(|f| f.replicas).unwrap_or(0),
-                        desired: fields,
-                        current_configurations: configurations,
+                        kind: kind.as_str().into(),
+                        resource,
+                        desired_replicas: workload.map(|w| w.pods.len()),
                         running_replicas: observed
-                            .map(|_| containers.iter().filter(|c| c.state == "running").count()),
-                        containers,
+                            .map(|_| pods.iter().filter(|p| p.running()).count()),
+                        pods: pods
+                            .into_iter()
+                            .map(|p| PodView {
+                                id: p.status.id.clone(),
+                                ordinal: p.ordinal,
+                                hostname: p.status.spec.hostname.clone(),
+                                state: p.status.state.clone(),
+                                current: desired_spec(&p.status.id) == Some(&p.status.spec),
+                                containers: p.status.containers.clone(),
+                                error: p.status.error.clone(),
+                            })
+                            .collect(),
                     }
                 })
                 .collect(),
@@ -271,115 +401,62 @@ impl Controller {
         result
     }
 
-    async fn observe(
-        &self,
-        state: &StoredState,
-        orqos: &OrqosClient,
-    ) -> Result<Vec<ContainerSummary>> {
-        let containers = owned(
-            state,
+    async fn observe(&self, state: &StoredState, orqos: &OrqosClient) -> Result<Vec<Owned>> {
+        let pods = owned(
+            &state.owner,
             orqos
-                .list_owned_containers(&state.owner)
+                .list_pods()
                 .await
-                .context("required Docker observation failed")?,
+                .context("required workload observation failed")?,
         )?;
         let mut progress = self.progress.write().await;
         progress.observation = Some(Observation {
             revision: state.revision,
             at: Utc::now().to_rfc3339(),
-            containers: containers.clone(),
+            pods: pods.clone(),
         });
         progress.stale = false;
-        Ok(containers)
+        Ok(pods)
     }
 
     async fn pass(&self, db: &sled::Db, orqos: &OrqosClient) -> Result<()> {
         // Validate the complete persisted snapshot before observation or mutation.
         let state = store::load(db)?;
-        // Only IR v1 is executed here; IR v2 deployments are reported as unexecuted by status.
-        let desired = state.desired()?.v1;
-        let workloads = desired_workloads(&desired);
-        let containers = self.observe(&state, orqos).await?;
+        let (workloads, unexecuted) = desired(&state)?;
+        let pods = self.observe(&state, orqos).await?;
         // If apply won the race during observation, start again with its snapshot.
         ensure!(
             store::load(db)?.revision == state.revision,
             "intent changed during observation; retry pending revision"
         );
-        let mut keep: BTreeMap<(String, String), usize> = BTreeMap::new();
-        let mut remove = vec![];
-        for c in &containers {
-            let k = key(c);
-            let count = keep.entry(k.clone()).or_default();
-            if workloads
-                .get(&k)
-                .is_some_and(|f| matching(c, f) && *count < f.replicas)
-            {
-                *count += 1;
-            } else {
-                remove.push(c);
+        let actions = plan(&workloads, &unexecuted, &pods);
+        // Pods are independent: one failing pod must not block the others, so every action is attempted.
+        let mut failures = Vec::new();
+        for action in &actions {
+            let result = match action {
+                Action::Remove(id) => orqos.delete_pod(id).await,
+                Action::Apply(id, spec) => orqos.put_pod(id, spec).await,
+            };
+            if let Err(error) = result {
+                failures.push(format!("{error:#}"));
             }
         }
-        let mutated = !remove.is_empty()
-            || workloads
-                .iter()
-                .any(|(k, f)| keep.get(k).copied().unwrap_or(0) < f.replicas);
-        let mutations: Result<()> = async {
-            for c in remove {
-                // Force removal handles running, stopped and failed-start debris alike.
-                orqos
-                    .remove_container(&c.id)
-                    .await
-                    .with_context(|| format!("removing owned container {}", c.id))?;
-            }
-            for ((deployment, pod), fields) in &workloads {
-                for _ in keep
-                    .get(&(deployment.clone(), pod.clone()))
-                    .copied()
-                    .unwrap_or(0)..fields.replicas
-                {
-                    let labels = HashMap::from([
-                        (OWNER.into(), state.owner.clone()),
-                        (MANAGED.into(), "v1".into()),
-                        (DEPLOYMENT.into(), deployment.clone()),
-                        (POD.into(), pod.clone()),
-                        (CONFIG.into(), configuration(fields)),
-                    ]);
-                    orqos
-                        .start_container(CreateReq {
-                            name: format!("rezn-{}", store::random_id()?),
-                            image: fields.image.clone(),
-                            cpu: None,
-                            ports: fields
-                                .ports
-                                .iter()
-                                .map(|p| PortMap {
-                                    container: *p,
-                                    host: 0,
-                                })
-                                .collect(),
-                            labels,
-                        })
-                        .await
-                        .with_context(|| format!("creating {deployment}/{pod}"))?;
-                }
-            }
-            Ok(())
-        }
-        .await;
-        let after = if mutated {
-            self.observe(&state, orqos).await
+        let after = if actions.is_empty() {
+            Ok(pods)
         } else {
-            Ok(containers)
+            self.observe(&state, orqos).await
         };
-        // Preserve both a mutation failure and a failed follow-up observation.
-        match (mutations, after) {
-            (Err(mutation), Err(observation)) => {
-                anyhow::bail!("{mutation:#}; follow-up observation: {observation:#}")
+        // Preserve both mutation failures and a failed follow-up observation.
+        match after {
+            Err(observation) => {
+                failures.push(format!("follow-up observation: {observation:#}"));
+                bail!("{}", failures.join("; "))
             }
-            (Err(error), _) | (_, Err(error)) => return Err(error),
-            (Ok(()), Ok(containers)) => ensure!(
-                converged(&desired, &containers),
-                "observed containers have not converged; retrying on next pass"
+            Ok(_) if !failures.is_empty() => bail!("{}", failures.join("; ")),
+            // Unexecuted deployments are not errors (status lists them); the executed ones must converge.
+            Ok(pods) => ensure!(
+                executed_converged(&workloads, &unexecuted, &pods),
+                "observed pods have not converged; retrying on next pass"
             ),
         }
         self.progress.write().await.errors.clear();

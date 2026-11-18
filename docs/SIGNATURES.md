@@ -2,7 +2,7 @@
 
 Rezn verifies Ed25519 over JCS-canonicalized submitted `program` values, preserving all program keys through verification and rejecting unsupported fields afterward. Accepted state retains the complete signed program envelope; validation never removes fields to rescue a signature or make an unsupported example executable.
 
-The public key comes from the caller. Any caller who can reach the local API can submit their own signed program. The deployment name is outside the signature, and there is no signed revision or replay protection. The controller's stored revision is a local observation fence, not an authenticated revision contract. Ownership labels isolate cooperative local controllers, but labels can be forged by anyone with Docker access. These mechanisms do not provide an authorization boundary.
+The public key comes from the caller. Any caller who can reach the local API can submit their own signed program. An IR v2 program signs its deployment and namespace, but there is no signed revision or replay protection. The controller's stored revision is a local observation fence, not an authenticated revision contract. Ownership labels isolate cooperative local controllers, but anyone holding the Orqos workload token (or root) can forge them. These mechanisms do not provide an authorization boundary.
 
 Before expanding beyond local development, define trusted signer configuration and a signature contract binding deployment identity and monotonic revisions (including deletion/empty intent). Then enforce authorization and replay checks atomically with stored intent. These changes are deliberately deferred in this MVP.
 

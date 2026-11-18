@@ -1,123 +1,136 @@
-use anyhow::{bail, Context, Result};
+//! Client for Orqos's workload API (`ORQOS_BACKENDS=workload`): pods of containers run as owned systemd/Podman
+//! units. See Orqos `docs/WORKLOAD_API.md`.
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use anyhow::{bail, ensure, Context, Result};
 use reqwest::{Client, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use utoipa::ToSchema;
+
+/// Orqos's pod spec. Rezn always sends every field explicitly, so an observed spec compares equal to the desired
+/// one exactly when Orqos runs what Rezn asked for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PodSpec {
+    pub hostname: String,
+    pub containers: Vec<ContainerSpec>,
+    pub restart: Restart,
+    pub grace_seconds: u32,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Restart {
+    Always,
+    OnFailure,
+    Never,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ContainerSpec {
+    pub name: String,
+    pub image: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+/// One pod as Orqos reports it.
+#[derive(Clone, Debug, Deserialize)]
+pub struct PodStatus {
+    pub id: String,
+    /// `running`, `starting`, `restarting`, `degraded`, `failed` or `stopped`.
+    pub state: String,
+    pub containers: Vec<ContainerStatus>,
+    pub spec: PodSpec,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+pub struct ContainerStatus {
+    pub name: String,
+    pub active_state: String,
+    pub sub_state: String,
+    pub result: String,
+    /// Automatic restarts by systemd since the container was last started explicitly.
+    pub restarts: u32,
+}
 
 #[derive(Clone)]
 pub struct OrqosClient {
     base_url: String,
+    token: String,
     client: Client,
-}
-
-#[derive(Serialize, Debug)]
-pub struct CreateReq {
-    pub name: String,
-    pub image: String,
-    pub cpu: Option<String>,
-    pub ports: Vec<PortMap>,
-    pub labels: HashMap<String, String>,
-}
-
-#[derive(Serialize, Debug)]
-pub struct PortMap {
-    pub container: u16,
-    pub host: u16,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
-pub struct ContainerSummary {
-    #[serde(rename = "Id")]
-    pub id: String,
-    pub labels: HashMap<String, String>,
-    pub image: String,
-    pub state: String,
-    pub ports: Vec<ObservedPort>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
-pub struct ObservedPort {
-    #[serde(rename = "IP")]
-    pub ip: Option<String>,
-    pub private_port: u16,
-    pub public_port: Option<u16>,
-    #[serde(rename = "Type")]
-    pub protocol: String,
+    /// Applying a pod can pull images and waits for its units to start; removing waits for the grace period.
+    slow: Client,
 }
 
 impl OrqosClient {
-    pub fn new(base_url: impl Into<String>) -> Self {
-        Self {
-            base_url: base_url.into(),
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(20))
-                .build()
-                .expect("Failed to build HTTP client"),
-        }
-    }
-
-    pub async fn list_owned_containers(&self, owner: &str) -> Result<Vec<ContainerSummary>> {
-        let res = self
-            .send_request(
-                "list containers",
-                self.client
-                    .get(format!("{}/docker/containers", self.base_url))
-                    .query(&[
-                        ("label", format!("dev.rezn.owner={owner}")),
-                        ("all", "true".into()),
-                    ]),
-            )
-            .await?
-            .json::<Vec<ContainerSummary>>()
-            .await
-            .context("Failed to parse list response")?;
-
-        Ok(res)
-    }
-
-    pub async fn start_container(&self, req: CreateReq) -> Result<()> {
-        tracing::debug!(
-            "Creating container request:\n{}",
-            serde_json::to_string_pretty(&req).unwrap()
+    pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Result<Self> {
+        let base_url = base_url.into();
+        ensure!(
+            base_url.starts_with("http://") || base_url.starts_with("https://"),
+            "ORQOS_API_URL must start with http:// or https://"
         );
+        let token = token.into();
+        ensure!(
+            token.len() >= 32 && !token.chars().any(char::is_control),
+            "the Orqos workload token must be at least 32 bytes without control characters"
+        );
+        let build = |seconds| {
+            Client::builder()
+                .timeout(Duration::from_secs(seconds))
+                .build()
+                .context("building the HTTP client")
+        };
+        Ok(Self {
+            base_url: base_url.trim_end_matches('/').into(),
+            token,
+            client: build(20)?,
+            slow: build(15 * 60)?,
+        })
+    }
 
-        self.send_request(
-            "create container",
-            self.client
-                .post(format!("{}/docker/containers", self.base_url))
-                .json(&req),
+    pub async fn list_pods(&self) -> Result<Vec<PodStatus>> {
+        self.send(
+            "list workload pods",
+            self.client.get(format!("{}/workload/pods", self.base_url)),
+        )
+        .await?
+        .json()
+        .await
+        .context("Failed to parse the workload pod list")
+    }
+
+    pub async fn put_pod(&self, id: &str, spec: &PodSpec) -> Result<()> {
+        self.send(
+            &format!("apply workload pod {id}"),
+            self.slow
+                .put(format!("{}/workload/pods/{id}", self.base_url))
+                .json(spec),
         )
         .await?;
-
         Ok(())
     }
 
-    #[cfg(test)]
-    pub async fn stop_container(&self, id: &str) -> Result<()> {
-        self.send_request(
-            "stop container",
-            self.client
-                .post(format!("{}/docker/containers/{}/stop", self.base_url, id)),
+    pub async fn delete_pod(&self, id: &str) -> Result<()> {
+        self.send(
+            &format!("remove workload pod {id}"),
+            self.slow
+                .delete(format!("{}/workload/pods/{id}", self.base_url)),
         )
         .await?;
         Ok(())
     }
 
-    pub async fn remove_container(&self, id: &str) -> Result<()> {
-        self.send_request(
-            "remove container",
-            self.client
-                .post(format!("{}/docker/containers/{}/remove", self.base_url, id))
-                .json(&serde_json::json!({ "force": true })),
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn send_request(&self, operation: &str, request: RequestBuilder) -> Result<Response> {
+    async fn send(&self, operation: &str, request: RequestBuilder) -> Result<Response> {
         let response = request
+            .bearer_auth(&self.token)
             .send()
             .await
             .with_context(|| format!("Failed to {operation}"))?;
@@ -139,138 +152,107 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::test_support::MockOrqos;
+    use crate::test_support::{MockOrqos, TOKEN};
 
-    fn create_request() -> CreateReq {
-        CreateReq {
-            name: "prod-web-1".into(),
-            image: "nginx:alpine".into(),
-            cpu: None,
-            ports: vec![PortMap {
-                container: 80,
-                host: 0,
+    fn spec() -> PodSpec {
+        PodSpec {
+            hostname: "web-0".into(),
+            containers: vec![ContainerSpec {
+                name: "web".into(),
+                image: "docker.io/library/nginx:1.27-alpine".into(),
+                command: None,
+                args: Some(vec!["-g".into(), "daemon off;".into()]),
+                env: BTreeMap::from([("LEVEL".into(), "info".into())]),
             }],
-            labels: HashMap::from([("pod".into(), "prod:web".into())]),
+            restart: Restart::Always,
+            grace_seconds: 30,
+            labels: BTreeMap::from([("dev.rezn.owner".into(), "ab".into())]),
         }
     }
 
     #[tokio::test]
-    async fn lifecycle_requests_follow_current_docker_contract() {
-        let server =
-            MockOrqos::start(
-                |request| match (request.method.as_str(), request.uri.path()) {
-                    ("GET", "/docker/containers") => (
-                        StatusCode::OK,
-                        json!([{"Id": "container-1", "Labels": {}, "Image": "nginx:alpine", "State": "running", "Ports": [{"IP":"0.0.0.0", "PrivatePort":80, "PublicPort":32768, "Type":"tcp"}]}]).to_string(),
-                    ),
-                    ("POST", "/docker/containers") => (
-                        StatusCode::OK,
-                        json!({"id": "container-1", "name": "prod-web-1", "ports": {}}).to_string(),
-                    ),
-                    ("POST", "/docker/containers/container-1/stop")
-                    | ("POST", "/docker/containers/container-1/remove") => {
-                        (StatusCode::NO_CONTENT, String::new())
-                    }
-                    _ => (StatusCode::NOT_FOUND, "Unknown route".into()),
-                },
-            )
-            .await;
-
-        let containers = server
-            .client
-            .list_owned_containers("runtime-1")
-            .await
-            .unwrap();
-        assert_eq!(containers.len(), 1);
-        assert_eq!(containers[0].id, "container-1");
-        assert_eq!(containers[0].ports[0].public_port, Some(32768));
-        server
-            .client
-            .start_container(create_request())
-            .await
-            .unwrap();
-        server.client.stop_container("container-1").await.unwrap();
-        server.client.remove_container("container-1").await.unwrap();
+    async fn requests_follow_the_workload_contract_with_bearer_auth() {
+        let observed = json!([{
+            "id": "rz-1", "desired": "running", "state": "running",
+            "pod": {"unit": "orqos-rz-1-pod.service", "active_state": "active", "sub_state": "running", "result": "success", "restarts": 0},
+            "containers": [{"name": "web", "unit": "orqos-rz-1-c-web.service", "active_state": "active", "sub_state": "running", "result": "success", "restarts": 2}],
+            "spec": {"hostname": "web-0", "restart": "always", "grace_seconds": 30, "labels": {"dev.rezn.owner": "ab"},
+                     "containers": [{"name": "web", "image": "docker.io/library/nginx:1.27-alpine", "args": ["-g", "daemon off;"], "env": {"LEVEL": "info"}}]},
+            "error": null, "updated_at": "2026-11-18T00:00:00Z"
+        }]);
+        let server = MockOrqos::start(move |request| match request.method.as_str() {
+            "GET" => (StatusCode::OK, observed.to_string()),
+            "PUT" | "DELETE" => (StatusCode::OK, "{}".into()),
+            _ => (StatusCode::NOT_FOUND, "unknown".into()),
+        })
+        .await;
+        let pods = server.client.list_pods().await.unwrap();
+        assert_eq!(
+            pods[0].spec,
+            spec(),
+            "an observed spec equals the one Rezn sends"
+        );
+        assert_eq!(pods[0].containers[0].restarts, 2);
+        server.client.put_pod("rz-1", &spec()).await.unwrap();
+        server.client.delete_pod("rz-1").await.unwrap();
 
         let requests = server.requests();
-        assert_eq!(requests.len(), 4);
-        assert_eq!(requests[0].method, Method::GET);
+        let routes: Vec<_> = requests
+            .iter()
+            .map(|r| (r.method.clone(), r.uri.path().to_string()))
+            .collect();
         assert_eq!(
-            requests[0].query(),
-            HashMap::from([
-                ("label".into(), "dev.rezn.owner=runtime-1".into()),
-                ("all".into(), "true".into())
-            ])
+            routes,
+            vec![
+                (Method::GET, "/workload/pods".into()),
+                (Method::PUT, "/workload/pods/rz-1".into()),
+                (Method::DELETE, "/workload/pods/rz-1".into()),
+            ]
         );
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&requests[1].body).unwrap(),
-            json!({
-                "name": "prod-web-1", "image": "nginx:alpine", "cpu": null,
-                "ports": [{"container": 80, "host": 0}], "labels": {"pod": "prod:web"}
-            })
-        );
-        assert!(requests[2].body.is_empty());
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&requests[3].body).unwrap(),
-            json!({"force": true})
-        );
+        assert!(requests
+            .iter()
+            .all(|r| r.authorization.as_deref() == Some(&format!("Bearer {TOKEN}")[..])));
+        let sent: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(sent["restart"], "always");
+        assert_eq!(sent["grace_seconds"], 30);
+        assert!(sent["containers"][0].get("command").is_none());
     }
 
     #[tokio::test]
-    async fn lifecycle_errors_preserve_operation_status_and_response_body() {
-        for (status, body) in [
+    async fn errors_keep_operation_status_url_and_body() {
+        let server =
+            MockOrqos::start(|_| (StatusCode::CONFLICT, r#"{"error":"not owned"}"#.into())).await;
+        for (operation, result) in [
             (
-                StatusCode::NOT_FOUND,
-                "Image missing; pull into the selected Docker engine.",
+                "list workload pods",
+                server.client.list_pods().await.map(|_| ()),
             ),
-            (StatusCode::CONFLICT, "Container name already exists."),
             (
-                StatusCode::SERVICE_UNAVAILABLE,
-                r#"{"enabled":true,"available":false,"error":"Docker socket unavailable"}"#,
+                "apply workload pod rz-1",
+                server.client.put_pod("rz-1", &spec()).await,
+            ),
+            (
+                "remove workload pod rz-1",
+                server.client.delete_pod("rz-1").await,
             ),
         ] {
-            let server = MockOrqos::start(move |_| (status, body.into())).await;
-            let results = [
-                (
-                    "list containers",
-                    server
-                        .client
-                        .list_owned_containers("runtime-1")
-                        .await
-                        .map(|_| ()),
-                ),
-                (
-                    "create container",
-                    server.client.start_container(create_request()).await,
-                ),
-                (
-                    "stop container",
-                    server.client.stop_container("container-1").await,
-                ),
-                (
-                    "remove container",
-                    server.client.remove_container("container-1").await,
-                ),
-            ];
-            for (operation, result) in results {
-                let error = format!("{:#}", result.unwrap_err());
-                assert!(error.contains(operation), "{error}");
-                assert!(error.contains(&format!("HTTP {status}")), "{error}");
-                assert!(error.contains("/docker/containers"), "{error}");
-                assert!(error.contains(body), "{error}");
-                assert!(!error.contains("Failed to parse list response"), "{error}");
-            }
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains(operation), "{error}");
+            assert!(error.contains("HTTP 409"), "{error}");
+            assert!(error.contains("/workload/pods"), "{error}");
+            assert!(error.contains("not owned"), "{error}");
         }
+        let server = MockOrqos::start(|_| (StatusCode::OK, "not JSON".into())).await;
+        assert!(
+            format!("{:#}", server.client.list_pods().await.unwrap_err())
+                .contains("Failed to parse")
+        );
     }
 
-    #[tokio::test]
-    async fn malformed_successful_list_is_an_error() {
-        let server = MockOrqos::start(|_| (StatusCode::OK, "not JSON".into())).await;
-        let result = server.client.list_owned_containers("runtime-1").await;
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("Failed to parse list response"));
+    #[test]
+    fn configuration_is_checked() {
+        assert!(OrqosClient::new("localhost:9090", TOKEN).is_err());
+        assert!(OrqosClient::new("http://127.0.0.1:9090", "short").is_err());
+        assert!(OrqosClient::new("http://127.0.0.1:9090/", TOKEN).is_ok());
     }
 }
