@@ -11,7 +11,7 @@ env:
   CARGO_TERM_COLOR: always
   RUSTUP_TOOLCHAIN: "1.99.0"
   # The Orqos commit whose workload API this Rezn targets.
-  ORQOS_REF: a982130fd83dea7a212384f5836afd65750c9bb2
+  ORQOS_REF: eca440e4599200b4e0ce39c52f927cc28a8b7560
 
 jobs:
   build:
