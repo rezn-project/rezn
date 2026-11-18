@@ -171,6 +171,38 @@ pub struct ContainerSpec {
     pub drop_all_capabilities: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<MountSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<Probe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<Probe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness: Option<Probe>,
+}
+
+/// A probe Orqos runs: `exec` in the container, or HTTP(S) from inside the pod's network namespace.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Probe {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<HttpProbe>,
+    pub period_seconds: u32,
+    pub timeout_seconds: u32,
+    pub failure_threshold: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct HttpProbe {
+    pub path: String,
+    pub port: u16,
+    pub scheme: Scheme,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Scheme {
+    Http,
+    Https,
 }
 
 /// One pod as Orqos reports it.
@@ -179,6 +211,8 @@ pub struct PodStatus {
     pub id: String,
     /// `running`, `starting`, `restarting`, `degraded`, `failed` or `stopped`.
     pub state: String,
+    /// It runs and every container is ready (a container without probes is ready once it runs).
+    pub ready: bool,
     pub containers: Vec<ContainerStatus>,
     pub spec: PodSpec,
     pub error: Option<String>,
@@ -192,6 +226,13 @@ pub struct ContainerStatus {
     pub result: String,
     /// Automatic restarts by systemd since the container was last started explicitly.
     pub restarts: u32,
+    /// The startup probe has passed (or there is none and it runs).
+    pub started: bool,
+    /// The readiness probe passes (or there is none and it has started).
+    pub ready: bool,
+    /// Restarts caused by failing startup or liveness probes.
+    pub probe_restarts: u32,
+    pub last_probe_failure: Option<String>,
 }
 
 #[derive(Clone)]
@@ -380,6 +421,19 @@ mod tests {
                     read_only: false,
                     sub_path: Some("v1".into()),
                 }],
+                startup: None,
+                readiness: Some(Probe {
+                    exec: None,
+                    http: Some(HttpProbe {
+                        path: "/ready".into(),
+                        port: 80,
+                        scheme: Scheme::Https,
+                    }),
+                    period_seconds: 10,
+                    timeout_seconds: 1,
+                    failure_threshold: 3,
+                }),
+                liveness: None,
             }],
             restart: Restart::Always,
             grace_seconds: 30,
@@ -417,9 +471,10 @@ mod tests {
     #[tokio::test]
     async fn requests_follow_the_workload_contract_with_bearer_auth() {
         let observed = json!([{
-            "id": "rz-1", "desired": "running", "state": "running",
+            "id": "rz-1", "desired": "running", "state": "running", "ready": true,
             "pod": {"unit": "orqos-rz-1-pod.service", "active_state": "active", "sub_state": "running", "result": "success", "restarts": 0},
-            "containers": [{"name": "web", "unit": "orqos-rz-1-c-web.service", "active_state": "active", "sub_state": "running", "result": "success", "restarts": 2}],
+            "containers": [{"name": "web", "unit": "orqos-rz-1-c-web.service", "active_state": "active", "sub_state": "running", "result": "success", "restarts": 2,
+                            "started": true, "ready": true, "probe_restarts": 1, "last_probe_failure": "liveness: HTTP 500"}],
             "spec": {"hostname": "web-0", "restart": "always", "grace_seconds": 30, "labels": {"dev.rezn.owner": "ab"},
                      "network": {"name": "rz-net", "aliases": ["web", "web.store.svc"]},
                      "supplementary_groups": [2000], "volumes": [{"name": "data", "volume": "rz-vol"},
@@ -427,7 +482,9 @@ mod tests {
                      "containers": [{"name": "web", "image": "docker.io/library/nginx:1.27-alpine", "args": ["-g", "daemon off;"], "env": {"LEVEL": "info"},
                                      "secret_env": {"DB_PASSWORD": {"secret": "rz-db", "key": "password"}},
                                      "user": 1000, "read_only_root": true, "drop_all_capabilities": true,
-                                     "mounts": [{"volume": "data", "path": "/data", "sub_path": "v1"}]}]},
+                                     "mounts": [{"volume": "data", "path": "/data", "sub_path": "v1"}],
+                                     "readiness": {"http": {"path": "/ready", "port": 80, "scheme": "https"},
+                                                   "period_seconds": 10, "timeout_seconds": 1, "failure_threshold": 3}}]},
             "error": null, "updated_at": "2026-11-18T00:00:00Z"
         }]);
         let server = MockOrqos::start(move |request| match request.method.as_str() {

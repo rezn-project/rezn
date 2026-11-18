@@ -17,8 +17,8 @@ use common::ir_v2::{self, Kind, PodManagement, PortRef, Program, Pull, Spec};
 use sha2::{Digest, Sha256};
 
 use crate::orqos_client::{
-    ContainerSpec, Medium, MountSpec, Network, PodSpec, PodVolume, Restart, Scratch, SecretFiles,
-    SecretItem, SecretKeyRef, VolumeSpec,
+    ContainerSpec, HttpProbe, Medium, MountSpec, Network, PodSpec, PodVolume, Probe, Restart,
+    Scheme, Scratch, SecretFiles, SecretItem, SecretKeyRef, VolumeSpec,
 };
 use crate::secret::Versions;
 
@@ -525,6 +525,9 @@ pub fn translate(
                             sub_path: m.sub_path.clone(),
                         })
                         .collect(),
+                    startup: c.startup.as_ref().map(|p| probe(p, c)),
+                    readiness: c.readiness.as_ref().map(|p| probe(p, c)),
+                    liveness: c.liveness.as_ref().map(|p| probe(p, c)),
                 }
             })
             .collect();
@@ -583,6 +586,51 @@ pub fn translate(
         });
     }
     Ok(translation)
+}
+
+/// Whether Orqos accepts the probe (IR v2 only requires positive values and an absolute path).
+fn probe_in_range(p: &ir_v2::Probe) -> bool {
+    let exec_ok = p.exec.as_ref().is_none_or(|argv| {
+        argv.len() <= 64 && !argv.iter().any(|a| a.chars().any(char::is_control))
+    });
+    let path_ok = p.http.as_ref().is_none_or(|h| {
+        h.path.len() <= 1024
+            && h.path
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/?%".contains(&b))
+    });
+    exec_ok
+        && path_ok
+        && p.period_seconds.unwrap_or(10) <= 3600
+        && p.timeout_seconds.unwrap_or(1) <= 300
+        && p.failure_threshold.unwrap_or(3) <= 1000
+}
+
+/// An IR v2 probe as Orqos runs it, with IR v2's defaults filled in and a named HTTP port resolved to the
+/// container's port number.
+fn probe(probe: &ir_v2::Probe, container: &ir_v2::Container) -> Probe {
+    Probe {
+        exec: probe.exec.clone(),
+        http: probe.http.as_ref().map(|h| HttpProbe {
+            path: h.path.clone(),
+            port: match &h.port {
+                PortRef::Number(n) => *n,
+                PortRef::Name(name) => container
+                    .ports
+                    .iter()
+                    .find(|p| &p.name == name)
+                    .map(|p| p.port)
+                    .expect("validated: probe ports name a port of the same container"),
+            },
+            scheme: match h.scheme {
+                ir_v2::Scheme::Http => Scheme::Http,
+                ir_v2::Scheme::Https => Scheme::Https,
+            },
+        }),
+        period_seconds: probe.period_seconds.unwrap_or(10),
+        timeout_seconds: probe.timeout_seconds.unwrap_or(1),
+        failure_threshold: probe.failure_threshold.unwrap_or(3),
+    }
 }
 
 /// For each `volume_claim`, the `fs_group`s of the pods that mount it (`None` for a pod without one).
@@ -750,13 +798,17 @@ pub fn unsupported(program: &Program) -> Vec<String> {
                     );
                 }
             }
-            for (probe, set) in [
-                ("startup", c.startup.is_some()),
-                ("readiness", c.readiness.is_some()),
-                ("liveness", c.liveness.is_some()),
+            for (kind, p) in [
+                ("startup", &c.startup),
+                ("readiness", &c.readiness),
+                ("liveness", &c.liveness),
             ] {
-                if set {
-                    add(format!("{at}/{probe}"), "probes are", "rezn#71, orqos#26");
+                if p.as_ref().is_some_and(|p| !probe_in_range(p)) {
+                    add(
+                        format!("{at}/{kind}"),
+                        "probes beyond the backend's limits (period up to 3600 s, timeout up to 300 s, threshold up to 1000, up to 64 exec arguments without control characters, a URI path up to 1024 characters) are",
+                        "orqos#26",
+                    );
                 }
             }
             if c.resources.is_some() {
@@ -1200,7 +1252,6 @@ mod tests {
         for name in [
             "edge.json",
             "jobs.json",
-            "minimal.json",
             "reference.json",
             "secrets.json",
             "stateful.json",
@@ -1376,12 +1427,42 @@ mod tests {
 
     #[test]
     fn unsupported_features_are_all_reported() {
-        let reasons = translate(OWNER_ID, &example("minimal.json")).unwrap_err();
+        // Probes run since rezn#71: the minimal example (a readiness probe on a named port) translates, with IR
+        // v2's defaults filled in and the port resolved.
+        let minimal = translate(OWNER_ID, &example("minimal.json")).unwrap();
+        let c = &minimal.workloads[0].pods[0].spec.containers[0];
         assert_eq!(
-            reasons,
-            vec![
-                "/resources/0/fields/pod/containers/0/readiness: probes are not executed yet (rezn#71, orqos#26)",
-            ]
+            c.readiness,
+            Some(Probe {
+                exec: None,
+                http: Some(HttpProbe {
+                    path: "/".into(),
+                    port: 80,
+                    scheme: Scheme::Http
+                }),
+                period_seconds: 10,
+                timeout_seconds: 1,
+                failure_threshold: 3,
+            })
+        );
+        let mut slow = program(web(1));
+        let Spec::ReplicaSet(set) = &mut slow.resources[1].spec else {
+            panic!()
+        };
+        set.pod.containers[0].liveness = Some(ir_v2::Probe {
+            exec: Some(vec!["true".into()]),
+            http: None,
+            period_seconds: Some(7200),
+            timeout_seconds: None,
+            failure_threshold: None,
+        });
+        let reasons = unsupported(&slow);
+        assert_eq!(reasons.len(), 1);
+        assert!(
+            reasons[0].starts_with(
+                "/resources/1/fields/pod/containers/0/liveness: probes beyond the backend's limits"
+            ),
+            "{reasons:?}"
         );
         let reasons = unsupported(&example("reference.json")).join("\n");
         for expected in [
@@ -1394,8 +1475,9 @@ mod tests {
         ] {
             assert!(reasons.contains(expected), "{expected}:\n{reasons}");
         }
-        // Storage, identity, configs, secrets and certificates run now.
+        // Storage, identity, configs, secrets, certificates and probes run now.
         for gone in [
+            "probes",
             "certificate",
             "mounts are",
             "volume claims are",

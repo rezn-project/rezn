@@ -281,7 +281,10 @@ volumes are files Orqos writes per pod and bind-mounts read-only and idmapped; e
 immutable Orqos object whose ID covers its content (the config's data or the stored key versions), which is how a
 changed input replaces exactly the workloads that use it ([configs and
 secrets](DEVELOPMENT.md#configs-and-secrets)). `ca` and `certificate` secrets are ECDSA P-256; certificates are
-renewed once two thirds of their lifetime have passed, and a CA is not rotated in v2.0.
+renewed once two thirds of their lifetime have passed, and a CA is not rotated in v2.0. Probes are run by Orqos itself rather than as
+Podman healthchecks, which allow one check per container and run inside it; HTTP probes connect from a thread that
+enters the pod's network namespace. Until readiness-aware membership
+([#59](https://github.com/rezn-project/rezn/issues/59)), services resolve to running replicas.
 
 ## Out of scope for v2.0
 

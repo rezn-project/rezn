@@ -103,12 +103,12 @@ scratch and secret-file volumes. A deployment runs only when **every** resource 
   resolves to), as DNS names (below);
 - `config` and `secret` resources (every source: `store`, `seed_once`, `random`, `ca` and `certificate`), as
   `config` and `secret` pod volumes and `secret` environment references (below);
-- containers with `pull` absent or `if_not_present`, environment `value`s, and declared `ports` (informational, as in
-  Kubernetes: nothing is published on the host).
+- containers with `pull` absent or `if_not_present`, environment `value`s, declared `ports` (informational, as in
+  Kubernetes: nothing is published on the host), and `startup`, `readiness` and `liveness` probes (below).
 
 Anything else leaves the whole deployment **unexecuted**: services that remap ports
-([#123](https://github.com/rezn-project/rezn/issues/123)), ingress, network policies, jobs, phases, init containers and sidecars, probes,
-resource requests and limits, other pull policies, registry credentials, pod-IP environment references, a group
+([#123](https://github.com/rezn-project/rezn/issues/123)), ingress, network policies, jobs, phases, init containers and sidecars,
+probes beyond the backend's limits, resource requests and limits, other pull policies, registry credentials, pod-IP environment references, a group
 without a user or `run_as_non_root` without an explicit user (both need the image's user), IDs above 65535, a claim
 mounted by pods with different `fs_group`s, and referenced secret keys missing from the secret store.
 `/status` lists every blocking field as `JSON-pointer: reason (issue)`, citing the issue that adds it. An
@@ -132,11 +132,27 @@ A service becomes DNS aliases on every pod of its target:
 
 Clients connect to the container's own port, so a service whose `port` differs from its target port is not
 executed yet. A non-headless service resolves to every replica's address (DNS round-robin) rather than one virtual
-address ([#123](https://github.com/rezn-project/rezn/issues/123)). Names resolve only while a replica runs; without
-probes (not executed yet) a running replica is a ready one, which is IR v2's membership rule. Aliases are part of
-the pod spec: adding, removing or changing a service replaces its target's pods through the rolling replacement
-below. Changing membership without a restart arrives with readiness
-([#59](https://github.com/rezn-project/rezn/issues/59)).
+address ([#123](https://github.com/rezn-project/rezn/issues/123)). Names resolve while a replica **runs**, ready or
+not: IR v2 says ready replicas only, which needs membership to change without a restart
+([#59](https://github.com/rezn-project/rezn/issues/59)). Aliases are part of the pod spec: adding, removing or
+changing a service replaces its target's pods through the rolling replacement below.
+
+### Probes and readiness
+
+Orqos runs each container's probes ([orqos#26](https://github.com/orqos-project/orqos/issues/26)): `exec` with
+`podman exec` as the container's user, HTTP(S) as a `GET` to `127.0.0.1:<port>` from inside the pod's network
+namespace (so images need no HTTP client; `https` is not verified). Rezn passes IR v2's defaults explicitly (period
+10 s, timeout 1 s, threshold 3) and resolves a named port to the container's port. Until a startup probe passes no
+other probe runs; readiness turns false after `failure_threshold` consecutive failures and true after one success;
+startup and liveness reaching their threshold stop the container, and the pod's `restart` policy restarts it (the
+pod and its other containers stay). A replica is **ready** when it runs and every container is ready (a container
+without probes is ready once it runs).
+
+Readiness gates everything that takes capacity away: a running replica is replaced only while every other replica
+is ready, an ordered set creates its next replica (and removes its highest) only once the others are ready, and
+`converged` needs every replica ready. A replica that never becomes ready holds its set's rollout, and `/status`
+shows `rollout.waiting_for`. A replica that is already unready serves nothing, so a changed spec replaces it at
+once: a broken revision never blocks its fix.
 
 ### Storage and identity
 
@@ -227,12 +243,12 @@ certificates (above), then:
 3. plans and applies a bounded set of changes, per replica set:
    - removes pods of removed resources or deployments, and replicas beyond the count (highest ordinals);
    - creates missing replicas;
-   - replaces pods whose spec changed: those not running at once, a running one (highest ordinal first) only
-     while every other replica of the set exists and runs, so a rolling change keeps the rest serving;
+   - replaces pods whose spec changed: those not ready at once, a ready one (highest ordinal first) only while
+     every other replica of the set exists and is ready, so a rolling change keeps the rest serving;
    - re-applies an unchanged pod Orqos reports `stopped` (for example after a host reboot), which starts it;
    - leaves `restarting`, `degraded` and `failed` pods to systemd's restart backoff, and reports them.
-   Ordered replica sets with `ordered` management create the lowest missing replica only once all lower ones run,
-   and remove the highest only once the others run.
+   Ordered replica sets with `ordered` management create the lowest missing replica only once all lower ones are
+   ready, and remove the highest only once the others are ready.
 4. creates volumes and Orqos secrets before the pods that use them, then observes again, removes volumes and
    Orqos secrets that the changes released (when their policy allows), and succeeds only when the executed
    deployments match.
@@ -252,12 +268,12 @@ invalid persisted state returns HTTP 500, never an empty map. `GET /status` repo
 | `desired_revision`, `observed_revision` | Latest stored revision and the revision of the last successful observation |
 | `last_observation`, `last_attempt` | UTC RFC3339 times; observation is null until a listing succeeds |
 | `observation` | `unknown` before any successful listing; `stale` after a failed pass; `pending` when the observation belongs to an older revision; otherwise `fresh` |
-| `converged` | True only when the observation is fresh for this revision, the last pass had no errors, no deployment is unexecuted, every desired pod runs with its exact spec and no other owned pod exists |
+| `converged` | True only when the observation is fresh for this revision, the last pass had no errors, no deployment is unexecuted, every desired pod runs with its exact spec and is ready, and no other owned pod exists |
 | `errors` | The last pass's validation, observation, mutation or convergence errors; cleared after a successful pass |
 | `unexecuted[]` | `deployment` and `reasons` (`JSON-pointer: reason (issue)`) for each program the backend cannot run yet |
-| `workloads[]` | Per replica set: `deployment`, `kind`, `resource`, `desired_replicas` (null for pods awaiting removal or of unexecuted deployments), `running_replicas` (null until observed) and `pods[]` |
+| `workloads[]` | Per replica set: `deployment`, `kind`, `resource`, `desired_replicas` (null for pods awaiting removal or of unexecuted deployments), `running_replicas` and `ready_replicas` (null until observed), `rollout` (null when settled; `waiting_for` the pods that run but are not ready while a replacement or ordered step waits) and `pods[]` |
 | `volumes[]` | Owned volumes: `id`, `deployment`, `claim`, `workload` and `ordinal` (per-replica volumes), `desired` (wanted by the accepted programs; otherwise retained or awaiting deletion), `retain`, `exists` and `mounted_by` |
-| `pods[]` | `id`, `ordinal`, `hostname`, Orqos's `state` (`running`, `starting`, `restarting`, `degraded`, `failed`, `stopped`), `current` (runs the desired spec), `changes` (why it is not current: `config "<name>"`, `secret "<name>"`, `pod template`), `aliases` (its DNS names on the namespace network), `containers[]` (`name`, `active_state`, `sub_state`, `result`, `restarts`) and Orqos's last `error` |
+| `pods[]` | `id`, `ordinal`, `hostname`, Orqos's `state` (`running`, `starting`, `restarting`, `degraded`, `failed`, `stopped`), `ready` (runs with every container ready), `current` (runs the desired spec), `changes` (why it is not current: `config "<name>"`, `secret "<name>"`, `pod template`), `aliases` (its DNS names on the namespace network), `containers[]` (`name`, `active_state`, `sub_state`, `result`, `restarts`, `started`, `ready`, `probe_restarts`, `last_probe_failure`) and Orqos's last `error` |
 
 After a failure, status keeps the last successful observation with its timestamp and marks it stale; it never
 invents zero replicas or declares success. It starts `unknown` after a restart and rebuilds from Orqos's listing.
@@ -326,7 +342,7 @@ applies signed IR v2 programs and checks with Podman itself:
 - an unchanged re-apply keeps every container;
 - scaling 2 → 3 → 1 touches only the highest ordinals;
 - a changed spec replaces replicas one at a time, highest first, never stopping both;
-- a program needing unsupported features is reported with reasons and changes nothing;
+- a program needing unsupported features (resource limits) is reported with reasons and changes nothing;
 - a restarted Rezn keeps its identity and changes nothing;
 - a killed container is restarted by systemd without Rezn replacing the pod;
 - a service's names resolve inside the namespace to every replica of its target, and connections by name arrive;
@@ -353,6 +369,11 @@ applies signed IR v2 programs and checks with Podman itself:
   server;
 - the listing shows certificate validity without values, generated certificates cannot be set, and they outlive
   their deployment until deleted;
+- replicas that run without passing their startup and readiness probes (an HTTP probe on a named port) are not
+  ready, and the deployment converges once they pass;
+- failing liveness restarts the container, not the pod, and it is unready until its probes pass again;
+- a rolling change waits for each new replica to be ready before replacing the next, and reports what it waits for;
+- an ordered set creates each replica only once the previous one is ready;
 - empty programs remove every owned pod and then the namespace networks, while a foreign Orqos pod stays.
 
 It removes everything it created, including after a failure. The *Acceptance* workflow runs it on Ubuntu 26.04
