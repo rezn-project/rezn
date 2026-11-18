@@ -9,7 +9,7 @@ use crate::{
     intent::{instructions, validate_envelope},
     routes::common::{app_error, AppError},
     store::{self, Deployment},
-    AppState,
+    workload, AppState,
 };
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -30,7 +30,7 @@ pub struct Accepted {
     request_body(content = ApplyPayload, description = "Replace one deployment with a signed program: an IR v2 program object, validated, stored and then executed through the Orqos workload backend (programs needing features it lacks are listed under /status unexecuted). IR v1 instruction arrays are refused. The signature covers the canonical submitted program, including its deployment and namespace.", content_type = "application/json"),
     responses(
         (status = 202, description = "Intent stored durably; inspect /status for convergence", body = Accepted),
-        (status = 400, description = "Invalid signature or unsupported intent", body = String),
+        (status = 400, description = "Invalid signature or program, or resource names colliding with another deployment of the same namespace", body = String),
         (status = 422, description = "Malformed request or unknown envelope fields", body = String),
         (status = 500, description = "Unreadable/corrupt persisted state or storage failure", body = String)
     ), tag = "Apply"
@@ -49,6 +49,14 @@ pub async fn apply_handler(
     };
     let _intent = app.controller.intent.lock().await;
     let mut state = store::load(&app.db).map_err(app_error)?;
+    let collisions = workload::collisions(
+        &payload.name,
+        &program,
+        &state.desired().map_err(app_error)?,
+    );
+    if !collisions.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, collisions.join("\n")));
+    }
     state.revision = state
         .revision
         .checked_add(1)
