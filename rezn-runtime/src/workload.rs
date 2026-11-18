@@ -1,15 +1,18 @@
 //! Translates IR v2 programs into Orqos workload pods.
 //!
 //! Orqos's workload backend runs pods of plain containers (image, command, args, literal environment, restart
-//! policy, grace period). A program runs only if every resource maps exactly onto that; otherwise the whole
-//! deployment is left unexecuted and every feature that blocks it is reported with the issue that adds it.
-//! Nothing is silently dropped.
-use std::collections::BTreeMap;
+//! policy, grace period) on owned networks with DNS aliases. A program runs only if every resource maps exactly
+//! onto that; otherwise the whole deployment is left unexecuted and every feature that blocks it is reported with
+//! the issue that adds it. Nothing is silently dropped.
+//!
+//! Every pod joins its namespace's network. A service becomes aliases on its target's pods: `<svc>`,
+//! `<svc>.<ns>` and `<svc>.<ns>.svc`, plus `<pod hostname>.<svc>` (and the qualified forms) when headless.
+use std::collections::{BTreeMap, BTreeSet};
 
-use common::ir_v2::{self, Kind, PodManagement, Program, Pull, Spec};
+use common::ir_v2::{self, Kind, PodManagement, PortRef, Program, Pull, Spec};
 use sha2::{Digest, Sha256};
 
-use crate::orqos_client::{ContainerSpec, PodSpec, Restart};
+use crate::orqos_client::{ContainerSpec, Network, PodSpec, Restart};
 
 pub const OWNER: &str = "dev.rezn.owner";
 pub const DEPLOYMENT: &str = "dev.rezn.deployment";
@@ -43,6 +46,32 @@ pub fn pod_id(owner: &str, deployment: &str, kind: &str, resource: &str, ordinal
     format!("rz-{}", &hex::encode(digest)[..24])
 }
 
+/// The Orqos network of one namespace: shared by every deployment of this owner in that namespace, distinct across
+/// owners, at most 27 characters.
+pub fn network_name(owner: &str, namespace: &str) -> String {
+    let identity = serde_json::json!([owner, "namespace", namespace]);
+    let digest = Sha256::digest(identity.to_string().as_bytes());
+    format!("rz-{}", &hex::encode(digest)[..24])
+}
+
+/// The DNS names of one pod: those of every service targeting its resource, sorted.
+fn aliases(services: &[(&str, bool)], namespace: &str, hostname: &str) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    for (service, headless) in services {
+        for name in [
+            service.to_string(),
+            format!("{service}.{namespace}"),
+            format!("{service}.{namespace}.svc"),
+        ] {
+            if *headless {
+                names.insert(format!("{hostname}.{name}"));
+            }
+            names.insert(name);
+        }
+    }
+    names.into_iter().collect()
+}
+
 /// `<resource>-<ordinal>`, with the resource name shortened when the result would exceed a DNS label.
 pub fn hostname(resource: &str, ordinal: u32) -> String {
     let suffix = format!("-{ordinal}");
@@ -56,6 +85,17 @@ pub fn translate(owner: &str, program: &Program) -> Result<Vec<Workload>, Vec<St
     if !reasons.is_empty() {
         return Err(reasons);
     }
+    // Services by target workload: (service name, headless).
+    let mut services: BTreeMap<&str, Vec<(&str, bool)>> = BTreeMap::new();
+    for resource in &program.resources {
+        if let Spec::Service(s) = &resource.spec {
+            services
+                .entry(s.target.as_str())
+                .or_default()
+                .push((resource.name.as_str(), s.headless.unwrap_or(false)));
+        }
+    }
+    let network = network_name(owner, &program.namespace);
     let mut workloads = Vec::new();
     for resource in &program.resources {
         let (replicas, sequential, pod) = match &resource.spec {
@@ -88,6 +128,10 @@ pub fn translate(owner: &str, program: &Program) -> Result<Vec<Workload>, Vec<St
             ir_v2::Restart::OnFailure => Restart::OnFailure,
             ir_v2::Restart::Never => Restart::Never,
         };
+        let targeting = services
+            .get(resource.name.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let pods = (0..replicas)
             .map(|ordinal| DesiredPod {
                 id: pod_id(
@@ -99,6 +143,14 @@ pub fn translate(owner: &str, program: &Program) -> Result<Vec<Workload>, Vec<St
                 ),
                 ordinal,
                 spec: PodSpec {
+                    network: Some(Network {
+                        name: network.clone(),
+                        aliases: aliases(
+                            targeting,
+                            &program.namespace,
+                            &hostname(&resource.name, ordinal),
+                        ),
+                    }),
                     hostname: hostname(&resource.name, ordinal),
                     containers: containers.clone(),
                     restart,
@@ -125,6 +177,44 @@ pub fn translate(owner: &str, program: &Program) -> Result<Vec<Workload>, Vec<St
     Ok(workloads)
 }
 
+/// IR v2's name classes: workload kinds share one, every other kind is its own.
+fn name_class(kind: Kind) -> &'static str {
+    if kind.is_workload() {
+        "workload"
+    } else {
+        kind.as_str()
+    }
+}
+
+/// Names of `program` that collide with a resource of the same class in another deployment of the same namespace
+/// (IR v2: deployments may share a namespace only if their resource names do not collide), as `pointer: reason`.
+pub fn collisions<'a>(
+    deployment: &str,
+    program: &Program,
+    others: impl IntoIterator<Item = (&'a String, &'a Program)>,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    for (other_name, other) in others {
+        if other_name == deployment || other.namespace != program.namespace {
+            continue;
+        }
+        for (i, resource) in program.resources.iter().enumerate() {
+            let class = name_class(resource.kind());
+            if other
+                .resources
+                .iter()
+                .any(|r| r.name == resource.name && name_class(r.kind()) == class)
+            {
+                reasons.push(format!(
+                    "/resources/{i}/name: {:?} is also a {class} name in deployment {other_name:?} of namespace {:?}",
+                    resource.name, program.namespace
+                ));
+            }
+        }
+    }
+    reasons
+}
+
 /// Every feature of the program that the workload backend cannot honour yet, as `pointer: reason (issue)`.
 pub fn unsupported(program: &Program) -> Vec<String> {
     let mut reasons = Vec::new();
@@ -149,11 +239,41 @@ pub fn unsupported(program: &Program) -> Vec<String> {
                 &s.pod
             }
             Spec::Config(_) => continue,
+            Spec::Service(s) => {
+                // Services are DNS names for the target's replicas: clients connect to the container's own port.
+                let target_ports: BTreeMap<&str, u16> = program
+                    .resources
+                    .iter()
+                    .find(|r| r.name == s.target && r.kind().is_workload())
+                    .and_then(|r| r.pod())
+                    .map(|pod| {
+                        pod.containers
+                            .iter()
+                            .chain(&pod.sidecars)
+                            .flat_map(|c| &c.ports)
+                            .map(|p| (p.name.as_str(), p.port))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for (j, port) in s.ports.iter().enumerate() {
+                    let target = match &port.target_port {
+                        PortRef::Number(n) => Some(*n),
+                        PortRef::Name(name) => target_ports.get(name.as_str()).copied(),
+                    };
+                    if target != Some(port.port) {
+                        add(
+                            format!("{at}/fields/ports/{j}"),
+                            "services whose port differs from the target port are",
+                            "rezn#123",
+                        );
+                    }
+                }
+                continue;
+            }
             other => {
                 let (what, issue) = match other {
                     Spec::Job(_) => ("jobs are", "rezn#42"),
                     Spec::ScheduledJob(_) => ("scheduled jobs are", "rezn#46"),
-                    Spec::Service(_) => ("services are", "rezn#58"),
                     Spec::VolumeClaim(_) => ("volume claims are", "rezn#67"),
                     Spec::Secret(_) => ("secrets are", "rezn#52, rezn#53"),
                     Spec::Ingress(_) => ("ingresses are", "rezn#60"),
@@ -295,21 +415,9 @@ mod tests {
         ]})
     }
 
-    /// The program without its services: ordered replica sets need a headless service, which is not executed yet
-    /// (rezn#58), so their translation is exercised on the rest of the program.
-    fn without_services(value: serde_json::Value) -> Program {
-        let mut p = program(value);
-        p.resources.retain(|r| r.kind() != Kind::Service);
-        p
-    }
-
     #[test]
     fn replica_sets_become_labelled_pods() {
-        assert_eq!(
-            translate(OWNER_ID, &program(web(2))).unwrap_err(),
-            vec!["/resources/3: services are not executed yet (rezn#58)"]
-        );
-        let workloads = translate(OWNER_ID, &without_services(web(2))).unwrap();
+        let workloads = translate(OWNER_ID, &program(web(2))).unwrap();
         assert_eq!(workloads.len(), 2);
         let set = &workloads[0];
         assert_eq!(
@@ -355,10 +463,131 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("pod_management");
-        assert!(translate(OWNER_ID, &without_services(ordered)).unwrap()[1].sequential);
-        assert!(translate(OWNER_ID, &without_services(web(0))).unwrap()[0]
+        assert!(translate(OWNER_ID, &program(ordered)).unwrap()[1].sequential);
+        assert!(translate(OWNER_ID, &program(web(0))).unwrap()[0]
             .pods
             .is_empty());
+    }
+
+    #[test]
+    fn pods_join_their_namespace_network_with_service_aliases() {
+        let mut value = web(2);
+        value["resources"].as_array_mut().unwrap().extend([
+            json!({"kind": "service", "name": "web", "fields": {"target": "web",
+                    "ports": [{"name": "http", "port": 80, "target_port": "http"}]}}),
+            json!({"kind": "service", "name": "front", "fields": {"target": "web",
+                    "ports": [{"name": "http", "port": 80, "target_port": 80}]}}),
+        ]);
+        let workloads = translate(OWNER_ID, &program(value)).unwrap();
+        let network = network_name(OWNER_ID, "store");
+        let names = |w: usize, p: usize| {
+            let spec = &workloads[w].pods[p].spec;
+            let n = spec.network.as_ref().unwrap();
+            assert_eq!(n.name, network);
+            n.aliases.clone()
+        };
+        assert_eq!(
+            names(0, 1),
+            [
+                "front",
+                "front.store",
+                "front.store.svc",
+                "web",
+                "web.store",
+                "web.store.svc"
+            ]
+        );
+        assert_eq!(names(0, 0), names(0, 1));
+        assert_eq!(
+            names(1, 1),
+            [
+                "db",
+                "db-1.db",
+                "db-1.db.store",
+                "db-1.db.store.svc",
+                "db.store",
+                "db.store.svc"
+            ]
+        );
+
+        // A workload no service targets still joins the namespace network, without aliases.
+        let mut lone = web(1);
+        lone["resources"].as_array_mut().unwrap().truncate(2);
+        let spec = &translate(OWNER_ID, &program(lone)).unwrap()[0].pods[0].spec;
+        assert_eq!(
+            spec.network,
+            Some(Network {
+                name: network.clone(),
+                aliases: vec![]
+            })
+        );
+    }
+
+    #[test]
+    fn networks_are_per_owner_and_namespace() {
+        let n = network_name(OWNER_ID, "store");
+        assert_eq!(n, network_name(OWNER_ID, "store"));
+        assert_eq!(n.len(), 27);
+        assert_ne!(n, network_name(OWNER_ID, "store2"));
+        assert_ne!(n, network_name(&"1".repeat(64), "store"));
+        assert_ne!(n, pod_id(OWNER_ID, "store", "namespace", "", 0));
+    }
+
+    #[test]
+    fn services_that_remap_ports_are_not_executed() {
+        let mut value = web(1);
+        value["resources"].as_array_mut().unwrap().push(json!(
+            {"kind": "service", "name": "web", "fields": {"target": "web", "ports": [
+                {"name": "same", "port": 80, "target_port": "http"},
+                {"name": "named", "port": 8080, "target_port": "http"},
+                {"name": "numbered", "port": 443, "target_port": 8443}]}}));
+        assert_eq!(
+            translate(OWNER_ID, &program(value)).unwrap_err(),
+            vec![
+                "/resources/4/fields/ports/1: services whose port differs from the target port are not executed yet (rezn#123)",
+                "/resources/4/fields/ports/2: services whose port differs from the target port are not executed yet (rezn#123)",
+            ]
+        );
+    }
+
+    #[test]
+    fn names_may_not_collide_across_deployments_of_a_namespace() {
+        let shop = program(web(1));
+        let mut other = web(1);
+        other["deployment"] = json!("other");
+        // Same names in another namespace are fine.
+        let elsewhere = {
+            let mut v = other.clone();
+            v["namespace"] = json!("elsewhere");
+            program(v)
+        };
+        // A job named like another deployment's ordered set shares the workload class; a service named like a
+        // workload does not collide with it.
+        other["resources"] = json!([
+            {"kind": "replica_set", "name": "web", "fields": {"replicas": 1, "pod": {
+                "containers": [{"name": "c", "image": "alpine"}]}}},
+            {"kind": "service", "name": "web", "fields": {"target": "web", "ports": []}},
+            {"kind": "job", "name": "db", "fields": {"pod": {"restart": "never",
+                "containers": [{"name": "c", "image": "alpine"}]}}},
+            {"kind": "config", "name": "settings", "fields": {"data": {}}},
+            {"kind": "config", "name": "fresh", "fields": {"data": {}}}
+        ]);
+        let other = program(other);
+        let all = BTreeMap::from([
+            ("shop".to_string(), shop.clone()),
+            ("other".to_string(), other.clone()),
+            ("elsewhere".to_string(), elsewhere),
+        ]);
+        assert_eq!(
+            collisions("other", &other, &all),
+            vec![
+                "/resources/0/name: \"web\" is also a workload name in deployment \"shop\" of namespace \"store\"",
+                "/resources/2/name: \"db\" is also a workload name in deployment \"shop\" of namespace \"store\"",
+                "/resources/3/name: \"settings\" is also a config name in deployment \"shop\" of namespace \"store\"",
+            ]
+        );
+        assert_eq!(collisions("shop", &shop, &all).len(), 3);
+        assert!(collisions("shop", &shop, [(&"shop".to_string(), &shop)]).is_empty());
     }
 
     #[test]
@@ -417,7 +646,6 @@ mod tests {
             reasons,
             vec![
                 "/resources/0/fields/pod/containers/0/readiness: probes are not executed yet (rezn#71, orqos#26)",
-                "/resources/1: services are not executed yet (rezn#58)",
             ]
         );
         let reasons = unsupported(&example("reference.json")).join("\n");

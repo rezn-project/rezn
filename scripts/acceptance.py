@@ -63,12 +63,36 @@ def podman(*args, check=True):
     return result.stdout.strip()
 
 
+# Answers every TCP connection on 8080 with the pod's hostname.
+COMMAND = ["/bin/sh", "-c",
+           "trap 'exit 0' TERM; (while true; do hostname | nc -l -p 8080; done) & while true; do sleep 1; done"]
+
+
+def pod(level):
+    return {"grace_seconds": 5, "containers": [{"name": "app", "image": IMAGE, "pull": "if_not_present",
+                                                "command": COMMAND, "env": [{"name": "LEVEL", "value": level}]}]}
+
+
 def replica_set(name, replicas, level):
-    return {"kind": "replica_set", "name": name, "fields": {"replicas": replicas, "pod": {
-        "grace_seconds": 5,
-        "containers": [{"name": "app", "image": IMAGE, "pull": "if_not_present",
-                        "command": ["/bin/sh", "-c", "trap 'exit 0' TERM; while true; do sleep 1; done"],
-                        "env": [{"name": "LEVEL", "value": level}]}]}}}
+    return {"kind": "replica_set", "name": name, "fields": {"replicas": replicas, "pod": pod(level)}}
+
+
+def ordered_set(name, replicas):
+    return {"kind": "ordered_replica_set", "name": name, "fields": {
+        "replicas": replicas, "service": name, "pod_management": "ordered", "pod": pod("db")}}
+
+
+def service(name, port=8080, target_port=8080, headless=False):
+    return {"kind": "service", "name": name, "fields": {
+        "target": name, "headless": headless,
+        "ports": [{"name": "tcp", "port": port, "target_port": target_port}]}}
+
+
+def resolve(container, name):
+    """The IPv4 addresses `name` resolves to inside a container, or None."""
+    result = subprocess.run(["podman", "exec", container, "getent", "ahostsv4", name],
+                            capture_output=True, text=True, timeout=30)
+    return None if result.returncode else {line.split()[0] for line in result.stdout.splitlines()}
 
 
 class Acceptance:
@@ -131,13 +155,17 @@ class Acceptance:
 
     # Rezn
 
-    def apply(self, resources):
-        program = {"ir": "rezn.dev/v2", "deployment": self.deployment, "namespace": "acceptance",
-                   "resources": resources}
+    def apply(self, resources, deployment=None, namespace="acceptance"):
+        deployment = deployment or self.deployment
+        program = {"ir": "rezn.dev/v2", "deployment": deployment, "namespace": namespace, "resources": resources}
         code, accepted = http(self.rezn_url + "/apply", {
-            "name": self.deployment, "instruction_wrapper": sign(program, self.key)})
+            "name": deployment, "instruction_wrapper": sign(program, self.key)})
         assert code == 202 and accepted["stored"] is True, accepted
         return accepted["revision"]
+
+    def owned_networks(self):
+        _, networks = http(self.orqos_url + "/workload/networks", token=self.token)
+        return networks
 
     def status(self):
         return http(self.rezn_url + "/status")[1]
@@ -150,9 +178,10 @@ class Acceptance:
                               and status["observed_revision"] == revision) else None
         return wait(f"convergence of revision {revision}", check)
 
-    def pods(self, status, resource="web"):
+    def pods(self, status, resource="web", deployment=None):
         return {p["ordinal"]: p for w in status["workloads"]
-                if w["deployment"] == self.deployment and w["resource"] == resource for p in w["pods"]}
+                if w["deployment"] == (deployment or self.deployment) and w["resource"] == resource
+                for p in w["pods"]}
 
     @staticmethod
     def container(pod):
@@ -262,12 +291,88 @@ class Acceptance:
         assert self.pods(status)[0]["id"] == victim["id"]
         self.record("a killed container is restarted by systemd without Rezn replacing the pod")
 
+        self.services()
+
+        networks = {n["podman_name"] for n in self.owned_networks()}
+        assert len(networks) == 2, networks
+        self.settled(self.apply([], deployment=self.deployment + "-x", namespace="isolated"))
         status = self.settled(self.apply([]))
         assert not self.pods(status)
         wait("owned Podman pods to disappear", lambda: not self.owned_podman_pods(), 60)
+        wait("namespace networks to disappear", lambda: not self.owned_networks(), 60)
+        for network in networks:
+            assert subprocess.run(["podman", "network", "exists", network]).returncode != 0, network
         self.foreign_intact()
-        self.record("an empty program removes every owned pod; a foreign Orqos pod is untouched")
+        self.record("empty programs remove every owned pod and then the namespace networks; a foreign Orqos pod "
+                    "is untouched")
         return self.steps
+
+    def services(self):
+        web_service = service("web")
+        status = self.settled(self.apply([replica_set("web", 2, "b"), web_service]))
+        pods = self.pods(status)
+        client = self.container(pods[0])
+        assert pods[0]["aliases"] == ["web", "web.acceptance", "web.acceptance.svc"], pods[0]
+        both = resolve(client, "web")
+        assert both and len(both) == 2, both
+        assert resolve(client, "web.acceptance") == both and resolve(client, "web.acceptance.svc") == both
+        assert podman("exec", client, "nc", "web.acceptance.svc", "8080") in {"web-0", "web-1"}
+        self.record("a service's names resolve to every replica of its target in the namespace and reach them")
+
+        resources = [replica_set("web", 2, "b"), web_service, ordered_set("db", 2), service("db", headless=True)]
+        revision = self.apply(resources)
+        seen_first_running_when_second_appeared = None
+        while True:
+            status = self.status()
+            db = self.pods(status, "db")
+            if 1 in db and seen_first_running_when_second_appeared is None:
+                seen_first_running_when_second_appeared = db[0]["state"] == "running"
+            if status["converged"] and status["observed_revision"] == revision:
+                break
+            time.sleep(0.2)
+        assert seen_first_running_when_second_appeared, "db-1 was created before db-0 was running"
+        db = self.pods(status, "db")
+        started = [podman("inspect", "--format", "{{.State.StartedAt}}", self.container(db[n])) for n in (0, 1)]
+        zero, one = resolve(client, "db-0.db"), resolve(client, "db-1.db")
+        assert zero and one and len(zero) == 1 and len(one) == 1 and zero != one, (zero, one)
+        assert resolve(client, "db") == zero | one
+        assert resolve(client, "db-1.db.acceptance.svc") == one
+        assert podman("exec", client, "nc", "db-1.db", "8080") == "db-1"
+        self.record(f"an ordered replica set with a headless service starts one replica at a time ({started}) "
+                    "and each replica resolves as <name>-<N>.<service>")
+
+        self.settled(self.apply([replica_set("probe", 1, "x")], deployment=self.deployment + "-x",
+                                namespace="isolated"))
+        status = self.status()
+        outsider = self.container(self.pods(status, "probe", self.deployment + "-x")[0])
+        assert resolve(outsider, "web") is None and resolve(outsider, "web.acceptance.svc") is None
+        for address in both:
+            reply = subprocess.run(["podman", "exec", outsider, "timeout", "5", "nc", address, "8080"],
+                                   capture_output=True, text=True, timeout=30).stdout.strip()
+            assert reply not in {"web-0", "web-1"}, f"another namespace reached {address} by IP"
+        assert resolve(client, "probe") is None
+        try:
+            self.apply([replica_set("web", 1, "c")], deployment=self.deployment + "-c")
+            raise AssertionError("a colliding deployment was accepted")
+        except urllib.error.HTTPError as error:
+            body = error.read().decode()
+            assert error.code == 400 and "is also a workload name" in body, (error.code, body)
+        self.record("namespaces are isolated (no names, no traffic by IP), and a deployment whose names collide in a shared namespace is refused")
+
+        current = self.container_ids(self.status())
+        revision = self.apply([replica_set("web", 2, "b"), service("web", port=80, target_port=8080),
+                               ordered_set("db", 2), service("db", headless=True)])
+
+        def unexecuted():
+            s = self.status()
+            return s if s["observed_revision"] == revision and s["unexecuted"] else None
+        status = wait("the unexecuted report", unexecuted)
+        assert "services whose port differs from the target port are not executed yet (rezn#123)" in \
+            status["unexecuted"][0]["reasons"][0], status
+        time.sleep(3)
+        assert self.container_ids(self.status()) == current
+        self.settled(self.apply(resources))
+        self.record("a service that remaps its port is reported unexecuted and changes nothing")
 
     def cleanup(self):
         errors = []

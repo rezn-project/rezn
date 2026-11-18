@@ -379,20 +379,21 @@ async fn lifecycle_create_reapply_scale_rolling_replace_and_remove() {
     assert_eq!(status.workloads[0].deployment, "other");
 }
 
-/// Ordered replica sets need a headless service, which is not executed yet (rezn#58); their sequencing is checked
-/// on the planner directly with the workload translation of the program minus its service.
+fn headless(name: &str) -> Value {
+    json!({"kind": "service", "name": name, "fields": {"target": name, "headless": true,
+        "ports": [{"name": "pg", "port": 5432, "target_port": 5432}]}})
+}
+
+/// The translation of an ordered replica set with its headless service, for checking the planner directly.
 fn ordered_workload(replicas: u32, management: &str) -> Workload {
-    let service = json!({"kind": "service", "name": "db", "fields": {"target": "db", "headless": true,
-        "ports": [{"name": "pg", "port": 5432, "target_port": 5432}]}});
-    let mut program = ir_v2::validate(&program(
+    let program = ir_v2::validate(&program(
         "data",
-        json!([ordered_set("db", replicas, management), service]),
+        json!([ordered_set("db", replicas, management), headless("db")]),
     ))
     .unwrap();
-    program
-        .resources
-        .retain(|r| r.kind() == Kind::OrderedReplicaSet);
-    translate(&"0".repeat(64), &program).unwrap().remove(0)
+    let workloads = translate(&"0".repeat(64), &program).unwrap();
+    assert_eq!(workloads[0].kind, Kind::OrderedReplicaSet);
+    workloads.into_iter().next().unwrap()
 }
 
 fn observed(workload: &Workload, states: &[&str]) -> Vec<Owned> {
@@ -518,7 +519,7 @@ async fn unexecuted_deployments_report_reasons_and_keep_their_pods() {
     let before = backend.requests().len();
     apply(&app, "hello", example_v2("minimal.json")).await;
     let service = json!({"kind": "service", "name": "db", "fields": {"target": "db", "headless": true,
-        "ports": [{"name": "pg", "port": 5432, "target_port": 5432}]}});
+        "ports": [{"name": "pg", "port": 5433, "target_port": 5432}]}});
     apply(
         &app,
         "data",
@@ -534,14 +535,13 @@ async fn unexecuted_deployments_report_reasons_and_keep_their_pods() {
     assert_eq!(status.unexecuted[0].deployment, "data");
     assert_eq!(
         status.unexecuted[0].reasons,
-        vec!["/resources/1: services are not executed yet (rezn#58)"]
+        vec!["/resources/1/fields/ports/0: services whose port differs from the target port are not executed yet (rezn#123)"]
     );
     assert_eq!(status.unexecuted[1].deployment, "hello");
     assert_eq!(
         status.unexecuted[1].reasons,
         vec![
             "/resources/0/fields/pod/containers/0/readiness: probes are not executed yet (rezn#71, orqos#26)",
-            "/resources/1: services are not executed yet (rezn#58)",
         ]
     );
 
@@ -574,6 +574,152 @@ async fn unexecuted_deployments_report_reasons_and_keep_their_pods() {
         .as_str()
         .unwrap()
         .contains("/liveness: probes"));
+}
+
+#[tokio::test]
+async fn services_become_aliases_and_adding_one_rolls_the_target() {
+    let (backend, engine) = backend().await;
+    let app = app(backend.client.clone(), None);
+    let web = |n| id(&app, "shop", "replica_set", "web", n);
+    apply(
+        &app,
+        "shop",
+        program("shop", json!([replica_set("web", 2, "a")])),
+    )
+    .await;
+    reconcile(&app).await.unwrap();
+    let network = crate::workload::network_name(&owner(&app), "apps");
+    let sent = engine.lock().unwrap().pods[&web(0)]["spec"].clone();
+    assert_eq!(sent["network"], json!({"name": network, "aliases": []}));
+
+    let service = json!({"kind": "service", "name": "web", "fields": {"target": "web",
+        "ports": [{"name": "http", "port": 80, "target_port": 80}]}});
+    apply(
+        &app,
+        "shop",
+        program("shop", json!([replica_set("web", 2, "a"), service])),
+    )
+    .await;
+    // One running replica at a time, highest first.
+    let before = backend.requests().len();
+    reconcile(&app).await.unwrap_err();
+    assert_eq!(mutations(&backend, before), vec![put(web(1))]);
+    let before = backend.requests().len();
+    reconcile(&app).await.unwrap();
+    assert_eq!(mutations(&backend, before), vec![put(web(0))]);
+    let status = converged(&app).await;
+    for pod in &status.workloads[0].pods {
+        assert_eq!(pod.aliases, ["web", "web.apps", "web.apps.svc"]);
+    }
+    assert_eq!(
+        engine.lock().unwrap().pods[&web(1)]["spec"]["network"]["name"],
+        json!(network)
+    );
+}
+
+#[tokio::test]
+async fn ordered_sets_with_headless_services_start_one_replica_at_a_time() {
+    let (backend, engine) = backend().await;
+    let app = app(backend.client.clone(), None);
+    let db = |n| id(&app, "data", "ordered_replica_set", "db", n);
+    engine.lock().unwrap().start_state = Some("starting");
+    apply(
+        &app,
+        "data",
+        program(
+            "data",
+            json!([ordered_set("db", 2, "ordered"), headless("db")]),
+        ),
+    )
+    .await;
+    let _ = reconcile(&app).await;
+    assert_eq!(mutations(&backend, 0), vec![put(db(0))]);
+    let before = backend.requests().len();
+    let _ = reconcile(&app).await;
+    assert!(
+        mutations(&backend, before).is_empty(),
+        "replica 1 waits for replica 0"
+    );
+    engine.lock().unwrap().set_state(&db(0), "running");
+    let before = backend.requests().len();
+    let _ = reconcile(&app).await;
+    assert_eq!(mutations(&backend, before), vec![put(db(1))]);
+    engine.lock().unwrap().set_state(&db(1), "running");
+    reconcile(&app).await.unwrap();
+    let status = converged(&app).await;
+    assert_eq!(
+        status.workloads[0].pods[1].aliases,
+        [
+            "db",
+            "db-1.db",
+            "db-1.db.apps",
+            "db-1.db.apps.svc",
+            "db.apps",
+            "db.apps.svc"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn colliding_names_in_a_shared_namespace_are_refused_or_left_unexecuted() {
+    let (backend, _) = backend().await;
+    let app = app(backend.client.clone(), None);
+    apply(
+        &app,
+        "shop",
+        program("shop", json!([replica_set("web", 1, "a")])),
+    )
+    .await;
+    reconcile(&app).await.unwrap();
+    let revision = store::load(&app.db).unwrap().revision;
+
+    let refused = apply_handler(
+        State(app.clone()),
+        Json(ApplyPayload {
+            name: "other".into(),
+            instruction_wrapper: signed(program("other", json!([replica_set("web", 1, "b")]))),
+        }),
+    )
+    .await
+    .err()
+    .expect("a colliding program is refused");
+    assert_eq!(refused.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        refused.1,
+        "/resources/0/name: \"web\" is also a workload name in deployment \"shop\" of namespace \"apps\""
+    );
+    assert_eq!(store::load(&app.db).unwrap().revision, revision);
+
+    // The same names in another namespace are accepted. State written before the check, with both in one
+    // namespace, leaves both deployments unexecuted and their pods in place.
+    let mut elsewhere = program("other", json!([replica_set("web", 1, "b")]));
+    elsewhere["namespace"] = json!("elsewhere");
+    apply(&app, "other", elsewhere).await;
+    let mut state: Value =
+        serde_json::from_slice(&app.db.get(STATE_KEY).unwrap().unwrap()).unwrap();
+    let colliding = signed(program("other", json!([replica_set("web", 1, "b")])));
+    state["deployments"]["other"]["meta"]["sig_id"] = json!(colliding.signature.sig);
+    state["deployments"]["other"]["envelope"] = json!(colliding);
+    app.db
+        .insert(STATE_KEY, serde_json::to_vec(&state).unwrap())
+        .unwrap();
+    let before = backend.requests().len();
+    let _ = reconcile(&app).await;
+    assert!(mutations(&backend, before).is_empty());
+    let status = app.controller.status(&app.db).await.unwrap();
+    let unexecuted: Vec<(&str, &str)> = status
+        .unexecuted
+        .iter()
+        .map(|u| (u.deployment.as_str(), u.reasons[0].as_str()))
+        .collect();
+    assert_eq!(
+        unexecuted,
+        [
+            ("other", "/resources/0/name: \"web\" is also a workload name in deployment \"shop\" of namespace \"apps\""),
+            ("shop", "/resources/0/name: \"web\" is also a workload name in deployment \"other\" of namespace \"apps\""),
+        ]
+    );
+    assert_eq!(status.workloads[0].pods.len(), 1);
 }
 
 #[tokio::test]

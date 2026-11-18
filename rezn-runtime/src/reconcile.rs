@@ -115,6 +115,8 @@ pub struct PodView {
     pub state: String,
     /// The pod runs the desired spec of the accepted revision.
     pub current: bool,
+    /// DNS names that resolve to this pod on its namespace network.
+    pub aliases: Vec<String>,
     pub containers: Vec<ContainerStatus>,
     /// Orqos's last operation error for the pod.
     pub error: Option<String>,
@@ -131,11 +133,17 @@ pub enum Action {
 fn desired(state: &StoredState) -> Result<(Vec<Workload>, Reasons)> {
     let mut workloads = Vec::new();
     let mut unexecuted = BTreeMap::new();
-    for (name, program) in state.desired()? {
-        match workload::translate(&state.owner, &program) {
-            Ok(w) => workloads.extend(w),
+    let programs = state.desired()?;
+    for (name, program) in &programs {
+        // `/apply` refuses colliding names; this covers state stored before that check.
+        let collisions = workload::collisions(name, program, &programs);
+        match workload::translate(&state.owner, program) {
+            Ok(w) if collisions.is_empty() => workloads.extend(w),
+            Ok(_) => {
+                unexecuted.insert(name.clone(), collisions);
+            }
             Err(reasons) => {
-                unexecuted.insert(name, reasons);
+                unexecuted.insert(name.clone(), [collisions, reasons].concat());
             }
         }
     }
@@ -379,6 +387,13 @@ impl Controller {
                                 hostname: p.status.spec.hostname.clone(),
                                 state: p.status.state.clone(),
                                 current: desired_spec(&p.status.id) == Some(&p.status.spec),
+                                aliases: p
+                                    .status
+                                    .spec
+                                    .network
+                                    .as_ref()
+                                    .map(|n| n.aliases.clone())
+                                    .unwrap_or_default(),
                                 containers: p.status.containers.clone(),
                                 error: p.status.error.clone(),
                             })

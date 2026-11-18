@@ -18,6 +18,16 @@ pub struct PodSpec {
     pub grace_seconds: u32,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<Network>,
+}
+
+/// An Orqos-owned Podman network the pod joins, with the DNS names that resolve to it there.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Network {
+    pub name: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -167,6 +177,10 @@ mod tests {
             restart: Restart::Always,
             grace_seconds: 30,
             labels: BTreeMap::from([("dev.rezn.owner".into(), "ab".into())]),
+            network: Some(Network {
+                name: "rz-net".into(),
+                aliases: vec!["web".into(), "web.store.svc".into()],
+            }),
         }
     }
 
@@ -177,6 +191,7 @@ mod tests {
             "pod": {"unit": "orqos-rz-1-pod.service", "active_state": "active", "sub_state": "running", "result": "success", "restarts": 0},
             "containers": [{"name": "web", "unit": "orqos-rz-1-c-web.service", "active_state": "active", "sub_state": "running", "result": "success", "restarts": 2}],
             "spec": {"hostname": "web-0", "restart": "always", "grace_seconds": 30, "labels": {"dev.rezn.owner": "ab"},
+                     "network": {"name": "rz-net", "aliases": ["web", "web.store.svc"]},
                      "containers": [{"name": "web", "image": "docker.io/library/nginx:1.27-alpine", "args": ["-g", "daemon off;"], "env": {"LEVEL": "info"}}]},
             "error": null, "updated_at": "2026-11-18T00:00:00Z"
         }]);

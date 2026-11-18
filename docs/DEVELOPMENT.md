@@ -75,6 +75,11 @@ deployment is refused at startup: use a new database (IR v1 Docker containers ar
 yourself). The Rezn DSL still emits IR v1, so its output is not executable until it emits IR v2
 ([rezn-dsl#29](https://github.com/rezn-project/rezn-dsl/issues/29)).
 
+IR v2 lets deployments share a namespace only if their resource names do not collide (workload kinds share one
+name class; every other kind is its own). `/apply` enforces this against the other stored deployments: a colliding
+program gets HTTP 400 with `JSON-pointer: "name" is also a <class> name in deployment "<other>" of namespace
+"<ns>"`.
+
 Invalid signatures or programs return HTTP 400 with the reason. Malformed JSON and unknown envelope keys return an
 extractor 4xx (normally 422). Invalid submissions write no state and trigger no change. Success is `202
 {"stored":true,"revision":N}`: durable stored intent, not completed deployment. Each accepted apply increments a
@@ -83,28 +88,56 @@ keeping the deployment record.
 
 ## What runs
 
-Orqos's workload backend runs pods of plain containers: image, `command`, `args`, literal environment values,
-restart policy and grace period. A deployment runs only when **every** resource maps exactly onto that:
+Orqos's workload backend runs pods of plain containers (image, `command`, `args`, literal environment values,
+restart policy and grace period) on owned networks with DNS aliases. A deployment runs only when **every** resource
+maps exactly onto that:
 
-- `replica_set` resources, each replica as one Orqos pod (one Podman pod with its own network namespace, user
-  namespace and hostname `<name>-<ordinal>`);
+- `replica_set` and `ordered_replica_set` resources (the latter without `volume_claims`), each replica as one Orqos
+  pod: one Podman pod with its own network namespace, user namespace and hostname `<name>-<ordinal>`;
+- `service` resources whose every `port` equals its target port (a number, or the named container port it
+  resolves to), as DNS names (below);
 - `config` resources, which are inert until something consumes them;
 - containers with `pull` absent or `if_not_present`, environment `value`s, and declared `ports` (informational, as in
-  Kubernetes: nothing is published).
+  Kubernetes: nothing is published on the host).
 
-Anything else leaves the whole deployment **unexecuted**: services and ingress, network policies, secrets, jobs,
-volume claims, phases, init containers and sidecars, pod and container security settings, volumes and mounts,
-probes, resource requests and limits, other pull policies, registry credentials, and secret or pod-IP environment
-references. `/status` lists every blocking field as `JSON-pointer: reason (issue)`, citing the issue that adds it.
-An unexecuted deployment's pods from an earlier revision keep running untouched. Ordered replica sets need a
-headless service, so they wait for services ([#58](https://github.com/rezn-project/rezn/issues/58)); their
-sequencing is implemented and unit-tested already.
+Anything else leaves the whole deployment **unexecuted**: services that remap ports
+([#123](https://github.com/rezn-project/rezn/issues/123)), ingress, network policies, secrets, jobs, volume claims,
+phases, init containers and sidecars, pod and container security settings, volumes and mounts, probes, resource
+requests and limits, other pull policies, registry credentials, and secret or pod-IP environment references.
+`/status` lists every blocking field as `JSON-pointer: reason (issue)`, citing the issue that adds it. An
+unexecuted deployment's pods from an earlier revision keep running untouched.
+
+### Networking and services
+
+Every pod of a namespace joins that namespace's network: an Orqos-owned Podman bridge network with aardvark-dns,
+named `orqos-net-rz-<first 24 hex digits of sha256([owner, "namespace", namespace])>` and shared by this owner's
+deployments in the namespace. Orqos creates it with the first pod and removes it after the last, strictly
+isolated (netavark `isolate=strict`), so pods of different namespaces can neither resolve nor reach each other,
+even by IP, while egress to the outside keeps working (stricter than Kubernetes'
+flat pod network, as IR v2 scopes names to the namespace).
+
+A service becomes DNS aliases on every pod of its target:
+
+- `<service>`, `<service>.<namespace>` and `<service>.<namespace>.svc` resolve to the addresses of all the target's
+  replicas;
+- a headless service also gives each replica `<name>-<N>.<service>`, `<name>-<N>.<service>.<namespace>` and
+  `<name>-<N>.<service>.<namespace>.svc`.
+
+Clients connect to the container's own port, so a service whose `port` differs from its target port is not
+executed yet. A non-headless service resolves to every replica's address (DNS round-robin) rather than one virtual
+address ([#123](https://github.com/rezn-project/rezn/issues/123)). Names resolve only while a replica runs; without
+probes (not executed yet) a running replica is a ready one, which is IR v2's membership rule. Aliases are part of
+the pod spec: adding, removing or changing a service replaces its target's pods through the rolling replacement
+below. Changing membership without a restart arrives with readiness
+([#59](https://github.com/rezn-project/rezn/issues/59)).
 
 ## Reconciliation
 
 One serialized loop runs after every apply and every `RECONCILE_INTERVAL`. Each pass:
 
-1. loads and validates the whole stored state, translating each deployment into desired pods;
+1. loads and validates the whole stored state, translating each deployment into desired pods (deployments whose
+   names collide in a shared namespace, which only state stored before `/apply` checked this can hold, stay
+   unexecuted);
 2. lists Orqos's pods and keeps those whose labels claim this database's owner, proving each claim (below);
 3. plans and applies a bounded set of changes, per replica set:
    - removes pods of removed resources or deployments, and replicas beyond the count (highest ordinals);
@@ -136,7 +169,7 @@ invalid persisted state returns HTTP 500, never an empty map. `GET /status` repo
 | `errors` | The last pass's validation, observation, mutation or convergence errors; cleared after a successful pass |
 | `unexecuted[]` | `deployment` and `reasons` (`JSON-pointer: reason (issue)`) for each program the backend cannot run yet |
 | `workloads[]` | Per replica set: `deployment`, `kind`, `resource`, `desired_replicas` (null for pods awaiting removal or of unexecuted deployments), `running_replicas` (null until observed) and `pods[]` |
-| `pods[]` | `id`, `ordinal`, `hostname`, Orqos's `state` (`running`, `starting`, `restarting`, `degraded`, `failed`, `stopped`), `current` (runs the desired spec), `containers[]` (`name`, `active_state`, `sub_state`, `result`, `restarts`) and Orqos's last `error` |
+| `pods[]` | `id`, `ordinal`, `hostname`, Orqos's `state` (`running`, `starting`, `restarting`, `degraded`, `failed`, `stopped`), `current` (runs the desired spec), `aliases` (its DNS names on the namespace network), `containers[]` (`name`, `active_state`, `sub_state`, `result`, `restarts`) and Orqos's last `error` |
 
 After a failure, status keeps the last successful observation with its timestamp and marks it stale; it never
 invents zero replicas or declares success. It starts `unknown` after a restart and rebuilds from Orqos's listing.
@@ -192,7 +225,13 @@ applies signed IR v2 programs and checks with Podman itself:
 - a program needing unsupported features is reported with reasons and changes nothing;
 - a restarted Rezn keeps its identity and changes nothing;
 - a killed container is restarted by systemd without Rezn replacing the pod;
-- an empty program removes every owned pod while a foreign Orqos pod stays.
+- a service's names resolve inside the namespace to every replica of its target, and connections by name arrive;
+- an ordered replica set with a headless service starts its replicas one at a time, and each resolves as
+  `<name>-<N>.<service>`;
+- a pod of another namespace cannot resolve those names, and a deployment whose names collide in a shared namespace
+  is refused;
+- a service that remaps its port is reported unexecuted and changes nothing;
+- empty programs remove every owned pod and then the namespace networks, while a foreign Orqos pod stays.
 
 It removes everything it created, including after a failure. The *Acceptance* workflow runs it on Ubuntu 26.04
 against the Orqos commit pinned in `.github/workflows/acceptance.yml`.

@@ -3,8 +3,8 @@
 Status: specified in M0 ([#32](https://github.com/rezn-project/rezn/issues/32)). `/apply` verifies, validates and
 stores IR v2 programs, `reznctl validate` checks them offline ([#39](https://github.com/rezn-project/rezn/issues/39)),
 and Rezn executes them through Orqos's workload backend ([#30](https://github.com/rezn-project/rezn/issues/30)) as far
-as that backend reaches: [what runs today](DEVELOPMENT.md#what-runs) is replica sets of plain containers, and any
-other program is reported as unexecuted with the issue each missing feature needs. IR v1 is retired. The Kubernetes
+as that backend reaches: [what runs today](DEVELOPMENT.md#what-runs) is replica sets and ordered replica sets of
+plain containers with their services, and any other program is reported as unexecuted with the issue each missing feature needs. IR v1 is retired. The Kubernetes
 import ([#83](https://github.com/rezn-project/rezn/issues/83)) follows in M1.
 
 IR v2 is the signed program format that every front end produces: the Kubernetes manifest import (from the
@@ -270,6 +270,11 @@ Following [ADR 0001](adr/0001-execution-foundation.md): each pod is a Podman pod
 `startup` probe gates the main containers (`Notify=healthy`). `scratch` volumes are pod-scoped, not per-container
 tmpfs mounts, because Podman tmpfs volumes vanish when no container mounts them. Every restart carries explicit
 backoff. Readiness is watched by Orqos, since `Notify=healthy` gates only start.
+
+Each namespace is one Podman network with aardvark-dns, and services are network aliases on their target's pods
+([networking](DEVELOPMENT.md#networking-and-services)): a non-headless service resolves to every ready replica
+(DNS round-robin) until virtual addresses and port remapping
+([#123](https://github.com/rezn-project/rezn/issues/123)) land, and namespaces cannot reach each other.
 
 ## Out of scope for v2.0
 
