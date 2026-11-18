@@ -1942,6 +1942,7 @@ dependencies = [
  "ctrlc",
  "ed25519-dalek",
  "hex",
+ "hmac",
  "log",
  "once_cell",
  "reqwest",

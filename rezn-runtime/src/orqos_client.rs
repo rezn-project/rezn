@@ -26,7 +26,8 @@ pub struct PodSpec {
     pub volumes: Vec<PodVolume>,
 }
 
-/// A pod volume: an owned volume (`volume`, created with `PUT /workload/volumes/{name}`) or a scratch volume.
+/// A pod volume: an owned volume (`volume`, created with `PUT /workload/volumes/{name}`), a scratch volume, or
+/// files from an owned secret (`secret`, created with `PUT /workload/secrets/{name}`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PodVolume {
     pub name: String,
@@ -34,6 +35,58 @@ pub struct PodVolume {
     pub volume: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scratch: Option<Scratch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<SecretFiles>,
+}
+
+/// Keys of an owned secret written as read-only files, owned by root and `group`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SecretFiles {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<SecretItem>>,
+    pub mode: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SecretItem {
+    pub key: String,
+    pub path: String,
+}
+
+/// One key of an owned secret.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SecretKeyRef {
+    pub secret: String,
+    pub key: String,
+}
+
+/// An owned secret's spec: base64 values (immutable in Orqos) and Rezn's labels.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct SecretSpec {
+    pub data: BTreeMap<String, String>,
+    pub labels: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for SecretSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretSpec")
+            .field("keys", &self.data.keys().collect::<Vec<_>>())
+            .field("labels", &self.labels)
+            .finish()
+    }
+}
+
+/// One owned secret as Orqos reports it (its keys too, which Rezn does not need; never values).
+#[derive(Clone, Debug, Deserialize)]
+pub struct SecretStatus {
+    pub name: String,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    /// Pods whose records use it.
+    pub pods: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -104,6 +157,8 @@ pub struct ContainerSpec {
     pub args: Option<Vec<String>>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secret_env: BTreeMap<String, SecretKeyRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -239,6 +294,39 @@ impl OrqosClient {
         Ok(())
     }
 
+    pub async fn list_secrets(&self) -> Result<Vec<SecretStatus>> {
+        self.send(
+            "list workload secrets",
+            self.client
+                .get(format!("{}/workload/secrets", self.base_url)),
+        )
+        .await?
+        .json()
+        .await
+        .context("Failed to parse the workload secret list")
+    }
+
+    pub async fn put_secret(&self, name: &str, spec: &SecretSpec) -> Result<()> {
+        self.send(
+            &format!("apply workload secret {name}"),
+            self.client
+                .put(format!("{}/workload/secrets/{name}", self.base_url))
+                .json(spec),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_secret(&self, name: &str) -> Result<()> {
+        self.send(
+            &format!("remove workload secret {name}"),
+            self.client
+                .delete(format!("{}/workload/secrets/{name}", self.base_url)),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn send(&self, operation: &str, request: RequestBuilder) -> Result<Response> {
         let response = request
             .bearer_auth(&self.token)
@@ -274,6 +362,13 @@ mod tests {
                 command: None,
                 args: Some(vec!["-g".into(), "daemon off;".into()]),
                 env: BTreeMap::from([("LEVEL".into(), "info".into())]),
+                secret_env: BTreeMap::from([(
+                    "DB_PASSWORD".into(),
+                    SecretKeyRef {
+                        secret: "rz-db".into(),
+                        key: "password".into(),
+                    },
+                )]),
                 user: Some(1000),
                 group: None,
                 read_only_root: true,
@@ -294,11 +389,28 @@ mod tests {
                 aliases: vec!["web".into(), "web.store.svc".into()],
             }),
             supplementary_groups: vec![2000],
-            volumes: vec![PodVolume {
-                name: "data".into(),
-                volume: Some("rz-vol".into()),
-                scratch: None,
-            }],
+            volumes: vec![
+                PodVolume {
+                    name: "data".into(),
+                    volume: Some("rz-vol".into()),
+                    scratch: None,
+                    secret: None,
+                },
+                PodVolume {
+                    name: "tls".into(),
+                    volume: None,
+                    scratch: None,
+                    secret: Some(SecretFiles {
+                        name: "rz-tls".into(),
+                        items: Some(vec![SecretItem {
+                            key: "tls.crt".into(),
+                            path: "certs/tls.crt".into(),
+                        }]),
+                        mode: 0o440,
+                        group: Some(2000),
+                    }),
+                },
+            ],
         }
     }
 
@@ -310,8 +422,10 @@ mod tests {
             "containers": [{"name": "web", "unit": "orqos-rz-1-c-web.service", "active_state": "active", "sub_state": "running", "result": "success", "restarts": 2}],
             "spec": {"hostname": "web-0", "restart": "always", "grace_seconds": 30, "labels": {"dev.rezn.owner": "ab"},
                      "network": {"name": "rz-net", "aliases": ["web", "web.store.svc"]},
-                     "supplementary_groups": [2000], "volumes": [{"name": "data", "volume": "rz-vol"}],
+                     "supplementary_groups": [2000], "volumes": [{"name": "data", "volume": "rz-vol"},
+                       {"name": "tls", "secret": {"name": "rz-tls", "items": [{"key": "tls.crt", "path": "certs/tls.crt"}], "mode": 288, "group": 2000}}],
                      "containers": [{"name": "web", "image": "docker.io/library/nginx:1.27-alpine", "args": ["-g", "daemon off;"], "env": {"LEVEL": "info"},
+                                     "secret_env": {"DB_PASSWORD": {"secret": "rz-db", "key": "password"}},
                                      "user": 1000, "read_only_root": true, "drop_all_capabilities": true,
                                      "mounts": [{"volume": "data", "path": "/data", "sub_path": "v1"}]}]},
             "error": null, "updated_at": "2026-11-18T00:00:00Z"

@@ -16,11 +16,15 @@ use tokio::sync::{Mutex, RwLock};
 use utoipa::ToSchema;
 
 use crate::{
-    orqos_client::{ContainerStatus, OrqosClient, PodSpec, PodStatus, VolumeSpec, VolumeStatus},
+    orqos_client::{
+        ContainerStatus, OrqosClient, PodSpec, PodStatus, SecretSpec, SecretStatus, VolumeSpec,
+        VolumeStatus,
+    },
+    secret::SecretStore,
     store::{self, StoredState},
     workload::{
-        self, DesiredVolume, Workload, CLAIM, DEPLOYMENT, KIND, NAMESPACE, ORDINAL, OWNER,
-        RESOURCE, RETAIN, WORKLOAD,
+        self, DesiredObject, DesiredVolume, ObjectSource, Workload, CLAIM, CONTENT, DEPLOYMENT,
+        KIND, NAMESPACE, ORDINAL, OWNER, RESOURCE, RETAIN, WORKLOAD,
     },
 };
 
@@ -43,6 +47,16 @@ struct Observation {
     at: String,
     pods: Vec<Owned>,
     volumes: Vec<OwnedVolume>,
+    objects: Vec<OwnedObject>,
+}
+
+/// An Orqos secret proven to belong to this database: one `config` or `secret` (`kind`) at one content digest.
+#[derive(Clone, Debug)]
+pub struct OwnedObject {
+    pub deployment: String,
+    pub kind: String,
+    pub resource: String,
+    pub status: SecretStatus,
 }
 
 /// A volume proven to belong to this database.
@@ -149,6 +163,9 @@ pub struct PodView {
     pub state: String,
     /// The pod runs the desired spec of the accepted revision.
     pub current: bool,
+    /// What a pod that is not current would change: `config "<name>"` or `secret "<name>"` for each changed input
+    /// it uses, and `pod template` for anything else.
+    pub changes: Vec<String>,
     /// DNS names that resolve to this pod on its namespace network.
     pub aliases: Vec<String>,
     pub containers: Vec<ContainerStatus>,
@@ -163,31 +180,182 @@ pub enum Action {
     Apply(String, PodSpec),
     PutVolume(String, VolumeSpec),
     RemoveVolume(String),
+    /// Create an Orqos secret from a config's data or the secret store (values are read only when it runs).
+    PutSecret(String, BTreeMap<String, String>, ObjectSource),
+    RemoveSecret(String),
 }
 
-/// Desired workloads and volumes of every executable deployment, and the reasons of the others.
-fn desired(state: &StoredState) -> Result<(Vec<Workload>, Vec<DesiredVolume>, Reasons)> {
-    let mut workloads = Vec::new();
-    let mut volumes = Vec::new();
-    let mut unexecuted = BTreeMap::new();
+/// What the accepted programs want.
+struct Desired {
+    workloads: Vec<Workload>,
+    volumes: Vec<DesiredVolume>,
+    objects: Vec<DesiredObject>,
+    unexecuted: Reasons,
+}
+
+/// Desired workloads, volumes and objects of every executable deployment, and the reasons of the others.
+fn desired(state: &StoredState, secrets: &SecretStore) -> Result<Desired> {
+    let mut desired = Desired {
+        workloads: Vec::new(),
+        volumes: Vec::new(),
+        objects: Vec::new(),
+        unexecuted: BTreeMap::new(),
+    };
     let programs = state.desired()?;
+    let mut stored = BTreeMap::new();
     for (name, program) in &programs {
+        if !stored.contains_key(&program.namespace) {
+            let versions = secrets
+                .program_versions(&program.namespace)
+                .context("reading the secret store")?;
+            stored.insert(program.namespace.clone(), versions);
+        }
         // `/apply` refuses colliding names; this covers state stored before that check.
         let collisions = workload::collisions(name, program, &programs);
-        match workload::translate(&state.owner, program) {
+        match workload::translate(&state.owner, program, &stored[&program.namespace]) {
             Ok(t) if collisions.is_empty() => {
-                workloads.extend(t.workloads);
-                volumes.extend(t.volumes);
+                desired.workloads.extend(t.workloads);
+                desired.volumes.extend(t.volumes);
+                desired.objects.extend(t.objects);
             }
             Ok(_) => {
-                unexecuted.insert(name.clone(), collisions);
+                desired.unexecuted.insert(name.clone(), collisions);
             }
             Err(reasons) => {
-                unexecuted.insert(name.clone(), [collisions, reasons].concat());
+                desired
+                    .unexecuted
+                    .insert(name.clone(), [collisions, reasons].concat());
             }
         }
     }
-    Ok((workloads, volumes, unexecuted))
+    Ok(desired)
+}
+
+/// Proves ownership of Orqos secrets like [`owned_volumes`]: the ID must recompute from the labels.
+pub fn owned_objects(owner: &str, secrets: Vec<SecretStatus>) -> Result<Vec<OwnedObject>> {
+    let mut result = Vec::new();
+    for secret in secrets {
+        let labels = &secret.labels;
+        if labels.get(OWNER).map(String::as_str) != Some(owner) {
+            continue;
+        }
+        let label = |key: &str| {
+            labels
+                .get(key)
+                .with_context(|| format!("secret {} lacks ownership label {key}", secret.name))
+        };
+        let deployment = label(DEPLOYMENT)?.clone();
+        let kind = label(KIND)?.clone();
+        let resource = label(RESOURCE)?.clone();
+        let content = label(CONTENT)?;
+        ensure!(
+            ir_v2::is_name(&deployment, 63)
+                && ir_v2::is_name(label(NAMESPACE)?, 63)
+                && ir_v2::is_name(&resource, 63)
+                && matches!(kind.as_str(), "config" | "secret")
+                && store::is_identity(content),
+            "secret {} has malformed ownership labels",
+            secret.name
+        );
+        ensure!(
+            secret.name == workload::object_id(owner, &deployment, &kind, &resource, content),
+            "secret {} claims this owner but its name does not match its labels",
+            secret.name
+        );
+        result.push(OwnedObject {
+            deployment,
+            kind,
+            resource,
+            status: secret,
+        });
+    }
+    result.sort_by(|a, b| a.status.name.cmp(&b.status.name));
+    Ok(result)
+}
+
+/// Orqos secret changes: desired ones that are missing (or whose labels differ) are put before any pod change;
+/// owned ones nobody wants are removed once no pod uses them. Unexecuted deployments' objects stay.
+pub fn plan_objects(
+    objects: &[DesiredObject],
+    unexecuted: &Reasons,
+    observed: &[OwnedObject],
+) -> (Vec<Action>, Vec<Action>) {
+    let by_id: BTreeMap<&str, &OwnedObject> = observed
+        .iter()
+        .map(|o| (o.status.name.as_str(), o))
+        .collect();
+    let puts = objects
+        .iter()
+        .filter(|o| {
+            by_id
+                .get(o.id.as_str())
+                .is_none_or(|seen| seen.status.labels != o.labels)
+        })
+        .map(|o| Action::PutSecret(o.id.clone(), o.labels.clone(), o.source.clone()))
+        .collect();
+    let wanted: BTreeSet<&str> = objects.iter().map(|o| o.id.as_str()).collect();
+    let removes = observed
+        .iter()
+        .filter(|o| {
+            !wanted.contains(o.status.name.as_str())
+                && !unexecuted.contains_key(&o.deployment)
+                && o.status.pods.is_empty()
+        })
+        .map(|o| Action::RemoveSecret(o.status.name.clone()))
+        .collect();
+    (puts, removes)
+}
+
+/// The Orqos secret IDs a pod spec uses.
+fn object_refs(spec: &PodSpec) -> BTreeSet<&str> {
+    spec.volumes
+        .iter()
+        .filter_map(|v| v.secret.as_ref().map(|s| s.name.as_str()))
+        .chain(
+            spec.containers
+                .iter()
+                .flat_map(|c| c.secret_env.values().map(|r| r.secret.as_str())),
+        )
+        .collect()
+}
+
+/// What replacing `observed` with `desired` changes: each changed config or secret it uses, by name (from
+/// `inputs`, Orqos secret ID to `kind "name"`), and `pod template` when anything else differs.
+pub fn changes(
+    desired: &PodSpec,
+    observed: &PodSpec,
+    inputs: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut changes: Vec<String> = object_refs(desired)
+        .difference(&object_refs(observed))
+        .map(|id| inputs.get(*id).cloned().unwrap_or_else(|| id.to_string()))
+        .collect();
+    // Compare the specs with each object ID replaced by the input it stands for.
+    let normalize = |spec: &PodSpec| {
+        let mut spec = spec.clone();
+        let name = |id: &mut String| {
+            if let Some(input) = inputs.get(id.as_str()) {
+                *id = input.clone();
+            }
+        };
+        for v in &mut spec.volumes {
+            if let Some(s) = &mut v.secret {
+                name(&mut s.name);
+            }
+        }
+        for c in &mut spec.containers {
+            for r in c.secret_env.values_mut() {
+                name(&mut r.secret);
+            }
+        }
+        spec
+    };
+    if normalize(desired) != normalize(observed) {
+        changes.push("pod template".into());
+    }
+    changes.sort();
+    changes.dedup();
+    changes
 }
 
 /// Proves volume ownership locally, like [`owned`]: volumes of other owners are ignored; one claiming this owner
@@ -493,23 +661,59 @@ fn volumes_converged(
     puts.is_empty() && removes.is_empty()
 }
 
+/// Executed deployments match what Orqos runs: pods, volumes and objects, with nothing left to remove.
+fn executed_matches(desired: &Desired, observation: &Observation) -> bool {
+    let (puts, removes) = plan_objects(&desired.objects, &desired.unexecuted, &observation.objects);
+    executed_converged(&desired.workloads, &desired.unexecuted, &observation.pods)
+        && volumes_converged(
+            &desired.workloads,
+            &desired.volumes,
+            &desired.unexecuted,
+            &observation.volumes,
+        )
+        && puts.is_empty()
+        && removes.is_empty()
+}
+
 /// Converged: every deployment is executed and matches what Orqos runs.
-fn converged(
-    workloads: &[Workload],
-    volumes: &[DesiredVolume],
-    unexecuted: &Reasons,
-    observation: &Observation,
-) -> bool {
-    unexecuted.is_empty()
-        && executed_converged(workloads, unexecuted, &observation.pods)
-        && volumes_converged(workloads, volumes, unexecuted, &observation.volumes)
+fn converged(desired: &Desired, observation: &Observation) -> bool {
+    desired.unexecuted.is_empty() && executed_matches(desired, observation)
+}
+
+/// The base64 values of an Orqos secret. Secret values must still have the versions planned.
+fn object_data(source: &ObjectSource, secrets: &SecretStore) -> Result<BTreeMap<String, String>> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    match source {
+        ObjectSource::Config(data) => Ok(data
+            .iter()
+            .map(|(k, v)| (k.clone(), STANDARD.encode(v)))
+            .collect()),
+        ObjectSource::Secret {
+            namespace,
+            name,
+            versions,
+        } => {
+            let mut data = BTreeMap::new();
+            for (key, version) in versions {
+                let current = secrets.get_program(namespace, name, key)?;
+                let Some((value, current)) = current.filter(|(_, v)| v == version) else {
+                    bail!("key {key:?} of secret {namespace}/{name} changed during the pass; retrying");
+                };
+                debug_assert_eq!(&current, version);
+                data.insert(key.clone(), STANDARD.encode(value));
+            }
+            Ok(data)
+        }
+    }
 }
 
 impl Controller {
-    pub async fn status(&self, db: &sled::Db) -> Result<Status> {
+    pub async fn status(&self, db: &sled::Db, secrets: &SecretStore) -> Result<Status> {
         let _intent = self.intent.lock().await;
         let state = store::load(db)?;
-        let (workloads, volumes, unexecuted) = desired(&state)?;
+        let wanted = desired(&state, secrets)?;
+        let (workloads, volumes, unexecuted) =
+            (&wanted.workloads, &wanted.volumes, &wanted.unexecuted);
         let progress = self.progress.read().await;
         let observed = progress.observation.as_ref();
         let pending = observed.is_some_and(|o| o.revision != state.revision);
@@ -525,6 +729,29 @@ impl Controller {
         for pod in observed.map(|o| o.pods.as_slice()).unwrap_or_default() {
             rows.entry(pod.workload()).or_default().1.push(pod);
         }
+        // Orqos secret IDs, desired or observed, to the input they stand for.
+        let inputs: BTreeMap<String, String> = wanted
+            .objects
+            .iter()
+            .map(|o| {
+                (
+                    o.id.clone(),
+                    format!("{} {:?}", o.labels[KIND], o.labels[RESOURCE]),
+                )
+            })
+            .chain(
+                observed
+                    .map(|o| o.objects.as_slice())
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|o| {
+                        (
+                            o.status.name.clone(),
+                            format!("{} {:?}", o.kind, o.resource),
+                        )
+                    }),
+            )
+            .collect();
         Ok(Status {
             owner: state.owner.clone(),
             desired_revision: state.revision,
@@ -544,7 +771,7 @@ impl Controller {
             converged: !progress.stale
                 && !pending
                 && progress.errors.is_empty()
-                && observed.is_some_and(|o| converged(&workloads, &volumes, &unexecuted, o)),
+                && observed.is_some_and(|o| converged(&wanted, o)),
             errors: progress.errors.clone(),
             unexecuted: unexecuted
                 .iter()
@@ -574,6 +801,9 @@ impl Controller {
                                 hostname: p.status.spec.hostname.clone(),
                                 state: p.status.state.clone(),
                                 current: desired_spec(&p.status.id) == Some(&p.status.spec),
+                                changes: desired_spec(&p.status.id)
+                                    .map(|spec| changes(spec, &p.status.spec, &inputs))
+                                    .unwrap_or_default(),
                                 aliases: p
                                     .status
                                     .spec
@@ -610,7 +840,7 @@ impl Controller {
                         )
                     })
                     .collect();
-                for v in &volumes {
+                for v in volumes {
                     let labels = &v.spec.labels;
                     views.entry(v.id.clone()).or_insert_with(|| VolumeView {
                         id: v.id.clone(),
@@ -629,10 +859,15 @@ impl Controller {
         })
     }
 
-    pub async fn reconcile(&self, db: &sled::Db, orqos: &OrqosClient) -> Result<()> {
+    pub async fn reconcile(
+        &self,
+        db: &sled::Db,
+        secrets: &SecretStore,
+        orqos: &OrqosClient,
+    ) -> Result<()> {
         let _pass = self.gate.lock().await;
         self.progress.write().await.last_attempt = Some(Utc::now().to_rfc3339());
-        let result = self.pass(db, orqos).await;
+        let result = self.pass(db, secrets, orqos).await;
         if let Err(error) = &result {
             let mut progress = self.progress.write().await;
             progress.stale = true;
@@ -656,11 +891,19 @@ impl Controller {
                 .await
                 .context("required volume observation failed")?,
         )?;
+        let objects = owned_objects(
+            &state.owner,
+            orqos
+                .list_secrets()
+                .await
+                .context("required secret observation failed")?,
+        )?;
         let observation = Observation {
             revision: state.revision,
             at: Utc::now().to_rfc3339(),
             pods,
             volumes,
+            objects,
         };
         let mut progress = self.progress.write().await;
         progress.observation = Some(observation.clone());
@@ -668,39 +911,87 @@ impl Controller {
         Ok(observation)
     }
 
-    async fn pass(&self, db: &sled::Db, orqos: &OrqosClient) -> Result<()> {
+    /// Runs every action (pods are independent, so one failure does not block the others) and returns the
+    /// failures.
+    async fn execute(
+        &self,
+        actions: &[Action],
+        secrets: &SecretStore,
+        orqos: &OrqosClient,
+    ) -> Vec<String> {
+        let mut failures = Vec::new();
+        for action in actions {
+            let result = match action {
+                Action::Remove(id) => orqos.delete_pod(id).await,
+                Action::Apply(id, spec) => orqos.put_pod(id, spec).await,
+                Action::PutVolume(id, spec) => orqos.put_volume(id, spec).await,
+                Action::RemoveVolume(id) => orqos.delete_volume(id).await,
+                Action::PutSecret(id, labels, source) => match object_data(source, secrets) {
+                    Ok(data) => {
+                        let spec = SecretSpec {
+                            data,
+                            labels: labels.clone(),
+                        };
+                        orqos.put_secret(id, &spec).await
+                    }
+                    Err(error) => Err(error),
+                },
+                Action::RemoveSecret(id) => orqos.delete_secret(id).await,
+            };
+            if let Err(error) = result {
+                failures.push(format!("{error:#}"));
+            }
+        }
+        failures
+    }
+
+    async fn pass(&self, db: &sled::Db, secrets: &SecretStore, orqos: &OrqosClient) -> Result<()> {
         // Validate the complete persisted snapshot before observation or mutation.
         let state = store::load(db)?;
-        let (workloads, volumes, unexecuted) = desired(&state)?;
+        let wanted = desired(&state, secrets)?;
         let observation = self.observe(&state, orqos).await?;
         // If apply won the race during observation, start again with its snapshot.
         ensure!(
             store::load(db)?.revision == state.revision,
             "intent changed during observation; retry pending revision"
         );
-        // Volumes first (pods mount them), then pods, then volume removals (only volumes no pod mounts).
-        let (mut actions, removals) =
-            plan_volumes(&workloads, &volumes, &unexecuted, &observation.volumes);
-        actions.extend(plan(&workloads, &unexecuted, &observation.pods));
-        actions.extend(removals);
-        // Pods are independent: one failing pod must not block the others, so every action is attempted.
-        let mut failures = Vec::new();
-        for action in &actions {
-            let result = match action {
-                Action::Remove(id) => orqos.delete_pod(id).await,
-                Action::Apply(id, spec) => orqos.put_pod(id, spec).await,
-                Action::PutVolume(id, spec) => orqos.put_volume(id, spec).await,
-                Action::RemoveVolume(id) => orqos.delete_volume(id).await,
-            };
-            if let Err(error) = result {
-                failures.push(format!("{error:#}"));
-            }
-        }
-        let after = if actions.is_empty() {
+        // Volumes and objects first (pods use them), then pods, then removals of what no pod uses.
+        let (mut actions, volume_removals) = plan_volumes(
+            &wanted.workloads,
+            &wanted.volumes,
+            &wanted.unexecuted,
+            &observation.volumes,
+        );
+        let (object_puts, object_removals) =
+            plan_objects(&wanted.objects, &wanted.unexecuted, &observation.objects);
+        actions.extend(object_puts);
+        actions.extend(plan(
+            &wanted.workloads,
+            &wanted.unexecuted,
+            &observation.pods,
+        ));
+        actions.extend(volume_removals);
+        actions.extend(object_removals);
+        let mut failures = self.execute(&actions, secrets, orqos).await;
+        let mut after = if actions.is_empty() {
             Ok(observation)
         } else {
             self.observe(&state, orqos).await
         };
+        // Replaced or removed pods may have released objects and volumes: remove those in the same pass.
+        if let (Ok(seen), true) = (&after, failures.is_empty()) {
+            let (_, mut cleanup) = plan_volumes(
+                &wanted.workloads,
+                &wanted.volumes,
+                &wanted.unexecuted,
+                &seen.volumes,
+            );
+            cleanup.extend(plan_objects(&wanted.objects, &wanted.unexecuted, &seen.objects).1);
+            if !cleanup.is_empty() {
+                failures.extend(self.execute(&cleanup, secrets, orqos).await);
+                after = self.observe(&state, orqos).await;
+            }
+        }
         // Preserve both mutation failures and a failed follow-up observation.
         match after {
             Err(observation) => {
@@ -710,9 +1001,8 @@ impl Controller {
             Ok(_) if !failures.is_empty() => bail!("{}", failures.join("; ")),
             // Unexecuted deployments are not errors (status lists them); the executed ones must converge.
             Ok(after) => ensure!(
-                executed_converged(&workloads, &unexecuted, &after.pods)
-                    && volumes_converged(&workloads, &volumes, &unexecuted, &after.volumes),
-                "observed pods and volumes have not converged; retrying on next pass"
+                executed_matches(&wanted, &after),
+                "observed pods, volumes and secrets have not converged; retrying on next pass"
             ),
         }
         self.progress.write().await.errors.clear();
@@ -724,7 +1014,11 @@ pub async fn run(app: Arc<crate::AppState>, interval: std::time::Duration) {
     let mut timer = tokio::time::interval(interval);
     loop {
         tokio::select! { _ = timer.tick() => {}, _ = app.controller.trigger.notified() => {} }
-        if let Err(error) = app.controller.reconcile(&app.db, &app.orqos).await {
+        if let Err(error) = app
+            .controller
+            .reconcile(&app.db, &app.secret_store, &app.orqos)
+            .await
+        {
             tracing::error!("reconciliation failed: {error:#}");
         }
     }

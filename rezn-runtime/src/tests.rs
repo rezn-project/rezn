@@ -25,6 +25,8 @@ struct Engine {
     pods: BTreeMap<String, Value>,
     /// Owned volumes by name: their spec.
     volumes: BTreeMap<String, Value>,
+    /// Owned secrets by name: their spec (`data` and `labels`).
+    secrets: BTreeMap<String, Value>,
     fail_list: bool,
     fail_put: Option<&'static str>,
     /// State of newly applied pods; `running` when unset.
@@ -39,6 +41,13 @@ impl Engine {
         let path = request.uri.path();
         if let Some(rest) = path.strip_prefix("/workload/volumes") {
             return self.volume(
+                request.method.as_str(),
+                rest.trim_start_matches('/'),
+                &request.body,
+            );
+        }
+        if let Some(rest) = path.strip_prefix("/workload/secrets") {
+            return self.secret(
                 request.method.as_str(),
                 rest.trim_start_matches('/'),
                 &request.body,
@@ -67,6 +76,14 @@ impl Engine {
                                 format!(r#"{{"error":"unknown volume {name}"}}"#),
                             );
                         }
+                    }
+                }
+                for name in Self::secret_refs(&spec) {
+                    if !self.secrets.contains_key(&name) {
+                        return (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            format!(r#"{{"error":"unknown secret {name}"}}"#),
+                        );
                     }
                 }
                 let containers: Vec<Value> = spec["containers"]
@@ -125,6 +142,70 @@ impl Engine {
             }
             ("DELETE", _) if self.volumes.remove(name).is_some() => (StatusCode::OK, "{}".into()),
             ("DELETE", _) => (StatusCode::NOT_FOUND, r#"{"error":"no such volume"}"#.into()),
+            _ => (StatusCode::NOT_FOUND, "unknown route".into()),
+        }
+    }
+
+    /// Orqos secrets a pod spec uses.
+    fn secret_refs(spec: &Value) -> Vec<String> {
+        let files = spec["volumes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v["secret"]["name"].as_str());
+        let env = spec["containers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c["secret_env"].as_object())
+            .flat_map(|e| e.values().filter_map(|r| r["secret"].as_str()));
+        files.chain(env).map(String::from).collect()
+    }
+
+    fn secret(&mut self, method: &str, name: &str, body: &[u8]) -> (StatusCode, String) {
+        let using = |engine: &Self| -> Vec<String> {
+            engine
+                .pods
+                .iter()
+                .filter(|(_, pod)| Self::secret_refs(&pod["spec"]).iter().any(|s| s == name))
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        match (method, name) {
+            ("GET", "") if self.fail_list => (StatusCode::SERVICE_UNAVAILABLE, "systemd unavailable".into()),
+            ("GET", "") => (
+                StatusCode::OK,
+                json!(self
+                    .secrets
+                    .iter()
+                    .map(|(n, spec)| {
+                        let pods: Vec<String> = self
+                            .pods
+                            .iter()
+                            .filter(|(_, pod)| Self::secret_refs(&pod["spec"]).contains(n))
+                            .map(|(id, _)| id.clone())
+                            .collect();
+                        json!({"name": n, "keys": spec["data"].as_object().unwrap().keys().collect::<Vec<_>>(),
+                               "labels": spec["labels"], "pods": pods})
+                    })
+                    .collect::<Vec<_>>())
+                .to_string(),
+            ),
+            ("PUT", _) if !name.is_empty() => {
+                let spec: Value = serde_json::from_slice(body).unwrap();
+                if let Some(existing) = self.secrets.get(name) {
+                    if existing["data"] != spec["data"] {
+                        return (StatusCode::CONFLICT, r#"{"error":"immutable"}"#.into());
+                    }
+                }
+                self.secrets.insert(name.into(), spec);
+                (StatusCode::OK, "{}".into())
+            }
+            ("DELETE", _) if !using(self).is_empty() => {
+                (StatusCode::CONFLICT, r#"{"error":"in use"}"#.into())
+            }
+            ("DELETE", _) if self.secrets.remove(name).is_some() => (StatusCode::OK, "{}".into()),
+            ("DELETE", _) => (StatusCode::NOT_FOUND, r#"{"error":"no such secret"}"#.into()),
             _ => (StatusCode::NOT_FOUND, "unknown route".into()),
         }
     }
@@ -213,11 +294,17 @@ fn delete(id: String) -> (Method, String) {
 }
 
 async fn reconcile(app: &Arc<crate::AppState>) -> anyhow::Result<()> {
-    app.controller.reconcile(&app.db, &app.orqos).await
+    app.controller
+        .reconcile(&app.db, &app.secret_store, &app.orqos)
+        .await
 }
 
 async fn converged(app: &Arc<crate::AppState>) -> crate::reconcile::Status {
-    let status = app.controller.status(&app.db).await.unwrap();
+    let status = app
+        .controller
+        .status(&app.db, &app.secret_store)
+        .await
+        .unwrap();
     assert!(
         status.converged,
         "{:?} {:?}",
@@ -399,7 +486,11 @@ async fn lifecycle_create_reapply_scale_rolling_replace_and_remove() {
     let error = reconcile(&app).await.unwrap_err();
     assert!(error.to_string().contains("not converged"), "{error:#}");
     assert_eq!(mutations(&backend, before), vec![put(web(1))]);
-    let status = app.controller.status(&app.db).await.unwrap();
+    let status = app
+        .controller
+        .status(&app.db, &app.secret_store)
+        .await
+        .unwrap();
     assert_eq!(
         status.workloads[0]
             .pods
@@ -449,7 +540,9 @@ fn ordered_workload(replicas: u32, management: &str) -> Workload {
         json!([ordered_set("db", replicas, management), headless("db")]),
     ))
     .unwrap();
-    let workloads = translate(&"0".repeat(64), &program).unwrap().workloads;
+    let workloads = translate(&"0".repeat(64), &program, &Default::default())
+        .unwrap()
+        .workloads;
     assert_eq!(workloads[0].kind, Kind::OrderedReplicaSet);
     workloads.into_iter().next().unwrap()
 }
@@ -586,7 +679,11 @@ async fn unexecuted_deployments_report_reasons_and_keep_their_pods() {
     .await;
     reconcile(&app).await.unwrap();
     assert!(mutations(&backend, before).is_empty());
-    let status = app.controller.status(&app.db).await.unwrap();
+    let status = app
+        .controller
+        .status(&app.db, &app.secret_store)
+        .await
+        .unwrap();
     assert!(!status.converged);
     assert!(status.errors.is_empty());
     assert_eq!(status.unexecuted.len(), 2);
@@ -610,7 +707,11 @@ async fn unexecuted_deployments_report_reasons_and_keep_their_pods() {
     apply(&app, "shop", program("shop", json!([probed]))).await;
     reconcile(&app).await.unwrap();
     assert!(mutations(&backend, before).is_empty());
-    let status = app.controller.status(&app.db).await.unwrap();
+    let status = app
+        .controller
+        .status(&app.db, &app.secret_store)
+        .await
+        .unwrap();
     let shop = status
         .workloads
         .iter()
@@ -790,14 +891,14 @@ async fn volumes_come_before_pods_and_follow_their_retention() {
         2000
     );
 
-    // Scale down: the pod goes first; its volume (on_scale_down: false) once nothing mounts it.
+    // Scale down: the pod goes first; its volume (on_scale_down: false) in the same pass, once nothing mounts it.
     apply(&app, "data", stateful(1, true)).await;
     let before = backend.requests().len();
-    reconcile(&app).await.unwrap_err();
-    assert_eq!(changes(&backend, before), [(Method::DELETE, db(1))]);
-    let before = backend.requests().len();
     reconcile(&app).await.unwrap();
-    assert_eq!(changes(&backend, before), [(Method::DELETE, data(1))]);
+    assert_eq!(
+        changes(&backend, before),
+        [(Method::DELETE, db(1)), (Method::DELETE, data(1))]
+    );
     converged(&app).await;
 
     // Scale up creates the volume again, before the pod.
@@ -811,7 +912,7 @@ async fn volumes_come_before_pods_and_follow_their_retention() {
 
     // Removing the deployment keeps retained volumes (the claim always; replicas with on_removal: true).
     apply(&app, "data", program("data", json!([]))).await;
-    let _ = reconcile(&app).await;
+    reconcile(&app).await.unwrap();
     let before = backend.requests().len();
     reconcile(&app).await.unwrap();
     assert!(changes(&backend, before).is_empty());
@@ -834,7 +935,6 @@ async fn volumes_come_before_pods_and_follow_their_retention() {
         2
     );
     apply(&app, "data", program("data", json!([]))).await;
-    let _ = reconcile(&app).await;
     let before = backend.requests().len();
     reconcile(&app).await.unwrap();
     let mut deleted: Vec<String> = changes(&backend, before)
@@ -845,7 +945,8 @@ async fn volumes_come_before_pods_and_follow_their_retention() {
         })
         .collect();
     deleted.sort();
-    let mut expected = vec![data(0), data(1)];
+    // One pass removes the pods and then the volumes they released.
+    let mut expected = vec![db(0), db(1), data(0), data(1)];
     expected.sort();
     assert_eq!(deleted, expected);
     let status = converged(&app).await;
@@ -899,7 +1000,11 @@ async fn colliding_names_in_a_shared_namespace_are_refused_or_left_unexecuted() 
     let before = backend.requests().len();
     let _ = reconcile(&app).await;
     assert!(mutations(&backend, before).is_empty());
-    let status = app.controller.status(&app.db).await.unwrap();
+    let status = app
+        .controller
+        .status(&app.db, &app.secret_store)
+        .await
+        .unwrap();
     let unexecuted: Vec<(&str, &str)> = status
         .unexecuted
         .iter()
@@ -930,7 +1035,11 @@ async fn restart_recovery_and_stopped_or_failed_pods() {
     // A restarted Rezn (new controller, same database) adopts nothing new and changes nothing.
     let app = app(backend.client.clone(), Some(first.db.as_ref().clone()));
     assert_eq!(
-        app.controller.status(&app.db).await.unwrap().observation,
+        app.controller
+            .status(&app.db, &app.secret_store)
+            .await
+            .unwrap()
+            .observation,
         "unknown"
     );
     let before = backend.requests().len();
@@ -951,7 +1060,11 @@ async fn restart_recovery_and_stopped_or_failed_pods() {
     let before = backend.requests().len();
     assert!(reconcile(&app).await.is_err());
     assert!(mutations(&backend, before).is_empty());
-    let status = app.controller.status(&app.db).await.unwrap();
+    let status = app
+        .controller
+        .status(&app.db, &app.secret_store)
+        .await
+        .unwrap();
     assert_eq!(status.workloads[0].running_replicas, Some(1));
     assert_eq!(status.workloads[0].pods[1].state, "failed");
     assert!(!status.converged);
@@ -1023,7 +1136,11 @@ async fn foreign_pods_are_untouched_and_unproven_ownership_blocks_every_change()
         assert!(error.contains(expected), "{expected}: {error}");
         assert!(mutations(&backend, before).is_empty());
         assert_eq!(
-            app.controller.status(&app.db).await.unwrap().observation,
+            app.controller
+                .status(&app.db, &app.secret_store)
+                .await
+                .unwrap()
+                .observation,
             "stale"
         );
         engine.lock().unwrap().pods.remove(pod_id);
@@ -1050,7 +1167,11 @@ async fn backend_failures_propagate_and_the_next_pass_recovers() {
         "{error}"
     );
     assert!(mutations(&backend, 0).is_empty());
-    let status = app.controller.status(&app.db).await.unwrap();
+    let status = app
+        .controller
+        .status(&app.db, &app.secret_store)
+        .await
+        .unwrap();
     assert!(!status.converged && status.workloads[0].running_replicas.is_none());
 
     // Every pod is attempted, and each failure keeps Orqos's status and message.
@@ -1063,7 +1184,11 @@ async fn backend_failures_propagate_and_the_next_pass_recovers() {
         error.contains("HTTP 409") && error.contains("units exist without ownership"),
         "{error}"
     );
-    let status = app.controller.status(&app.db).await.unwrap();
+    let status = app
+        .controller
+        .status(&app.db, &app.secret_store)
+        .await
+        .unwrap();
     assert_eq!(status.errors, vec![error]);
     assert_eq!(status.observation, "stale");
 
@@ -1101,7 +1226,11 @@ async fn failed_follow_up_observation_keeps_a_stale_snapshot_and_retry_does_not_
     .await;
     let error = format!("{:#}", reconcile(&app).await.unwrap_err());
     assert!(error.contains("follow-up observation"), "{error}");
-    let stale = app.controller.status(&app.db).await.unwrap();
+    let stale = app
+        .controller
+        .status(&app.db, &app.secret_store)
+        .await
+        .unwrap();
     assert_eq!(stale.observation, "stale");
     assert_eq!(stale.workloads[0].running_replicas, Some(0));
     let before = backend.requests().len();
@@ -1144,7 +1273,11 @@ async fn older_observation_cannot_report_convergence_of_newer_intent_and_passes_
     .await;
     release.notify_one();
     assert!(first.await.unwrap().is_err());
-    let pending = app.controller.status(&app.db).await.unwrap();
+    let pending = app
+        .controller
+        .status(&app.db, &app.secret_store)
+        .await
+        .unwrap();
     assert!(!pending.converged);
     assert_ne!(pending.observed_revision, Some(pending.desired_revision));
     wait_for(&entered).await;
@@ -1157,7 +1290,13 @@ async fn older_observation_cannot_report_convergence_of_newer_intent_and_passes_
     assert_eq!(pod_listings(&backend), 2);
     release.notify_one();
     second.await.unwrap().unwrap();
-    assert!(app.controller.status(&app.db).await.unwrap().converged);
+    assert!(
+        app.controller
+            .status(&app.db, &app.secret_store)
+            .await
+            .unwrap()
+            .converged
+    );
 }
 
 #[tokio::test]
@@ -1190,7 +1329,11 @@ async fn successful_older_pass_during_apply_cannot_claim_newer_convergence() {
     apply(&app, "shop", program("shop", json!([]))).await;
     release.notify_one();
     pass.await.unwrap().unwrap();
-    let pending = app.controller.status(&app.db).await.unwrap();
+    let pending = app
+        .controller
+        .status(&app.db, &app.secret_store)
+        .await
+        .unwrap();
     assert_eq!(pending.observation, "pending");
     assert!(!pending.converged);
     assert_eq!(pending.workloads[0].desired_replicas, None);
@@ -1208,7 +1351,13 @@ async fn apply_wakes_the_worker_without_waiting_for_the_periodic_interval() {
         std::time::Duration::from_secs(3600),
     ));
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while !app.controller.status(&app.db).await.unwrap().converged {
+        while !app
+            .controller
+            .status(&app.db, &app.secret_store)
+            .await
+            .unwrap()
+            .converged
+        {
             tokio::task::yield_now().await;
         }
         apply(
@@ -1217,7 +1366,13 @@ async fn apply_wakes_the_worker_without_waiting_for_the_periodic_interval() {
             program("shop", json!([replica_set("web", 1, "a")])),
         )
         .await;
-        while !app.controller.status(&app.db).await.unwrap().converged {
+        while !app
+            .controller
+            .status(&app.db, &app.secret_store)
+            .await
+            .unwrap()
+            .converged
+        {
             tokio::task::yield_now().await;
         }
     })
@@ -1454,4 +1609,352 @@ fn shared_jcs_and_ed25519_fixture_matches_the_dsl_verifier() {
     }
     wrapper.program.as_array_mut().unwrap().reverse();
     assert!(crate::intent::verify(&wrapper).is_err());
+}
+
+/// A program with a config, a stored secret, a random secret, a workload using all three and one using none.
+fn configured(settings: &str) -> Value {
+    program(
+        "conf",
+        json!([
+            {"kind": "config", "name": "settings", "fields": {"data": {"app.json": settings, "ca.crt": "CA"}}},
+            {"kind": "secret", "name": "db", "fields": {"type": "opaque", "keys": ["password"], "source": {"store": {}}}},
+            {"kind": "secret", "name": "app", "fields": {"type": "opaque", "keys": ["token"],
+                "source": {"random": {"token": {"length": 24, "alphabet": "hex"}}}}},
+            {"kind": "replica_set", "name": "api", "fields": {"replicas": 2, "pod": {
+                "fs_group": 2000,
+                "volumes": [
+                    {"name": "settings", "config": {"name": "settings", "items": [{"key": "app.json", "path": "conf/app.json"}]}},
+                    {"name": "creds", "secret": {"name": "db", "mode": 288}}
+                ],
+                "containers": [{"name": "api", "image": "docker.io/library/alpine:3.22", "command": ["sleep", "infinity"],
+                    "env": [{"name": "DB_PASSWORD", "secret": {"name": "db", "key": "password"}},
+                            {"name": "TOKEN", "secret": {"name": "app", "key": "token"}}],
+                    "mounts": [{"volume": "settings", "path": "/etc/api"}, {"volume": "creds", "path": "/run/creds"}]}]}}},
+            replica_set("other", 1, "info")
+        ]),
+    )
+}
+
+#[tokio::test]
+async fn configs_and_secrets_flow_through_the_store_and_replace_only_their_users() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let (backend, engine) = backend().await;
+    let app = app(backend.client.clone(), None);
+    let http = HttpRezn::start(app.clone()).await;
+    let client = reqwest::Client::new();
+    let url = |path: &str| format!("{}{path}", http.url);
+    let apply_raw = |program: Value| {
+        let request = client
+            .post(url("/apply"))
+            .json(&json!({"name": "conf", "instruction_wrapper": signed(program)}));
+        async move {
+            let response = request.send().await.unwrap();
+            (response.status(), response.text().await.unwrap())
+        }
+    };
+    let put_secret = |name: &str, data: Value| {
+        let request = client
+            .put(url(&format!("/namespaces/apps/secrets/{name}")))
+            .json(&json!({"data": data}));
+        async move {
+            let response = request.send().await.unwrap();
+            (response.status(), response.text().await.unwrap())
+        }
+    };
+
+    // A referenced stored key that is missing fails the revision before anything is stored.
+    let (code, body) = apply_raw(configured("{}")).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains(r#"key "password" of secret "db" is not in the secret store (set it with PUT /namespaces/apps/secrets/db)"#), "{body}");
+    assert!(
+        app.secret_store
+            .program_versions("apps")
+            .unwrap()
+            .is_empty(),
+        "nothing generated by a refused apply"
+    );
+    let (code, body) = put_secret("db", json!({"password": "line\nbreak"})).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let (code, body) = apply_raw(configured("{}")).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("control characters"), "{body}");
+    let (code, _) = put_secret("db", json!({"password": "pw-one"})).await;
+    assert_eq!(code, StatusCode::OK);
+    let (code, body) = apply_raw(configured("{}")).await;
+    assert_eq!(code, StatusCode::ACCEPTED, "{body}");
+
+    // The random key was generated once; the listing shows keys and versions, never values.
+    let listed: Value = client
+        .get(url("/namespaces/apps/secrets"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed[0]["name"], "app");
+    assert_eq!(listed[0]["source"], "random");
+    assert_eq!(listed[0]["keys"][0]["key"], "token");
+    assert_eq!(listed[1]["missing"], json!([]));
+    let token = app
+        .secret_store
+        .get_program("apps", "app", "token")
+        .unwrap()
+        .unwrap()
+        .0;
+    assert!(token.len() == 24 && token.iter().all(u8::is_ascii_hexdigit));
+    assert!(!listed.to_string().contains("pw-one"));
+    let (code, body) = put_secret("app", json!({"token": "mine"})).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    let gone = client
+        .delete(url("/namespaces/apps/secrets/db"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status(), StatusCode::CONFLICT);
+
+    // Objects first, then pods. Their data is the config's and the store's.
+    reconcile(&app).await.unwrap();
+    let requests = changes(&backend, 0);
+    let objects: Vec<&String> = requests
+        .iter()
+        .filter(|(m, p)| *m == Method::PUT && p.starts_with("/workload/secrets/"))
+        .map(|(_, p)| p)
+        .collect();
+    assert_eq!(objects.len(), 3);
+    let first_pod = requests
+        .iter()
+        .position(|(_, p)| p.starts_with("/workload/pods/"))
+        .unwrap();
+    assert!(requests[..first_pod]
+        .iter()
+        .all(|(_, p)| p.starts_with("/workload/secrets/")));
+    let status = converged(&app).await;
+    let api = |status: &crate::reconcile::Status| -> Vec<String> {
+        status
+            .workloads
+            .iter()
+            .find(|w| w.resource == "api")
+            .unwrap()
+            .pods
+            .iter()
+            .map(|p| p.id.clone())
+            .collect()
+    };
+    let api_ids = api(&status);
+    let (spec, other_spec) = {
+        let engine = engine.lock().unwrap();
+        (
+            engine.pods[&api_ids[0]]["spec"].clone(),
+            engine.pods[&id(&app, "conf", "replica_set", "other", 0)]["spec"].clone(),
+        )
+    };
+    let config_id = spec["volumes"][0]["secret"]["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let db_id = spec["volumes"][1]["secret"]["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        spec["volumes"][0]["secret"]["items"],
+        json!([{"key": "app.json", "path": "conf/app.json"}])
+    );
+    assert_eq!(
+        (
+            spec["volumes"][0]["secret"]["mode"].clone(),
+            spec["volumes"][0]["secret"]["group"].clone()
+        ),
+        (json!(420), json!(2000))
+    );
+    assert_eq!(spec["volumes"][1]["secret"]["mode"], 288);
+    assert_eq!(
+        spec["containers"][0]["secret_env"]["DB_PASSWORD"],
+        json!({"secret": db_id, "key": "password"})
+    );
+    {
+        let engine = engine.lock().unwrap();
+        let decode = |id: &str, key: &str| {
+            String::from_utf8(
+                STANDARD
+                    .decode(engine.secrets[id]["data"][key].as_str().unwrap())
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(decode(&config_id, "app.json"), "{}");
+        assert_eq!(decode(&config_id, "ca.crt"), "CA");
+        assert_eq!(decode(&db_id, "password"), "pw-one");
+        assert_eq!(engine.secrets[&db_id]["labels"]["dev.rezn.resource"], "db");
+    }
+    // Values never appear in Rezn's status or state.
+    for path in ["/status", "/state"] {
+        let text = client
+            .get(url(path))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            !text.contains("pw-one") && !text.contains(std::str::from_utf8(&token).unwrap()),
+            "{path}"
+        );
+    }
+
+    // A changed config replaces only the pods that use it; status says why, and the old object goes in the same pass.
+    let (code, _) = apply_raw(configured(r#"{"v":2}"#)).await;
+    assert_eq!(code, StatusCode::ACCEPTED);
+    let status = app
+        .controller
+        .status(&app.db, &app.secret_store)
+        .await
+        .unwrap();
+    let pods = &status
+        .workloads
+        .iter()
+        .find(|w| w.resource == "api")
+        .unwrap()
+        .pods;
+    assert!(
+        pods.iter()
+            .all(|p| !p.current && p.changes == [r#"config "settings""#]),
+        "{:?}",
+        pods.iter().map(|p| &p.changes).collect::<Vec<_>>()
+    );
+    let before = backend.requests().len();
+    // Replicas are replaced one per pass, so the first pass does not converge yet.
+    reconcile(&app).await.unwrap_err();
+    let requests = changes(&backend, before);
+    let pod_puts: Vec<&String> = requests
+        .iter()
+        .filter(|(m, p)| *m == Method::PUT && p.starts_with("/workload/pods/"))
+        .map(|(_, p)| p)
+        .collect();
+    assert_eq!(pod_puts.len(), 1, "one replica at a time: {requests:?}");
+    assert!(requests
+        .iter()
+        .any(|(m, p)| *m == Method::PUT && p.starts_with("/workload/secrets/")));
+    reconcile(&app).await.unwrap();
+    let status = converged(&app).await;
+    assert_eq!(api(&status), api_ids);
+    {
+        let engine = engine.lock().unwrap();
+        assert_eq!(
+            engine.pods[&id(&app, "conf", "replica_set", "other", 0)]["spec"],
+            other_spec,
+            "unrelated pods keep their spec"
+        );
+        assert!(
+            !engine.secrets.contains_key(&config_id),
+            "the old config object is removed once unused"
+        );
+        assert!(engine.secrets.contains_key(&db_id));
+    }
+
+    // Re-storing the same value changes nothing; a new value replaces the secret's users.
+    let (code, _) = put_secret("db", json!({"password": "pw-one"})).await;
+    assert_eq!(code, StatusCode::OK);
+    let before = backend.requests().len();
+    reconcile(&app).await.unwrap();
+    assert!(changes(&backend, before).is_empty());
+    let (code, _) = put_secret("db", json!({"password": "pw-two"})).await;
+    assert_eq!(code, StatusCode::OK);
+    let status = app
+        .controller
+        .status(&app.db, &app.secret_store)
+        .await
+        .unwrap();
+    let pods = &status
+        .workloads
+        .iter()
+        .find(|w| w.resource == "api")
+        .unwrap()
+        .pods;
+    assert!(pods.iter().all(|p| p.changes == [r#"secret "db""#]));
+    reconcile(&app).await.unwrap_err();
+    reconcile(&app).await.unwrap();
+    converged(&app).await;
+    {
+        let engine = engine.lock().unwrap();
+        assert!(!engine.secrets.contains_key(&db_id));
+        let new_db = engine.pods[&api_ids[1]]["spec"]["volumes"][1]["secret"]["name"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            STANDARD
+                .decode(
+                    engine.secrets[&new_db]["data"]["password"]
+                        .as_str()
+                        .unwrap()
+                )
+                .unwrap(),
+            b"pw-two"
+        );
+    }
+
+    // Removing the deployment removes its pods and then their objects in one pass; stored values stay.
+    let (code, _) = apply_raw(program("conf", json!([]))).await;
+    assert_eq!(code, StatusCode::ACCEPTED);
+    reconcile(&app).await.unwrap();
+    converged(&app).await;
+    assert!(engine.lock().unwrap().secrets.is_empty());
+    assert_eq!(app.secret_store.program_versions("apps").unwrap().len(), 2);
+    let gone = client
+        .delete(url("/namespaces/apps/secrets/db"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status(), StatusCode::OK);
+}
+
+#[test]
+fn object_ownership_is_proven_from_labels() {
+    use crate::orqos_client::SecretStatus;
+    use crate::reconcile::owned_objects;
+    let owner = "a".repeat(64);
+    let content = "c".repeat(64);
+    let labels = |kind: &str| {
+        BTreeMap::from([
+            (OWNER.to_string(), owner.clone()),
+            ("dev.rezn.deployment".to_string(), "shop".to_string()),
+            ("dev.rezn.namespace".to_string(), "store".to_string()),
+            ("dev.rezn.kind".to_string(), kind.to_string()),
+            ("dev.rezn.resource".to_string(), "db".to_string()),
+            ("dev.rezn.content".to_string(), content.clone()),
+        ])
+    };
+    let status = |name: String, labels: BTreeMap<String, String>| SecretStatus {
+        name,
+        labels,
+        pods: vec![],
+    };
+    let good = crate::workload::object_id(&owner, "shop", "secret", "db", &content);
+    let foreign = status(
+        "someone-else".into(),
+        BTreeMap::from([(OWNER.to_string(), "b".repeat(64))]),
+    );
+    let owned = owned_objects(
+        &owner,
+        vec![status(good.clone(), labels("secret")), foreign],
+    )
+    .unwrap();
+    assert_eq!(owned.len(), 1);
+    assert_eq!(
+        (owned[0].kind.as_str(), owned[0].resource.as_str()),
+        ("secret", "db")
+    );
+    // A name that does not recompute from the labels, or an unknown kind, fails the observation.
+    assert!(owned_objects(
+        &owner,
+        vec![status(
+            "rz-000000000000000000000000".into(),
+            labels("secret")
+        )]
+    )
+    .is_err());
+    assert!(owned_objects(&owner, vec![status(good, labels("volume"))]).is_err());
 }
