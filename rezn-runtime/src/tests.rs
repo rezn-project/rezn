@@ -2240,7 +2240,7 @@ async fn unready_replicas_hold_the_rollout_and_are_reported() {
         .rollout
         .as_ref()
         .expect("the waiting rollout is reported");
-    assert_eq!(rollout.waiting_for, [one.clone()]);
+    assert_eq!(rollout.waiting_for, std::slice::from_ref(&one));
     assert!(!web.pods.iter().find(|p| p.id == one).unwrap().ready);
 
     // Readiness returning lets the rollout finish.
