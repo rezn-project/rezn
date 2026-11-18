@@ -199,6 +199,17 @@ pub async fn put_program_secret(
     if payload.data.values().map(String::len).sum::<usize>() > MAX_BYTES {
         return Err(invalid(format!("data: at most {MAX_BYTES} bytes in total")));
     }
+    // Registry credentials are checked now rather than at the first failed pull.
+    if let Some(config) = payload.data.get(".dockerconfigjson") {
+        let auths = serde_json::from_str::<serde_json::Value>(config)
+            .ok()
+            .is_some_and(|v| v.get("auths").is_some_and(serde_json::Value::is_object));
+        if !auths {
+            return Err(invalid(
+                "data..dockerconfigjson: Docker registry credentials, a JSON object with an \"auths\" object".into(),
+            ));
+        }
+    }
     let _intent = app.controller.intent.lock().await;
     let programs = store::load(&app.db)
         .and_then(|s| s.desired())

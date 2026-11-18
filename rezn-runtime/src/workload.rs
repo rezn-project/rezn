@@ -333,6 +333,9 @@ pub fn translate(
                 used.insert(("secret", r.name.as_str()));
             }
         }
+        for secret in &pod.image_pull_secrets {
+            used.insert(("secret", secret.as_str()));
+        }
     }
     let referenced = referenced_keys(program);
     let mut object_ids: BTreeMap<(&str, &str), String> = BTreeMap::new();
@@ -527,6 +530,11 @@ pub fn translate(
                 readiness: c.readiness.as_ref().map(|p| probe(p, c)),
                 liveness: c.liveness.as_ref().map(|p| probe(p, c)),
                 resources: c.resources.as_ref().map(resources),
+                pull: Some(match c.pull.unwrap_or(Pull::IfNotPresent) {
+                    Pull::IfNotPresent => crate::orqos_client::Pull::Missing,
+                    Pull::Always => crate::orqos_client::Pull::Always,
+                    Pull::Never => crate::orqos_client::Pull::Never,
+                }),
             }
         };
         let containers: Vec<ContainerSpec> = pod.containers.iter().map(container).collect();
@@ -566,6 +574,11 @@ pub fn translate(
                     containers: containers.clone(),
                     init: init.clone(),
                     sidecars: sidecars.clone(),
+                    image_pull_secrets: pod
+                        .image_pull_secrets
+                        .iter()
+                        .map(|s| object_ids[&("secret", s.as_str())].clone())
+                        .collect(),
                     restart,
                     grace_seconds: pod.grace_seconds.unwrap_or(30),
                     labels: BTreeMap::from([
@@ -780,13 +793,6 @@ pub fn unsupported(program: &Program) -> Vec<String> {
                 "orqos#20",
             );
         }
-        if !pod.image_pull_secrets.is_empty() {
-            add(
-                format!("{at}/image_pull_secrets"),
-                "registry credentials are",
-                "orqos#23",
-            );
-        }
         let every = pod
             .init
             .iter()
@@ -820,13 +826,6 @@ pub fn unsupported(program: &Program) -> Vec<String> {
                         );
                     }
                 }
-            }
-            if matches!(c.pull, Some(Pull::Always | Pull::Never)) {
-                add(
-                    format!("{at}/pull"),
-                    "pull policies other than if_not_present are",
-                    "orqos#23",
-                );
             }
             for (k, env) in c.env.iter().enumerate() {
                 if env.pod_ip.is_some() {
@@ -1520,12 +1519,57 @@ mod tests {
             panic!()
         };
         set.pod.init[0].readiness = set.pod.sidecars[0].startup.clone();
-        set.pod.sidecars[0].pull = Some(Pull::Always);
+        set.pod.sidecars[0].env.push(ir_v2::Env {
+            name: "IP".into(),
+            value: None,
+            secret: None,
+            pod_ip: Some(true),
+        });
         let reasons = unsupported(&bad);
         assert_eq!(reasons.len(), 2, "{reasons:?}");
         assert!(reasons[0]
             .starts_with("/resources/1/fields/pod/init/0/readiness: probes on init containers"));
-        assert!(reasons[1].starts_with("/resources/1/fields/pod/sidecars/0/pull:"));
+        assert!(reasons[1].starts_with("/resources/1/fields/pod/sidecars/0/env/0/pod_ip:"));
+    }
+
+    #[test]
+    fn pull_secrets_and_policies_are_translated() {
+        let p = program(
+            json!({"ir": "rezn.dev/v2", "deployment": "shop", "namespace": "store", "resources": [
+                {"kind": "secret", "name": "registry", "fields": {"type": "opaque", "keys": [".dockerconfigjson", "note"],
+                    "source": {"store": {}}}},
+                {"kind": "replica_set", "name": "api", "fields": {"replicas": 1, "pod": {
+                    "image_pull_secrets": ["registry"],
+                    "containers": [{"name": "api", "image": "registry.example.com/api@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1", "pull": "always"},
+                                   {"name": "cache", "image": "redis:7", "pull": "never"},
+                                   {"name": "plain", "image": "alpine:3.22"}]}}}
+            ]}),
+        );
+        let stored = BTreeMap::from([(
+            "registry".to_string(),
+            BTreeMap::from([
+                (".dockerconfigjson".to_string(), "v1".to_string()),
+                ("note".to_string(), "v2".to_string()),
+            ]),
+        )]);
+        let t = super::translate(OWNER_ID, &p, &stored).unwrap();
+        let spec = &t.workloads[0].pods[0].spec;
+        assert_eq!(spec.image_pull_secrets, [t.objects[0].id.clone()]);
+        let ObjectSource::Secret { versions, .. } = &t.objects[0].source else {
+            panic!()
+        };
+        assert_eq!(
+            versions.keys().collect::<Vec<_>>(),
+            [".dockerconfigjson"],
+            "only the referenced key reaches Orqos"
+        );
+        let pulls: Vec<_> = spec.containers.iter().map(|c| c.pull).collect();
+        use crate::orqos_client::Pull as P;
+        assert_eq!(pulls, [Some(P::Always), Some(P::Never), Some(P::Missing)]);
+        let missing = super::translate(OWNER_ID, &p, &Stored::new()).unwrap_err();
+        assert!(missing[0].contains(
+            r#"key ".dockerconfigjson" of secret "registry" is not in the secret store"#
+        ));
     }
 
     #[test]
@@ -1576,9 +1620,11 @@ mod tests {
         ] {
             assert!(reasons.contains(expected), "{expected}:\n{reasons}");
         }
-        // Storage, identity, configs, secrets, certificates, probes, init containers, sidecars and resources run
-        // now.
+        // Storage, identity, configs, secrets, certificates, probes, init containers, sidecars, resources and
+        // registry credentials run now.
         for gone in [
+            "registry credentials",
+            "pull policies",
             "resource requests",
             "resources outside",
             "init containers are",
@@ -1596,17 +1642,17 @@ mod tests {
         ] {
             assert!(!reasons.contains(gone), "{gone}:\n{reasons}");
         }
-        let mut always = web(1);
-        always["resources"].as_array_mut().unwrap().truncate(2);
-        always["resources"][1]["fields"]["pod"]["containers"][0]["pull"] = json!("always");
-        always["resources"][1]["fields"]["pod"]["containers"][0]["env"] =
+        let mut ip = web(1);
+        ip["resources"].as_array_mut().unwrap().truncate(2);
+        ip["resources"][1]["fields"]["pod"]["containers"][0]["pull"] = json!("always");
+        ip["resources"][1]["fields"]["pod"]["containers"][0]["env"] =
             json!([{"name": "IP", "pod_ip": true}]);
         assert_eq!(
-            unsupported(&program(always)),
+            unsupported(&program(ip)),
             vec![
-                "/resources/1/fields/pod/containers/0/pull: pull policies other than if_not_present are not executed yet (orqos#23)",
                 "/resources/1/fields/pod/containers/0/env/0/pod_ip: pod IP references are not executed yet (orqos#25)",
-            ]
+            ],
+            "pull policies run since orqos#23"
         );
     }
 }
