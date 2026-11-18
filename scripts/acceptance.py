@@ -298,6 +298,7 @@ class Acceptance:
         self.services()
         self.storage()
         self.configuration()
+        self.certificates()
 
         networks = {n["podman_name"] for n in self.owned_networks()}
         assert len(networks) == 2, networks
@@ -514,6 +515,123 @@ class Acceptance:
         assert sorted(s["name"] for s in listed) == ["app", "db"], listed
         assert delete_secret("db") == 200 and delete_secret("app") == 200
         self.record("removing the deployment removes its Orqos secrets and keeps stored values until deleted")
+
+    def certificates(self):
+        name = self.deployment + "-t"
+        namespace = "tls"
+        sleep = "trap 'exit 0' TERM; while true; do sleep 1; done"
+
+        def program(names):
+            return [
+                {"kind": "secret", "name": "ca", "fields": {"type": "tls", "keys": ["tls.crt", "tls.key"],
+                                                            "source": {"ca": {"common_name": "acceptance CA",
+                                                                              "days": 3650}}}},
+                {"kind": "secret", "name": "web-tls", "fields": {"type": "tls", "keys": ["tls.crt", "tls.key"],
+                                                                 "source": {"certificate": {
+                                                                     "ca": "ca", "dns_names": names, "days": 90}}}},
+                {"kind": "replica_set", "name": "web", "fields": {"replicas": 1, "pod": {
+                    "grace_seconds": 5, "fs_group": 2000,
+                    "volumes": [{"name": "tls", "secret": {"name": "web-tls", "mode": 0o440}}],
+                    "containers": [{"name": "app", "image": IMAGE, "pull": "if_not_present",
+                                    "command": ["/bin/sh", "-c",
+                                                "apk add --no-cache openssl >/tmp/apk.log 2>&1 && exec openssl "
+                                                "s_server -quiet -accept 8443 -cert /run/tls/tls.crt "
+                                                "-key /run/tls/tls.key"],
+                                    "ports": [{"name": "https", "port": 8443}],
+                                    "mounts": [{"volume": "tls", "path": "/run/tls"}]}]}}},
+                {"kind": "service", "name": "web", "fields": {
+                    "target": "web", "ports": [{"name": "https", "port": 8443, "target_port": "https"}]}},
+                {"kind": "replica_set", "name": "client", "fields": {"replicas": 1, "pod": {
+                    "grace_seconds": 5,
+                    "volumes": [{"name": "ca", "secret": {"name": "ca",
+                                                          "items": [{"key": "tls.crt", "path": "ca.crt"}]}}],
+                    "containers": [{"name": "app", "image": IMAGE, "pull": "if_not_present",
+                                    "command": ["/bin/sh", "-c",
+                                                f"apk add --no-cache openssl >/tmp/apk.log 2>&1; {sleep}"],
+                                    "mounts": [{"volume": "ca", "path": "/run/ca"}]}]}}},
+            ]
+
+        def apply(names):
+            return self.settled(self.apply(program(names), deployment=name, namespace=namespace))
+
+        def one(status, resource):
+            return self.pods(status, resource, name)[0]
+
+        def run(replica, script, check=True):
+            return subprocess.run(["podman", "exec", self.container(replica), "sh", "-c", script],
+                                  capture_output=True, text=True, timeout=60, check=check)
+
+        def handshake(client, host):
+            return run(client, f"echo | openssl s_client -connect web.tls.svc:8443 -servername {host} "
+                               f"-CAfile /run/ca/ca.crt -verify_hostname {host} -verify_return_error 2>&1",
+                       check=False)
+
+        def host_openssl(*args, stdin=None):
+            return subprocess.run(["openssl", *args], input=stdin, capture_output=True, text=True,
+                                  timeout=30)
+
+        status = apply(["web", "web.tls.svc"])
+        web, client = one(status, "web"), one(status, "client")
+
+        def trusted():
+            result = handshake(client, "web.tls.svc")
+            return result.returncode == 0 and "Verify return code: 0 (ok)" in result.stdout
+        wait("a verified TLS handshake by service name", trusted, timeout=240, interval=2)
+        refused = handshake(client, "other.tls.svc")
+        assert refused.returncode != 0, refused.stdout
+        leaf = run(web, "cat /run/tls/tls.crt").stdout
+        ca = run(client, "cat /run/ca/ca.crt").stdout
+        with tempfile.NamedTemporaryFile("w", suffix=".pem") as ca_file:
+            ca_file.write(ca)
+            ca_file.flush()
+            verified = host_openssl("verify", "-CAfile", ca_file.name, "-verify_hostname", "web.tls.svc",
+                                    stdin=leaf)
+            assert verified.returncode == 0, verified.stdout + verified.stderr
+        sans = host_openssl("x509", "-noout", "-ext", "subjectAltName", stdin=leaf).stdout
+        assert "DNS:web, DNS:web.tls.svc" in sans, sans
+        assert run(client, "ls -A /run/ca").stdout.split() == ["ca.crt"]
+        stat = run(web, "stat -c '%u %g %a' /run/tls/tls.key").stdout.strip()
+        assert stat == "0 2000 440", stat
+        _, objects = http(self.orqos_url + "/workload/secrets", token=self.token)
+        mine = [o for o in objects if o["labels"].get("dev.rezn.deployment") == name]
+        keys = {o["labels"]["dev.rezn.resource"]: o["keys"] for o in mine}
+        assert keys == {"ca": ["tls.crt"], "web-tls": ["tls.crt", "tls.key"]}, keys
+        self.record("a generated CA signs a certificate for a service's names: a client trusting only the CA's "
+                    "certificate completes a verified TLS handshake by name, and the CA key never leaves Rezn")
+
+        def serial(replica):
+            return host_openssl("x509", "-noout", "-serial",
+                                stdin=run(replica, "cat /run/tls/tls.crt").stdout).stdout.strip()
+        first_serial = serial(web)
+        ids = {r: podman("inspect", "--format", "{{.Id}}", self.container(one(status, r))) for r in ("web", "client")}
+        status = apply(["web", "web.tls.svc"])
+        assert serial(one(status, "web")) == first_serial
+        assert {r: podman("inspect", "--format", "{{.Id}}", self.container(one(status, r)))
+                for r in ("web", "client")} == ids
+        status = apply(["web", "web.tls", "web.tls.svc"])
+        web = one(status, "web")
+        assert podman("inspect", "--format", "{{.Id}}", self.container(web)) != ids["web"]
+        assert podman("inspect", "--format", "{{.Id}}", self.container(one(status, "client"))) == ids["client"]
+        assert serial(web) != first_serial
+        wait("a verified handshake for the added name", lambda: handshake(client, "web.tls").returncode == 0,
+             timeout=240, interval=2)
+        self.record("an unchanged re-apply keeps the certificate and every container; adding a name reissues it "
+                    "from the same CA and replaces only the server")
+
+        _, listed = http(f"{self.rezn_url}/namespaces/{namespace}/secrets")
+        by_name = {s["name"]: s for s in listed}
+        assert by_name["ca"]["certificate"]["kind"] == "ca" and by_name["web-tls"]["certificate"]["renew_after"]
+        assert "BEGIN" not in json.dumps(listed)
+        try:
+            http(f"{self.rezn_url}/namespaces/{namespace}/secrets/ca", {"data": {"tls.crt": "x"}}, method="PUT")
+            raise AssertionError("a generated CA was overwritten")
+        except urllib.error.HTTPError as error:
+            assert error.code == 409, error.code
+        self.settled(self.apply([], deployment=name, namespace=namespace))
+        for secret in ("ca", "web-tls"):
+            assert http(f"{self.rezn_url}/namespaces/{namespace}/secrets/{secret}", method="DELETE")[0] == 200
+        self.record("the listing shows certificate validity without values, generated certificates cannot be set, "
+                    "and stored certificates outlive their deployment until deleted")
 
     def services(self):
         web_service = service("web")

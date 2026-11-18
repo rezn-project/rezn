@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
+    certificates::{self, Meta},
     routes::common::{app_error, AppError},
     secret::Versions,
     store, workload, AppState,
@@ -45,6 +46,38 @@ pub struct ProgramSecretView {
     pub source: Option<String>,
     /// Declared keys without a stored value.
     pub missing: Vec<String>,
+    /// A generated CA's or certificate's validity.
+    pub certificate: Option<CertificateView>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct CertificateView {
+    /// `ca` or `certificate`.
+    pub kind: String,
+    pub not_before: String,
+    pub not_after: String,
+    /// When a certificate is renewed (two thirds through its lifetime). A CA is never regenerated.
+    pub renew_after: Option<String>,
+    /// The declaration changed since it was generated: a certificate is reissued at the next apply or pass; a CA
+    /// is kept (generate-once).
+    pub spec_changed: bool,
+}
+
+fn certificate_view(meta: &Meta, declared: Option<&ir_v2::Secret>) -> CertificateView {
+    let current = declared.and_then(|s| {
+        s.source.ca.as_ref().map(certificates::ca_spec).or(s
+            .source
+            .certificate
+            .as_ref()
+            .map(certificates::certificate_spec))
+    });
+    CertificateView {
+        kind: meta.kind.clone(),
+        not_before: meta.not_before.to_rfc3339(),
+        not_after: meta.not_after.to_rfc3339(),
+        renew_after: (meta.kind == "certificate").then(|| meta.renew_after().to_rfc3339()),
+        spec_changed: current.is_some_and(|c| c != meta.spec),
+    }
 }
 
 fn source_kind(secret: &ir_v2::Secret) -> &'static str {
@@ -107,6 +140,7 @@ fn view(
     name: &str,
     versions: Option<&Versions>,
     declared: &[(&str, &Program, &str, &ir_v2::Secret)],
+    meta: Option<&Meta>,
 ) -> ProgramSecretView {
     let keys = versions
         .into_iter()
@@ -132,6 +166,7 @@ fn view(
             .filter(|k| !versions.is_some_and(|v| v.contains_key(*k)))
             .map(String::from)
             .collect(),
+        certificate: meta.map(|m| certificate_view(m, declared.first().map(|(.., s)| *s))),
     }
 }
 
@@ -230,7 +265,7 @@ pub async fn put_program_secret(
             .map_err(app_error)?
     };
     app.controller.trigger.notify_one();
-    Ok(Json(view(&name, Some(&versions), &declared)))
+    Ok(Json(view(&name, Some(&versions), &declared, None)))
 }
 
 #[utoipa::path(
@@ -253,6 +288,7 @@ pub async fn list_program_secrets(
         .program_versions(&namespace)
         .map_err(app_error)?;
     let declared = declarations(&programs, &namespace, None);
+    let metas = certificates::metas(&app.secret_store, &namespace).map_err(app_error)?;
     let names: BTreeSet<&str> = stored
         .keys()
         .map(String::as_str)
@@ -267,7 +303,7 @@ pub async fn list_program_secrets(
                     .filter(|(_, _, n, _)| *n == name)
                     .cloned()
                     .collect();
-                view(name, stored.get(name), &mine)
+                view(name, stored.get(name), &mine, metas.get(name))
             })
             .collect(),
     ))

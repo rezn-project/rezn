@@ -1945,6 +1945,7 @@ dependencies = [
  "hmac",
  "log",
  "once_cell",
+ "openssl",
  "reqwest",
  "secrecy",
  "serde",

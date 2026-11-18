@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
+    certificates,
     intent::{instructions, validate_envelope},
     routes::common::{app_error, AppError},
     secret,
@@ -105,6 +106,12 @@ pub async fn apply_handler(
                     .map_err(app_error)?;
             }
         }
+    }
+    // Certificate authorities are generated once; certificates are issued when missing or changed.
+    for change in certificates::maintain(&app.secret_store, [&program], chrono::Utc::now())
+        .map_err(app_error)?
+    {
+        tracing::info!("{change}");
     }
     state.revision = state
         .revision

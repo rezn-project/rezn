@@ -946,6 +946,17 @@ impl Controller {
     }
 
     async fn pass(&self, db: &sled::Db, secrets: &SecretStore, orqos: &OrqosClient) -> Result<()> {
+        // Renew due certificates first, so this pass rolls their users. Apply and the secret routes write the
+        // store under the same lock.
+        {
+            let _intent = self.intent.lock().await;
+            let programs = store::load(db)?.desired()?;
+            for change in crate::certificates::maintain(secrets, programs.values(), Utc::now())
+                .context("maintaining generated certificates")?
+            {
+                tracing::info!("{change}");
+            }
+        }
         // Validate the complete persisted snapshot before observation or mutation.
         let state = store::load(db)?;
         let wanted = desired(&state, secrets)?;
