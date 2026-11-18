@@ -276,7 +276,11 @@ Each namespace is one Podman network with aardvark-dns, and services are network
 (DNS round-robin) until virtual addresses and port remapping
 ([#123](https://github.com/rezn-project/rezn/issues/123)) land, and namespaces cannot reach each other. Each pod
 has a user namespace of 65536 IDs, and volumes are mounted idmapped, so files keep the IDs the container sees
-whatever host range the pod gets ([storage](DEVELOPMENT.md#storage-and-identity)).
+whatever host range the pod gets ([storage](DEVELOPMENT.md#storage-and-identity)). `config` and `secret`
+volumes are files Orqos writes per pod and bind-mounts read-only and idmapped; each config and secret is an
+immutable Orqos object whose ID covers its content (the config's data or the stored key versions), which is how a
+changed input replaces exactly the workloads that use it ([configs and
+secrets](DEVELOPMENT.md#configs-and-secrets)).
 
 ## Out of scope for v2.0
 

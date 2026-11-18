@@ -421,8 +421,8 @@ class Acceptance:
             return {n: podman("inspect", "--format", "{{.Id}}", self.container(p))
                     for n, p in self.pods(status, resource, name).items()}
 
-        def run(pod, script):
-            return podman("exec", self.container(pod), "sh", "-c", script)
+        def run(replica, script):
+            return podman("exec", self.container(replica), "sh", "-c", script)
 
         def put_secret(secret, data):
             try:
@@ -451,8 +451,8 @@ class Acceptance:
         status = apply(program('{"v":1}'))
         pods = api(status)
         tokens = set()
-        for pod in pods.values():
-            out = run(pod, "ls /etc/api | tr '\\n' ' '; echo; cat /etc/api/conf/app.json; echo; cat /opt/app.json; echo; "
+        for replica in pods.values():
+            out = run(replica, "ls /etc/api | tr '\\n' ' '; echo; cat /etc/api/conf/app.json; echo; cat /opt/app.json; echo; "
                            "stat -c '%u %g %a' /run/creds /run/creds/password; cat /run/creds/password; echo; "
                            "printf '%s\\n' \"$DB_PASSWORD\" \"$TOKEN\"; touch /etc/api/x 2>/dev/null || echo read-only")
             lines = out.splitlines()
