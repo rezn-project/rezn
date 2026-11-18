@@ -692,9 +692,12 @@ class Acceptance:
         podman("exec", self.container(victim), "touch", "/tmp/dead")
 
         def restarted():
+            # The probe restart is recorded before `podman stop` finishes: wait for the new container instance.
             s = self.status()
             replica = replicas(s)[0]
-            return s if replica["containers"][0]["probe_restarts"] >= 1 and replica["state"] == "running" else None
+            now = podman("inspect", "--format", "{{.Id}}", self.container(replica), check=False)
+            return s if (replica["containers"][0]["probe_restarts"] >= 1 and replica["state"] == "running"
+                         and now and now != before) else None
         status = wait("a liveness restart", restarted, timeout=60)
         replica = replicas(status)[0]
         assert replica["id"] == victim["id"] and container_id(replica) != before and not replica["ready"], replica
