@@ -88,12 +88,17 @@ keeping the deployment record.
 
 ## What runs
 
-Orqos's workload backend runs pods of plain containers (image, `command`, `args`, literal environment values,
-restart policy and grace period) on owned networks with DNS aliases. A deployment runs only when **every** resource
-maps exactly onto that:
+Orqos's workload backend runs pods of containers (image, `command`, `args`, literal environment values, user and
+groups, hardening, restart policy and grace period) on owned networks with DNS aliases, with owned and scratch
+volumes. A deployment runs only when **every** resource maps exactly onto that:
 
-- `replica_set` and `ordered_replica_set` resources (the latter without `volume_claims`), each replica as one Orqos
-  pod: one Podman pod with its own network namespace, user namespace and hostname `<name>-<ordinal>`;
+- `replica_set` and `ordered_replica_set` resources, each replica as one Orqos pod: one Podman pod with its own
+  network namespace, user namespace and hostname `<name>-<ordinal>`;
+- `volume_claim` resources and ordered sets' `volume_claims`, pod volumes from `claim` and `scratch`, and container
+  `mounts` (below);
+- `user`, `group`, `fs_group`, `fs_group_policy: on_root_mismatch`, `seccomp: runtime_default`,
+  `run_as_non_root` with an explicit non-zero user, and container `security` (`user`, `group`, `read_only_root`,
+  `allow_privilege_escalation: false`, `drop_capabilities: ["all"]`);
 - `service` resources whose every `port` equals its target port (a number, or the named container port it
   resolves to), as DNS names (below);
 - `config` resources, which are inert until something consumes them;
@@ -101,9 +106,11 @@ maps exactly onto that:
   Kubernetes: nothing is published on the host).
 
 Anything else leaves the whole deployment **unexecuted**: services that remap ports
-([#123](https://github.com/rezn-project/rezn/issues/123)), ingress, network policies, secrets, jobs, volume claims,
-phases, init containers and sidecars, pod and container security settings, volumes and mounts, probes, resource
-requests and limits, other pull policies, registry credentials, and secret or pod-IP environment references.
+([#123](https://github.com/rezn-project/rezn/issues/123)), ingress, network policies, secrets, jobs, phases, init
+containers and sidecars, config and secret volumes, probes, resource requests and limits, other pull policies,
+registry credentials, secret or pod-IP environment references, a group without a user or `run_as_non_root` without
+an explicit user (both need the image's user), IDs above 65535, and a claim mounted by pods with different
+`fs_group`s.
 `/status` lists every blocking field as `JSON-pointer: reason (issue)`, citing the issue that adds it. An
 unexecuted deployment's pods from an earlier revision keep running untouched.
 
@@ -130,6 +137,33 @@ probes (not executed yet) a running replica is a ready one, which is IR v2's mem
 the pod spec: adding, removing or changing a service replaces its target's pods through the rolling replacement
 below. Changing membership without a restart arrives with readiness
 ([#59](https://github.com/rezn-project/rezn/issues/59)).
+
+### Storage and identity
+
+Every pod has its own user namespace of 65536 IDs (`UserNS=auto:size=65536`), so container root and every container
+ID map to an unprivileged host range. That range can differ after a restart, so volumes are mounted **idmapped**:
+on disk, files keep the IDs the container sees (user 1000 writes files owned by 1000), and whichever range the pod
+gets next can read them. Containers run as the container's `security.user`/`group`, else the pod's, else the
+image's user; `fs_group` is added as a supplementary group.
+
+- A `volume_claim` is one Orqos volume shared by every pod that mounts it.
+- An ordered set's `volume_claims` give each replica its own volume (`<claim>-<set>-<N>` in IR terms), which
+  follows the ordinal across restarts, replacement and scaling.
+- A volume's root belongs to `root:<fs_group>` with mode 2775 (setgid, so new files get the group), or
+  `root:root` 0755 without `fs_group`. The group is set when the volume is created and set again only if the root's
+  group differs (`on_root_mismatch`), never recursively.
+- `scratch` volumes belong to one pod: `memory` is a tmpfs of `bytes`, `disk` a local volume (`bytes` advisory,
+  [#68](https://github.com/rezn-project/rezn/issues/68)). They are empty when the pod is created or replaced, kept
+  across container restarts, and removed with the pod.
+- Mounts honour `read_only` and `sub_path`.
+
+**Retention.** Volumes are created before the pods that mount them and removed only once no pod mounts them. A
+per-replica volume beyond the replica count stays unless the set says `retain.on_scale_down: false`; when its set or
+deployment is gone it stays unless `retain.on_removal` was `false` (the last policy is kept with the volume in
+Orqos). A `volume_claim` is always kept when its deployment is removed. Retained volumes come back to the same claim
+and ordinal, and an unexecuted deployment's volumes are never removed. Deleting retained volumes is an operator
+action for now, through Orqos (`DELETE /workload/volumes/<id>`); a Rezn purge belongs with uninstall
+([#48](https://github.com/rezn-project/rezn/issues/48)).
 
 ## Reconciliation
 
@@ -169,6 +203,7 @@ invalid persisted state returns HTTP 500, never an empty map. `GET /status` repo
 | `errors` | The last pass's validation, observation, mutation or convergence errors; cleared after a successful pass |
 | `unexecuted[]` | `deployment` and `reasons` (`JSON-pointer: reason (issue)`) for each program the backend cannot run yet |
 | `workloads[]` | Per replica set: `deployment`, `kind`, `resource`, `desired_replicas` (null for pods awaiting removal or of unexecuted deployments), `running_replicas` (null until observed) and `pods[]` |
+| `volumes[]` | Owned volumes: `id`, `deployment`, `claim`, `workload` and `ordinal` (per-replica volumes), `desired` (wanted by the accepted programs; otherwise retained or awaiting deletion), `retain`, `exists` and `mounted_by` |
 | `pods[]` | `id`, `ordinal`, `hostname`, Orqos's `state` (`running`, `starting`, `restarting`, `degraded`, `failed`, `stopped`), `current` (runs the desired spec), `aliases` (its DNS names on the namespace network), `containers[]` (`name`, `active_state`, `sub_state`, `result`, `restarts`) and Orqos's last `error` |
 
 After a failure, status keeps the last successful observation with its timestamp and marks it stale; it never
@@ -206,6 +241,18 @@ ignored. A pod that claims this owner but has missing or malformed labels, or an
 labels produce, fails the whole observation before any change. Orqos separately refuses to touch units and Podman
 pods it does not own (its own `dev.orqos.owner` token).
 
+Each volume is an Orqos volume named `rz-<first 24 hex digits of sha256([owner, "volume", deployment, set or null,
+claim, ordinal or null])>`, with these labels in Orqos's volume record (where they can change, unlike Podman's):
+
+```text
+dev.rezn.owner, dev.rezn.deployment, dev.rezn.namespace
+dev.rezn.claim=<claim name>
+dev.rezn.workload=<ordered set>, dev.rezn.ordinal=<replica number>   (per-replica volumes only)
+dev.rezn.retain=true | false
+```
+
+Volume ownership is proven the same way: the labels must be well formed and produce the volume's name.
+
 ## Live acceptance
 
 From this repository, with Orqos built in the sibling checkout and the prerequisites above:
@@ -231,6 +278,11 @@ applies signed IR v2 programs and checks with Podman itself:
 - a pod of another namespace cannot resolve those names, and a deployment whose names collide in a shared namespace
   is refused;
 - a service that remaps its port is reported unexecuted and changes nothing;
+- pods run as their user with `fs_group`-owned volumes, a read-only root and no capabilities; files keep
+  container IDs on disk, and a shared claim is shared;
+- scaling an ordered set 2 → 1 → 2 brings replica 1 back with its own volume;
+- replacing every replica keeps each one's volume and starts its scratch volume empty;
+- removing a deployment keeps its volumes, and applying it again reuses them;
 - empty programs remove every owned pod and then the namespace networks, while a foreign Orqos pod stays.
 
 It removes everything it created, including after a failure. The *Acceptance* workflow runs it on Ubuntu 26.04

@@ -23,6 +23,8 @@ use crate::{
 #[derive(Default)]
 struct Engine {
     pods: BTreeMap<String, Value>,
+    /// Owned volumes by name: their spec.
+    volumes: BTreeMap<String, Value>,
     fail_list: bool,
     fail_put: Option<&'static str>,
     /// State of newly applied pods; `running` when unset.
@@ -35,6 +37,13 @@ impl Engine {
             return (StatusCode::UNAUTHORIZED, "missing token".into());
         }
         let path = request.uri.path();
+        if let Some(rest) = path.strip_prefix("/workload/volumes") {
+            return self.volume(
+                request.method.as_str(),
+                rest.trim_start_matches('/'),
+                &request.body,
+            );
+        }
         let id = path.strip_prefix("/workload/pods/").unwrap_or_default();
         match (request.method.as_str(), path) {
             ("GET", "/workload/pods") if self.fail_list => (
@@ -50,6 +59,16 @@ impl Engine {
                     return (StatusCode::CONFLICT, body.into());
                 }
                 let spec: Value = serde_json::from_slice(&request.body).unwrap();
+                for volume in spec["volumes"].as_array().into_iter().flatten() {
+                    if let Some(name) = volume["volume"].as_str() {
+                        if !self.volumes.contains_key(name) {
+                            return (
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                format!(r#"{{"error":"unknown volume {name}"}}"#),
+                            );
+                        }
+                    }
+                }
                 let containers: Vec<Value> = spec["containers"]
                     .as_array()
                     .unwrap()
@@ -67,6 +86,45 @@ impl Engine {
             }
             ("DELETE", _) if self.pods.remove(id).is_some() => (StatusCode::OK, "{}".into()),
             ("DELETE", _) => (StatusCode::NOT_FOUND, r#"{"error":"no such pod"}"#.into()),
+            _ => (StatusCode::NOT_FOUND, "unknown route".into()),
+        }
+    }
+
+    /// Pods whose specs mount an owned volume.
+    fn mounting(&self, name: &str) -> Vec<String> {
+        self.pods
+            .iter()
+            .filter(|(_, pod)| {
+                pod["spec"]["volumes"]
+                    .as_array()
+                    .is_some_and(|v| v.iter().any(|v| v["volume"] == name))
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    fn volume(&mut self, method: &str, name: &str, body: &[u8]) -> (StatusCode, String) {
+        match (method, name) {
+            ("GET", "") if self.fail_list => (StatusCode::SERVICE_UNAVAILABLE, "systemd unavailable".into()),
+            ("GET", "") => (
+                StatusCode::OK,
+                json!(self
+                    .volumes
+                    .iter()
+                    .map(|(name, spec)| json!({"name": name, "exists": true, "spec": spec, "pods": self.mounting(name)}))
+                    .collect::<Vec<_>>())
+                .to_string(),
+            ),
+            ("PUT", _) if !name.is_empty() => {
+                let spec: Value = serde_json::from_slice(body).unwrap();
+                self.volumes.insert(name.into(), spec);
+                (StatusCode::OK, "{}".into())
+            }
+            ("DELETE", _) if !self.mounting(name).is_empty() => {
+                (StatusCode::CONFLICT, r#"{"error":"mounted"}"#.into())
+            }
+            ("DELETE", _) if self.volumes.remove(name).is_some() => (StatusCode::OK, "{}".into()),
+            ("DELETE", _) => (StatusCode::NOT_FOUND, r#"{"error":"no such volume"}"#.into()),
             _ => (StatusCode::NOT_FOUND, "unknown route".into()),
         }
     }
@@ -391,7 +449,7 @@ fn ordered_workload(replicas: u32, management: &str) -> Workload {
         json!([ordered_set("db", replicas, management), headless("db")]),
     ))
     .unwrap();
-    let workloads = translate(&"0".repeat(64), &program).unwrap();
+    let workloads = translate(&"0".repeat(64), &program).unwrap().workloads;
     assert_eq!(workloads[0].kind, Kind::OrderedReplicaSet);
     workloads.into_iter().next().unwrap()
 }
@@ -660,6 +718,141 @@ async fn ordered_sets_with_headless_services_start_one_replica_at_a_time() {
     );
 }
 
+fn stateful(replicas: u32, on_removal: bool) -> Value {
+    program(
+        "data",
+        json!([
+            {"kind": "volume_claim", "name": "shared", "fields": {"bytes": 1048576}},
+            {"kind": "ordered_replica_set", "name": "db", "fields": {"replicas": replicas, "service": "db",
+                "pod_management": "parallel",
+                "volume_claims": [{"name": "data", "bytes": 1048576}],
+                "retain": {"on_scale_down": false, "on_removal": on_removal},
+                "pod": {"user": 1000, "fs_group": 2000,
+                    "volumes": [{"name": "data", "claim": "data"}, {"name": "shared", "claim": "shared"}],
+                    "containers": [{"name": "db", "image": "docker.io/library/postgres:17",
+                        "mounts": [{"volume": "data", "path": "/data"}, {"volume": "shared", "path": "/shared"}]}]}}},
+            headless("db")
+        ]),
+    )
+}
+
+/// Every PUT and DELETE after the first `skip` requests, as (method, path).
+fn changes(backend: &MockOrqos, skip: usize) -> Vec<(Method, String)> {
+    backend.requests()[skip..]
+        .iter()
+        .filter(|r| r.method != Method::GET)
+        .map(|r| (r.method.clone(), r.uri.path().to_string()))
+        .collect()
+}
+
+#[tokio::test]
+async fn volumes_come_before_pods_and_follow_their_retention() {
+    let (backend, engine) = backend().await;
+    let app = app(backend.client.clone(), None);
+    let owner = owner(&app);
+    let db = |n| {
+        format!(
+            "/workload/pods/{}",
+            id(&app, "data", "ordered_replica_set", "db", n)
+        )
+    };
+    let data = |n| {
+        format!(
+            "/workload/volumes/{}",
+            crate::workload::volume_id(&owner, "data", Some("db"), "data", Some(n))
+        )
+    };
+    let shared = format!(
+        "/workload/volumes/{}",
+        crate::workload::volume_id(&owner, "data", None, "shared", None)
+    );
+
+    apply(&app, "data", stateful(2, true)).await;
+    reconcile(&app).await.unwrap();
+    assert_eq!(
+        changes(&backend, 0),
+        [
+            (Method::PUT, shared.clone()),
+            (Method::PUT, data(0)),
+            (Method::PUT, data(1)),
+            (Method::PUT, db(0)),
+            (Method::PUT, db(1)),
+        ]
+    );
+    let status = converged(&app).await;
+    assert_eq!(status.volumes.len(), 3);
+    assert!(status
+        .volumes
+        .iter()
+        .all(|v| v.desired && v.exists && v.retain));
+    assert_eq!(
+        engine.lock().unwrap().volumes[data(1).trim_start_matches("/workload/volumes/")]["group"],
+        2000
+    );
+
+    // Scale down: the pod goes first; its volume (on_scale_down: false) once nothing mounts it.
+    apply(&app, "data", stateful(1, true)).await;
+    let before = backend.requests().len();
+    reconcile(&app).await.unwrap_err();
+    assert_eq!(changes(&backend, before), [(Method::DELETE, db(1))]);
+    let before = backend.requests().len();
+    reconcile(&app).await.unwrap();
+    assert_eq!(changes(&backend, before), [(Method::DELETE, data(1))]);
+    converged(&app).await;
+
+    // Scale up creates the volume again, before the pod.
+    apply(&app, "data", stateful(2, true)).await;
+    let before = backend.requests().len();
+    reconcile(&app).await.unwrap();
+    assert_eq!(
+        changes(&backend, before),
+        [(Method::PUT, data(1)), (Method::PUT, db(1))]
+    );
+
+    // Removing the deployment keeps retained volumes (the claim always; replicas with on_removal: true).
+    apply(&app, "data", program("data", json!([]))).await;
+    let _ = reconcile(&app).await;
+    let before = backend.requests().len();
+    reconcile(&app).await.unwrap();
+    assert!(changes(&backend, before).is_empty());
+    let status = converged(&app).await;
+    assert_eq!(status.volumes.len(), 3);
+    assert!(status
+        .volumes
+        .iter()
+        .all(|v| !v.desired && v.retain && v.mounted_by.is_empty()));
+
+    // Re-applying reuses them; with on_removal: false, removal then deletes the per-replica volumes only.
+    apply(&app, "data", stateful(2, false)).await;
+    let before = backend.requests().len();
+    reconcile(&app).await.unwrap();
+    let puts = changes(&backend, before);
+    assert_eq!(
+        puts.iter()
+            .filter(|(_, p)| p.starts_with("/workload/pods/"))
+            .count(),
+        2
+    );
+    apply(&app, "data", program("data", json!([]))).await;
+    let _ = reconcile(&app).await;
+    let before = backend.requests().len();
+    reconcile(&app).await.unwrap();
+    let mut deleted: Vec<String> = changes(&backend, before)
+        .into_iter()
+        .map(|(method, path)| {
+            assert_eq!(method, Method::DELETE);
+            path
+        })
+        .collect();
+    deleted.sort();
+    let mut expected = vec![data(0), data(1)];
+    expected.sort();
+    assert_eq!(deleted, expected);
+    let status = converged(&app).await;
+    assert_eq!(status.volumes.len(), 1);
+    assert_eq!(status.volumes[0].claim, "shared");
+}
+
 #[tokio::test]
 async fn colliding_names_in_a_shared_namespace_are_refused_or_left_unexecuted() {
     let (backend, _) = backend().await;
@@ -887,6 +1080,7 @@ async fn failed_follow_up_observation_keeps_a_stale_snapshot_and_retry_does_not_
     let counted = lists.clone();
     let backend = MockOrqos::start(move |request| {
         if request.method == Method::GET
+            && request.uri.path() == "/workload/pods"
             && counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1
         {
             (
@@ -922,11 +1116,15 @@ async fn older_observation_cannot_report_convergence_of_newer_intent_and_passes_
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let (e, r) = (entered.clone(), release.clone());
-    let backend = MockOrqos::start_async(move |_| {
+    let backend = MockOrqos::start_async(move |request| {
         let (e, r) = (e.clone(), r.clone());
+        // Pod listings block until released; volume listings answer at once.
+        let blocks = request.uri.path() == "/workload/pods";
         async move {
-            e.notify_one();
-            wait_for(&r).await;
+            if blocks {
+                e.notify_one();
+                wait_for(&r).await;
+            }
             (StatusCode::OK, "[]".into())
         }
     })
@@ -950,7 +1148,13 @@ async fn older_observation_cannot_report_convergence_of_newer_intent_and_passes_
     assert!(!pending.converged);
     assert_ne!(pending.observed_revision, Some(pending.desired_revision));
     wait_for(&entered).await;
-    assert_eq!(backend.requests().len(), 2);
+    let pod_listings = |b: &MockOrqos| {
+        b.requests()
+            .iter()
+            .filter(|r| r.uri.path() == "/workload/pods")
+            .count()
+    };
+    assert_eq!(pod_listings(&backend), 2);
     release.notify_one();
     second.await.unwrap().unwrap();
     assert!(app.controller.status(&app.db).await.unwrap().converged);

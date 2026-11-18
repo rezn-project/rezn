@@ -5,15 +5,18 @@ Rezn is a declarative workload controller aiming to replace Kubernetes on a sing
 [Orqos](https://github.com/orqos-project/orqos)'s workload backend ([ADR 0001](docs/adr/0001-execution-foundation.md)).
 See the [roadmap](https://github.com/rezn-project/rezn/issues/25).
 
-What runs today is deliberately narrow: `replica_set` and `ordered_replica_set` resources of plain containers
-(image, command, arguments, literal environment values, grace period), `service` resources as DNS names, and inert
-`config` resources. Each replica is one Podman pod with its own network and user namespace, supervised by systemd
-with restart backoff, on its namespace's network, where `<service>`, `<service>.<namespace>.svc` and, for headless
-services, `<name>-<N>.<service>` resolve. Scaling touches the highest ordinals, ordered sets start one replica at a
-time, changed specs roll one replica at a time, and stopped pods are started again. A program that needs anything
-else (port-remapping services, secrets, volumes, probes, jobs and so on) is stored but left **unexecuted**, and `/status` names every
-blocking field with the issue that adds it. Nothing is silently dropped. IR v1 programs are refused; the
-[Kubernetes manifest subset](docs/KUBERNETES-SUBSET.md) is specified for import.
+What runs today: `replica_set` and `ordered_replica_set` resources (image, command, arguments, literal environment
+values, user and groups, read-only root, no privilege escalation, no capabilities, grace period), `service`
+resources as DNS names, `volume_claim`s and per-replica claims with retention, scratch volumes, and inert `config`
+resources. Volumes are mounted idmapped, so data keeps its container IDs across pods and restarts. Each replica is
+one Podman pod with its own network and user namespace, supervised by systemd with restart backoff, on its
+namespace's network, where `<service>`, `<service>.<namespace>.svc` and, for headless services,
+`<name>-<N>.<service>` resolve. Scaling touches the highest ordinals, ordered sets start one replica at a time,
+changed specs roll one replica at a time, and stopped pods are started again. A program that needs anything else
+(port-remapping services, secrets, config and secret files, probes, resource limits, init containers, jobs and so
+on) is stored but left **unexecuted**, and `/status` names every blocking field with the issue that adds it. Nothing
+is silently dropped. IR v1 programs are refused; the [Kubernetes manifest subset](docs/KUBERNETES-SUBSET.md) is
+specified for import.
 
 ```bash
 python3 scripts/signed_program.py examples/ir-v2/runnable.json > /tmp/demo.signed.json
