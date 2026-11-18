@@ -31,6 +31,8 @@ struct Engine {
     fail_put: Option<&'static str>,
     /// State of newly applied pods; `running` when unset.
     start_state: Option<&'static str>,
+    /// Newly applied pods run but are not ready (their readiness probes fail).
+    start_unready: bool,
 }
 
 impl Engine {
@@ -91,10 +93,12 @@ impl Engine {
                     .unwrap()
                     .iter()
                     .map(|c| json!({"name": c["name"], "unit": format!("orqos-{id}-c-{}.service", c["name"].as_str().unwrap()),
-                                    "active_state": "active", "sub_state": "running", "result": "success", "restarts": 0}))
+                                    "active_state": "active", "sub_state": "running", "result": "success", "restarts": 0,
+                                    "started": true, "ready": !self.start_unready, "probe_restarts": 0, "last_probe_failure": null}))
                     .collect();
+                let state = self.start_state.unwrap_or("running");
                 let pod = json!({
-                    "id": id, "desired": "running", "state": self.start_state.unwrap_or("running"),
+                    "id": id, "desired": "running", "state": state, "ready": state == "running" && !self.start_unready,
                     "pod": {"unit": format!("orqos-{id}-pod.service"), "active_state": "active", "sub_state": "running", "result": "success", "restarts": 0},
                     "containers": containers, "spec": spec, "error": null, "updated_at": "2026-11-18T00:00:00Z"
                 });
@@ -211,7 +215,17 @@ impl Engine {
     }
 
     fn set_state(&mut self, id: &str, state: &str) {
-        self.pods.get_mut(id).unwrap()["state"] = json!(state);
+        let pod = self.pods.get_mut(id).unwrap();
+        pod["state"] = json!(state);
+        pod["ready"] = json!(state == "running");
+    }
+
+    fn set_ready(&mut self, id: &str, ready: bool) {
+        let pod = self.pods.get_mut(id).unwrap();
+        pod["ready"] = json!(ready);
+        for c in pod["containers"].as_array_mut().unwrap() {
+            c["ready"] = json!(ready);
+        }
     }
 }
 
@@ -558,7 +572,14 @@ fn observed(workload: &Workload, states: &[&str]) -> Vec<Owned> {
             ordinal: pod.ordinal,
             status: PodStatus {
                 id: pod.id.clone(),
-                state: state.to_string(),
+                // "unready" is a running pod whose readiness probes fail.
+                state: if *state == "unready" {
+                    "running"
+                } else {
+                    state
+                }
+                .to_string(),
+                ready: *state == "running",
                 containers: vec![],
                 spec: pod.spec.clone(),
                 error: None,
@@ -668,7 +689,9 @@ async fn unexecuted_deployments_report_reasons_and_keep_their_pods() {
     reconcile(&app).await.unwrap();
 
     let before = backend.requests().len();
-    apply(&app, "hello", example_v2("minimal.json")).await;
+    let mut limited = replica_set("hello", 1, "a");
+    limited["fields"]["pod"]["containers"][0]["resources"] = json!({"cpu_limit_millis": 500});
+    apply(&app, "hello", program("hello", json!([limited]))).await;
     let service = json!({"kind": "service", "name": "db", "fields": {"target": "db", "headless": true,
         "ports": [{"name": "pg", "port": 5433, "target_port": 5432}]}});
     apply(
@@ -696,15 +719,15 @@ async fn unexecuted_deployments_report_reasons_and_keep_their_pods() {
     assert_eq!(
         status.unexecuted[1].reasons,
         vec![
-            "/resources/0/fields/pod/containers/0/readiness: probes are not executed yet (rezn#71, orqos#26)",
+            "/resources/0/fields/pod/containers/0/resources: resource requests and limits are not executed yet (rezn#40)",
         ]
     );
 
     // A running deployment whose new program cannot run keeps its pods from the earlier revision.
-    let mut probed = replica_set("web", 3, "b");
-    probed["fields"]["pod"]["containers"][0]["liveness"] = json!({"exec": ["true"]});
+    let mut limited = replica_set("web", 3, "b");
+    limited["fields"]["pod"]["containers"][0]["resources"] = json!({"memory_limit_bytes": 1048576});
     let before = backend.requests().len();
-    apply(&app, "shop", program("shop", json!([probed]))).await;
+    apply(&app, "shop", program("shop", json!([limited]))).await;
     reconcile(&app).await.unwrap();
     assert!(mutations(&backend, before).is_empty());
     let status = app
@@ -732,7 +755,7 @@ async fn unexecuted_deployments_report_reasons_and_keep_their_pods() {
     assert!(body["unexecuted"][2]["reasons"][0]
         .as_str()
         .unwrap()
-        .contains("/liveness: probes"));
+        .contains("/resources: resource requests"));
 }
 
 #[tokio::test]
@@ -1075,7 +1098,7 @@ async fn foreign_pods_are_untouched_and_unproven_ownership_blocks_every_change()
     let (backend, engine) = backend().await;
     let app = app(backend.client.clone(), None);
     let foreign = |id: &str, labels: Value| {
-        json!({"id": id, "state": "running", "containers": [], "error": null,
+        json!({"id": id, "state": "running", "ready": true, "containers": [], "error": null,
                "spec": {"hostname": "x", "restart": "always", "grace_seconds": 30, "labels": labels,
                         "containers": [{"name": "c", "image": "alpine"}]}})
     };
@@ -2120,4 +2143,111 @@ async fn generated_certificates_are_issued_reissued_renewed_and_trusted_by_their
     assert_eq!(listed[1]["certificate"]["spec_changed"], false);
     assert!(listed[1]["certificate"]["renew_after"].is_string());
     assert!(!listed.to_string().contains("BEGIN"));
+}
+
+#[test]
+fn readiness_gates_rollouts_ordered_starts_and_scale_down() {
+    let none = BTreeMap::new();
+    let three = ordered_workload(3, "ordered");
+    let id = |n: usize| three.pods[n].id.clone();
+    let w = std::slice::from_ref(&three);
+    // The next ordinal waits until the lower ones are ready, not just running.
+    assert!(plan(w, &none, &observed(&three, &["unready"])).is_empty());
+    assert_eq!(
+        plan(w, &none, &observed(&three, &["running"])),
+        vec![Action::Apply(id(1), three.pods[1].spec.clone())]
+    );
+    // Scale-down waits for the remaining replicas to be ready.
+    let one = ordered_workload(1, "ordered");
+    let w = std::slice::from_ref(&one);
+    assert!(plan(
+        w,
+        &none,
+        &observed(&three, &["unready", "running", "running"])
+    )
+    .is_empty());
+
+    // A rollout: replica 2 has the new spec but is not ready, so replica 1 waits; readiness lets it go on.
+    let mut changed = three.clone();
+    for pod in &mut changed.pods {
+        pod.spec.grace_seconds = 5;
+    }
+    let w = std::slice::from_ref(&changed);
+    let mut seen = observed(&three, &["running", "running", "running"]);
+    seen[2].status.spec = changed.pods[2].spec.clone();
+    seen[2].status.ready = false;
+    assert!(
+        plan(w, &none, &seen).is_empty(),
+        "an unready new replica holds the rollout"
+    );
+    seen[2].status.ready = true;
+    assert_eq!(
+        plan(w, &none, &seen),
+        vec![Action::Apply(id(1), changed.pods[1].spec.clone())]
+    );
+    // An unready old replica serves nothing, so it is replaced at once (a broken revision cannot block its fix);
+    // the ready ones still wait their turn.
+    let seen = observed(&three, &["running", "unready", "running"]);
+    assert_eq!(
+        plan(w, &none, &seen),
+        vec![Action::Apply(id(1), changed.pods[1].spec.clone())]
+    );
+}
+
+#[tokio::test]
+async fn unready_replicas_hold_the_rollout_and_are_reported() {
+    let (backend, engine) = backend().await;
+    let app = app(backend.client.clone(), None);
+    apply(
+        &app,
+        "shop",
+        program("shop", json!([replica_set("web", 2, "a")])),
+    )
+    .await;
+    reconcile(&app).await.unwrap();
+    let status = converged(&app).await;
+    assert_eq!(status.workloads[0].ready_replicas, Some(2));
+    assert!(status.workloads[0].rollout.is_none());
+
+    // New pods come up unready: the first replacement happens, then the rollout waits for it.
+    engine.lock().unwrap().start_unready = true;
+    apply(
+        &app,
+        "shop",
+        program("shop", json!([replica_set("web", 2, "b")])),
+    )
+    .await;
+    reconcile(&app).await.unwrap_err();
+    let before = backend.requests().len();
+    reconcile(&app).await.unwrap_err();
+    assert!(
+        mutations(&backend, before).is_empty(),
+        "nothing else is replaced while replica 1 is unready"
+    );
+    let status = app
+        .controller
+        .status(&app.db, &app.secret_store)
+        .await
+        .unwrap();
+    let web = &status.workloads[0];
+    let one = id(&app, "shop", "replica_set", "web", 1);
+    assert!(!status.converged);
+    assert_eq!(
+        (web.running_replicas, web.ready_replicas),
+        (Some(2), Some(1))
+    );
+    let rollout = web
+        .rollout
+        .as_ref()
+        .expect("the waiting rollout is reported");
+    assert_eq!(rollout.waiting_for, [one.clone()]);
+    assert!(!web.pods.iter().find(|p| p.id == one).unwrap().ready);
+
+    // Readiness returning lets the rollout finish.
+    engine.lock().unwrap().start_unready = false;
+    engine.lock().unwrap().set_ready(&one, true);
+    reconcile(&app).await.unwrap();
+    let status = converged(&app).await;
+    assert_eq!(status.workloads[0].ready_replicas, Some(2));
+    assert!(status.workloads[0].rollout.is_none());
 }

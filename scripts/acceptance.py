@@ -260,16 +260,17 @@ class Acceptance:
         self.record("a changed spec replaces replicas one at a time, highest ordinal first")
 
         current = self.container_ids(status)
-        probed = replica_set("web", 2, "c")
-        probed["fields"]["pod"]["containers"][0]["readiness"] = {"exec": ["true"]}
-        revision = self.apply([probed])
+        limited = replica_set("web", 2, "c")
+        limited["fields"]["pod"]["containers"][0]["resources"] = {"memory_limit_bytes": 67108864}
+        revision = self.apply([limited])
 
         def unexecuted():
             s = self.status()
             return s if s["observed_revision"] == revision and s["unexecuted"] else None
         status = wait("the unexecuted report", unexecuted)
         assert not status["converged"] and status["unexecuted"][0]["deployment"] == self.deployment
-        assert "readiness: probes are not executed yet" in status["unexecuted"][0]["reasons"][0], status
+        assert "resources: resource requests and limits are not executed yet" in \
+            status["unexecuted"][0]["reasons"][0], status
         time.sleep(3)
         assert self.container_ids(self.status()) == current
         self.record("a program needing unsupported features is reported with reasons and changes nothing")
@@ -299,6 +300,7 @@ class Acceptance:
         self.storage()
         self.configuration()
         self.certificates()
+        self.probes()
 
         networks = {n["podman_name"] for n in self.owned_networks()}
         assert len(networks) == 2, networks
@@ -632,6 +634,122 @@ class Acceptance:
             assert http(f"{self.rezn_url}/namespaces/{namespace}/secrets/{secret}", method="DELETE")[0] == 200
         self.record("the listing shows certificate validity without values, generated certificates cannot be set, "
                     "and stored certificates outlive their deployment until deleted")
+
+    def probes(self):
+        name = self.deployment + "-p"
+        namespace = "probes"
+        responder = ("trap 'exit 0' TERM; while true; do if [ -f /tmp/ready ]; then s='200 OK'; "
+                     "else s='503 Service Unavailable'; fi; printf \"HTTP/1.1 $s\\r\\nContent-Length: 0\\r\\n"
+                     "Connection: close\\r\\n\\r\\n\" | nc -l -p 8080; done")
+
+        def template(level):
+            return {"grace_seconds": 2, "containers": [{
+                "name": "app", "image": IMAGE, "pull": "if_not_present", "command": ["/bin/sh", "-c", responder],
+                "env": [{"name": "LEVEL", "value": level}], "ports": [{"name": "http", "port": 8080}],
+                "startup": {"exec": ["test", "-f", "/tmp/started"], "period_seconds": 1, "failure_threshold": 600},
+                "readiness": {"http": {"path": "/ready", "port": "http", "scheme": "http"}, "period_seconds": 1,
+                              "failure_threshold": 1},
+                "liveness": {"exec": ["/bin/sh", "-c", "test ! -f /tmp/dead"], "period_seconds": 1,
+                             "failure_threshold": 2}}]}
+
+        def web(level):
+            return {"kind": "replica_set", "name": "web", "fields": {"replicas": 2, "pod": template(level)}}
+
+        def apply(resources):
+            return self.apply(resources, deployment=name, namespace=namespace)
+
+        def replicas(status, resource="web"):
+            return self.pods(status, resource, name)
+
+        def make_ready(replica):
+            podman("exec", self.container(replica), "touch", "/tmp/started", "/tmp/ready")
+
+        def container_id(replica):
+            return podman("inspect", "--format", "{{.Id}}", self.container(replica))
+
+        def workload(status, resource="web"):
+            return next(w for w in status["workloads"] if w["deployment"] == name and w["resource"] == resource)
+
+        revision = apply([web("a")])
+
+        def running_unready():
+            s = self.status()
+            pods = replicas(s)
+            return s if (s["observed_revision"] == revision and len(pods) == 2
+                         and all(p["state"] == "running" for p in pods.values())) else None
+        status = wait("both replicas running", running_unready)
+        assert not status["converged"] and workload(status)["ready_replicas"] == 0, workload(status)
+        assert all(not p["ready"] and not p["containers"][0]["started"] for p in replicas(status).values())
+        for replica in replicas(status).values():
+            make_ready(replica)
+        status = self.settled(revision)
+        assert workload(status)["ready_replicas"] == 2
+        self.record("replicas that run but have not passed their startup and readiness probes are not ready, and "
+                    "the deployment converges once they pass (an HTTP probe from inside the pod, by port name)")
+
+        victim = replicas(status)[0]
+        before = container_id(victim)
+        podman("exec", self.container(victim), "touch", "/tmp/dead")
+
+        def restarted():
+            s = self.status()
+            replica = replicas(s)[0]
+            return s if replica["containers"][0]["probe_restarts"] >= 1 and replica["state"] == "running" else None
+        status = wait("a liveness restart", restarted, timeout=60)
+        replica = replicas(status)[0]
+        assert replica["id"] == victim["id"] and container_id(replica) != before and not replica["ready"], replica
+        assert not status["converged"]
+        make_ready(replica)
+        status = self.settled(revision)
+        self.record("failing liveness restarts the container, not the pod, and it is unready until its probes pass "
+                    "again")
+
+        old = {n: container_id(p) for n, p in replicas(status).items()}
+        revision = apply([web("b")])
+
+        def first_replaced():
+            s = self.status()
+            pods = replicas(s)
+            if s["observed_revision"] != revision or 1 not in pods or pods[1]["state"] != "running":
+                return None
+            return s if container_id(pods[1]) != old[1] else None
+        status = wait("replica 1 to be replaced first", first_replaced)
+        time.sleep(5)
+        status = self.status()
+        pods = replicas(status)
+        assert container_id(pods[0]) == old[0], "replica 0 was replaced while replica 1 was not ready"
+        rollout = workload(status)["rollout"]
+        assert rollout and rollout["waiting_for"] == [pods[1]["id"]], rollout
+        make_ready(pods[1])
+
+        def second_replaced():
+            s = self.status()
+            pods = replicas(s)
+            return s if 0 in pods and pods[0]["state"] == "running" and container_id(pods[0]) != old[0] else None
+        status = wait("replica 0 to be replaced after replica 1 is ready", second_replaced)
+        make_ready(replicas(status)[0])
+        status = self.settled(revision)
+        assert all(podman("exec", self.container(p), "printenv", "LEVEL") == "b" for p in replicas(status).values())
+        assert workload(status)["rollout"] is None
+        self.record("a rolling change waits for each new replica to be ready before replacing the next, and reports "
+                    "what it waits for")
+
+        db = {"kind": "ordered_replica_set", "name": "db", "fields": {
+            "replicas": 2, "service": "db", "pod_management": "ordered", "pod": template("db")}}
+        headless = {"kind": "service", "name": "db", "fields": {
+            "target": "db", "headless": True, "ports": [{"name": "http", "port": 8080, "target_port": "http"}]}}
+        revision = apply([web("b"), db, headless])
+        status = wait("db-0 running", lambda: (lambda s: s if 0 in replicas(s, "db") and
+                                               replicas(s, "db")[0]["state"] == "running" else None)(self.status()))
+        time.sleep(5)
+        assert 1 not in replicas(self.status(), "db"), "db-1 was created before db-0 was ready"
+        make_ready(replicas(status, "db")[0])
+        status = wait("db-1 running", lambda: (lambda s: s if 1 in replicas(s, "db") and
+                                               replicas(s, "db")[1]["state"] == "running" else None)(self.status()))
+        make_ready(replicas(status, "db")[1])
+        self.settled(revision)
+        self.record("an ordered replica set creates each replica only once the previous one is ready")
+        self.settled(apply([]))
 
     def services(self):
         web_service = service("web")

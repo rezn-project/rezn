@@ -88,6 +88,11 @@ impl Owned {
     fn running(&self) -> bool {
         self.status.state == "running"
     }
+
+    /// Running with every container ready (a container without probes is ready once it runs).
+    fn ready(&self) -> bool {
+        self.running() && self.status.ready
+    }
 }
 
 #[derive(Default)]
@@ -151,7 +156,18 @@ pub struct WorkloadStatus {
     pub desired_replicas: Option<usize>,
     /// Null until there has been a successful observation; stale values keep their timestamp.
     pub running_replicas: Option<usize>,
+    /// Replicas whose containers all pass their readiness probes (or have none and run).
+    pub ready_replicas: Option<usize>,
+    /// Set while a replacement, ordered start or ordered removal waits for replicas that run but are not ready.
+    pub rollout: Option<Rollout>,
     pub pods: Vec<PodView>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct Rollout {
+    /// Pods the next step waits for.
+    pub waiting_for: Vec<String>,
+    pub reason: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -161,6 +177,8 @@ pub struct PodView {
     pub hostname: String,
     /// Orqos's summary: `running`, `starting`, `restarting`, `degraded`, `failed` or `stopped`.
     pub state: String,
+    /// Running, with every container ready.
+    pub ready: bool,
     /// The pod runs the desired spec of the accepted revision.
     pub current: bool,
     /// What a pod that is not current would change: `config "<name>"` or `secret "<name>"` for each changed input
@@ -578,11 +596,12 @@ pub fn plan(workloads: &[Workload], unexecuted: &Reasons, observed: &[Owned]) ->
         let existing = by_workload.get(&key).unwrap_or(&empty);
         let replicas = w.pods.len() as u32;
         let extra: Vec<&Owned> = existing.range(replicas..).map(|(_, p)| *p).collect();
+        // Steps that take capacity away wait until every other replica is ready, not just running.
         let others_run = |except: u32| {
             existing
                 .iter()
                 .filter(|(ordinal, _)| **ordinal != except)
-                .all(|(_, p)| p.running())
+                .all(|(_, p)| p.ready())
         };
         if w.sequential {
             if let Some(highest) = extra.last() {
@@ -599,7 +618,7 @@ pub fn plan(workloads: &[Workload], unexecuted: &Reasons, observed: &[Owned]) ->
             match existing.get(&desired.ordinal) {
                 None => {
                     let lower_run =
-                        (0..desired.ordinal).all(|o| existing.get(&o).is_some_and(|p| p.running()));
+                        (0..desired.ordinal).all(|o| existing.get(&o).is_some_and(|p| p.ready()));
                     if !w.sequential || (lower_run && extra.is_empty()) {
                         applies.push(Action::Apply(desired.id.clone(), desired.spec.clone()));
                     }
@@ -608,7 +627,9 @@ pub fn plan(workloads: &[Workload], unexecuted: &Reasons, observed: &[Owned]) ->
                     }
                 }
                 Some(pod) if pod.status.spec != desired.spec => {
-                    if !pod.running() {
+                    // A replica that is not ready serves nothing, so replacing it costs no capacity; waiting
+                    // would let a broken revision block the fix forever.
+                    if !pod.ready() {
                         applies.push(Action::Apply(desired.id.clone(), desired.spec.clone()));
                     } else {
                         running_replacement = Some(desired);
@@ -643,7 +664,7 @@ fn executed_converged(workloads: &[Workload], unexecuted: &Reasons, observed: &[
         .collect();
     executed.len() == desired.len()
         && executed.iter().all(|p| {
-            p.running()
+            p.ready()
                 && desired
                     .get(p.status.id.as_str())
                     .is_some_and(|spec| **spec == p.status.spec)
@@ -793,6 +814,24 @@ impl Controller {
                         desired_replicas: workload.map(|w| w.pods.len()),
                         running_replicas: observed
                             .map(|_| pods.iter().filter(|p| p.running()).count()),
+                        ready_replicas: observed.map(|_| pods.iter().filter(|p| p.ready()).count()),
+                        rollout: workload.and_then(|w| {
+                            // Not settled (a replica missing, extra or with an older spec) while some run unready.
+                            let settled = pods.len() == w.pods.len()
+                                && w.pods.iter().all(|d| {
+                                    pods.iter()
+                                        .any(|p| p.status.id == d.id && p.status.spec == d.spec)
+                                });
+                            let waiting: Vec<String> = pods
+                                .iter()
+                                .filter(|p| p.running() && !p.ready())
+                                .map(|p| p.status.id.clone())
+                                .collect();
+                            (!settled && !waiting.is_empty()).then(|| Rollout {
+                                waiting_for: waiting,
+                                reason: "running but not ready".into(),
+                            })
+                        }),
                         pods: pods
                             .into_iter()
                             .map(|p| PodView {
@@ -800,6 +839,7 @@ impl Controller {
                                 ordinal: p.ordinal,
                                 hostname: p.status.spec.hostname.clone(),
                                 state: p.status.state.clone(),
+                                ready: p.ready(),
                                 current: desired_spec(&p.status.id) == Some(&p.status.spec),
                                 changes: desired_spec(&p.status.id)
                                     .map(|spec| changes(spec, &p.status.spec, &inputs))
