@@ -286,7 +286,8 @@ secrets](DEVELOPMENT.md#configs-and-secrets)). `ca` and `certificate` secrets ar
 renewed once two thirds of their lifetime have passed, and a CA is not rotated in v2.0. Probes are run by Orqos itself rather than as
 Podman healthchecks, which allow one check per container and run inside it; resource limits are cgroup limits
 set through Podman and requests are admitted against the host's capacity minus a reserve
-([admission](DEVELOPMENT.md#resources-and-admission)); HTTP probes connect from a thread that
+([admission](DEVELOPMENT.md#resources-and-admission)); `image_pull_secrets` reach Podman as a merged auth file,
+and pulls happen before a pod is created or replaced, so a failed pull leaves the running pod alone; HTTP probes connect from a thread that
 enters the pod's network namespace. Until readiness-aware membership
 ([#59](https://github.com/rezn-project/rezn/issues/59)), services resolve to running replicas.
 

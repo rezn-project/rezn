@@ -101,6 +101,20 @@ impl Engine {
                         );
                     }
                 }
+                // Pulls with credentials that say "wrong" fail, as a registry refusing them would.
+                for name in spec["image_pull_secrets"].as_array().into_iter().flatten() {
+                    use base64::{engine::general_purpose::STANDARD, Engine as _};
+                    let config = self.secrets[name.as_str().unwrap()]["data"][".dockerconfigjson"]
+                        .as_str()
+                        .and_then(|v| STANDARD.decode(v).ok())
+                        .unwrap_or_default();
+                    if String::from_utf8_lossy(&config).contains("wrong") {
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            r#"{"error":"pulling image registry.example.com/api:1 for container \"app\" failed: unauthorized: authentication required"}"#.into(),
+                        );
+                    }
+                }
                 let containers: Vec<Value> = spec["containers"]
                     .as_array()
                     .unwrap()
@@ -165,6 +179,11 @@ impl Engine {
 
     /// Orqos secrets a pod spec uses.
     fn secret_refs(spec: &Value) -> Vec<String> {
+        let pulls = spec["image_pull_secrets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.as_str());
         let files = spec["volumes"]
             .as_array()
             .into_iter()
@@ -176,7 +195,7 @@ impl Engine {
             .flatten()
             .filter_map(|c| c["secret_env"].as_object())
             .flat_map(|e| e.values().filter_map(|r| r["secret"].as_str()));
-        files.chain(env).map(String::from).collect()
+        files.chain(env).chain(pulls).map(String::from).collect()
     }
 
     fn secret(&mut self, method: &str, name: &str, body: &[u8]) -> (StatusCode, String) {
@@ -703,7 +722,7 @@ async fn unexecuted_deployments_report_reasons_and_keep_their_pods() {
 
     let before = backend.requests().len();
     let mut limited = replica_set("hello", 1, "a");
-    limited["fields"]["pod"]["containers"][0]["pull"] = json!("always");
+    limited["fields"]["pod"]["containers"][0]["env"] = json!([{"name": "IP", "pod_ip": true}]);
     apply(&app, "hello", program("hello", json!([limited]))).await;
     let service = json!({"kind": "service", "name": "db", "fields": {"target": "db", "headless": true,
         "ports": [{"name": "pg", "port": 5433, "target_port": 5432}]}});
@@ -732,13 +751,13 @@ async fn unexecuted_deployments_report_reasons_and_keep_their_pods() {
     assert_eq!(
         status.unexecuted[1].reasons,
         vec![
-            "/resources/0/fields/pod/containers/0/pull: pull policies other than if_not_present are not executed yet (orqos#23)",
+            "/resources/0/fields/pod/containers/0/env/0/pod_ip: pod IP references are not executed yet (orqos#25)",
         ]
     );
 
     // A running deployment whose new program cannot run keeps its pods from the earlier revision.
     let mut limited = replica_set("web", 3, "b");
-    limited["fields"]["pod"]["containers"][0]["pull"] = json!("never");
+    limited["fields"]["pod"]["containers"][0]["env"] = json!([{"name": "IP", "pod_ip": true}]);
     let before = backend.requests().len();
     apply(&app, "shop", program("shop", json!([limited]))).await;
     reconcile(&app).await.unwrap();
@@ -768,7 +787,7 @@ async fn unexecuted_deployments_report_reasons_and_keep_their_pods() {
     assert!(body["unexecuted"][2]["reasons"][0]
         .as_str()
         .unwrap()
-        .contains("/pull: pull policies"));
+        .contains("/pod_ip: pod IP references"));
 }
 
 #[tokio::test]
@@ -2351,4 +2370,65 @@ async fn requests_are_admitted_against_the_hosts_allocatable_capacity() {
         message.contains("cannot check the revision against the host's capacity"),
         "{message}"
     );
+}
+
+#[tokio::test]
+async fn registry_credentials_reach_pulls_and_a_fixed_secret_recovers() {
+    let (backend, engine) = backend().await;
+    let app = app(backend.client.clone(), None);
+    let http = HttpRezn::start(app.clone()).await;
+    let client = reqwest::Client::new();
+    let put = |value: &str| {
+        let request = client
+            .put(format!("{}/namespaces/apps/secrets/registry", http.url))
+            .json(&json!({"data": {".dockerconfigjson": value}}));
+        async move { request.send().await.unwrap().status() }
+    };
+    assert_eq!(put("not json").await, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        put(r#"{"credsStore": "pass"}"#).await,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        put(r#"{"auths": {"registry.example.com": {"auth": "wrong"}}}"#).await,
+        StatusCode::OK
+    );
+    let mut api = replica_set("api", 1, "a");
+    api["fields"]["pod"]["image_pull_secrets"] = json!(["registry"]);
+    api["fields"]["pod"]["containers"][0]["pull"] = json!("always");
+    let resources = json!([
+        {"kind": "secret", "name": "registry", "fields": {"type": "opaque", "keys": [".dockerconfigjson"], "source": {"store": {}}}},
+        api
+    ]);
+    apply(&app, "shop", program("shop", resources)).await;
+
+    // The refused pull is an error of the pass, and nothing runs.
+    let error = format!("{:#}", reconcile(&app).await.unwrap_err());
+    assert!(error.contains("unauthorized"), "{error}");
+    let status = app
+        .controller
+        .status(&app.db, &app.secret_store)
+        .await
+        .unwrap();
+    assert!(status.errors.iter().any(|e| e.contains("unauthorized")));
+    assert!(engine.lock().unwrap().pods.is_empty());
+
+    // Fixing the credentials makes a new Orqos secret, so the next pass pulls with it.
+    assert_eq!(
+        put(r#"{"auths": {"registry.example.com": {"auth": "cmlnaHQ="}}}"#).await,
+        StatusCode::OK
+    );
+    reconcile(&app).await.unwrap();
+    let status = converged(&app).await;
+    assert!(status.errors.is_empty());
+    let engine = engine.lock().unwrap();
+    let spec = &engine.pods.values().next().unwrap()["spec"];
+    assert_eq!(spec["containers"][0]["pull"], "always");
+    let secret = spec["image_pull_secrets"][0].as_str().unwrap();
+    assert_eq!(
+        engine.secrets.len(),
+        1,
+        "the wrong credentials' object is gone"
+    );
+    assert!(engine.secrets.contains_key(secret));
 }

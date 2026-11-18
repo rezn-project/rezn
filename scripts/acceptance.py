@@ -8,6 +8,7 @@ state, and removes everything it created, including after a failure.
     sudo python3 scripts/acceptance.py --orqos-bin ../orqos/target/debug/orqos --rezn-bin target/debug/rezn
 """
 import argparse
+import base64
 import json
 import os
 from pathlib import Path
@@ -94,6 +95,49 @@ def resolve(container, name):
     result = subprocess.run(["podman", "exec", container, "getent", "ahostsv4", name],
                             capture_output=True, text=True, timeout=30)
     return None if result.returncode else {line.split()[0] for line in result.stdout.splitlines()}
+
+
+REGISTRY = "localhost:5000"
+REGISTRY_CONF = "/etc/containers/registries.conf.d/99-rezn-acceptance.conf"
+PRIVATE = f"{REGISTRY}/acceptance/private:1"
+
+
+def start_registry(workdir):
+    """A local registry with htpasswd auth on plain HTTP, allowed for localhost:5000 by an acceptance-only drop-in."""
+    os.makedirs(os.path.dirname(REGISTRY_CONF), exist_ok=True)
+    Path(REGISTRY_CONF).write_text(f'[[registry]]\nlocation = "{REGISTRY}"\ninsecure = true\n')
+    auth = Path(workdir) / "registry-auth"
+    auth.mkdir(exist_ok=True)
+    (auth / "htpasswd").write_text(podman("run", "--rm", "--entrypoint", "htpasswd", "docker.io/library/httpd:2.4",
+                                          "-Bbn", "rezn", "s3cret") + "\n")
+    podman("run", "-d", "--name", "rezn-acceptance-registry", "-p", "127.0.0.1:5000:5000", "-v", f"{auth}:/auth",
+           "-e", "REGISTRY_AUTH=htpasswd", "-e", "REGISTRY_AUTH_HTPASSWD_REALM=acceptance",
+           "-e", "REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd", "docker.io/library/registry:2")
+
+    def up():
+        try:
+            urllib.request.urlopen(f"http://{REGISTRY}/v2/", timeout=2)
+        except urllib.error.HTTPError as error:
+            return error.code == 401
+        return False
+    wait("the registry", up, timeout=60)
+    authfile = str(Path(workdir) / "push-auth.json")
+    podman("login", "--authfile", authfile, "-u", "rezn", "-p", "s3cret", REGISTRY)
+    podman("tag", IMAGE, PRIVATE)
+    podman("push", "--authfile", authfile, PRIVATE)
+    podman("rmi", PRIVATE)
+
+
+def stop_registry():
+    subprocess.run(["podman", "rm", "--force", "--ignore", "rezn-acceptance-registry"], capture_output=True)
+    subprocess.run(["podman", "rmi", "--force", PRIVATE], capture_output=True)
+    if os.path.exists(REGISTRY_CONF):
+        os.remove(REGISTRY_CONF)
+
+
+def docker_config(user, password):
+    token = base64.b64encode(f"{user}:{password}".encode()).decode()
+    return json.dumps({"auths": {REGISTRY: {"auth": token}}})
 
 
 class Acceptance:
@@ -262,7 +306,7 @@ class Acceptance:
 
         current = self.container_ids(status)
         limited = replica_set("web", 2, "c")
-        limited["fields"]["pod"]["containers"][0]["pull"] = "always"
+        limited["fields"]["pod"]["containers"][0]["env"] = [{"name": "IP", "pod_ip": True}]
         revision = self.apply([limited])
 
         def unexecuted():
@@ -270,7 +314,7 @@ class Acceptance:
             return s if s["observed_revision"] == revision and s["unexecuted"] else None
         status = wait("the unexecuted report", unexecuted)
         assert not status["converged"] and status["unexecuted"][0]["deployment"] == self.deployment
-        assert "pull: pull policies other than if_not_present are not executed yet" in \
+        assert "pod_ip: pod IP references are not executed yet" in \
             status["unexecuted"][0]["reasons"][0], status
         time.sleep(3)
         assert self.container_ids(self.status()) == current
@@ -304,6 +348,7 @@ class Acceptance:
         self.probes()
         self.pod_lifecycle()
         self.resources()
+        self.registry()
 
         networks = {n["podman_name"] for n in self.owned_networks()}
         assert len(networks) == 2, networks
@@ -847,6 +892,59 @@ class Acceptance:
         for deployment, ns in ((first, "admit-a"), (second, "admit-b"), (name, namespace)):
             self.settled(self.apply([], deployment=deployment, namespace=ns))
 
+    def registry(self):
+        start_registry(self.directory)
+        name = self.deployment + "-g"
+        namespace = "registry"
+
+        def program(pull="always", image=PRIVATE):
+            private = replica_set("private", 1, "a")
+            private["fields"]["pod"]["image_pull_secrets"] = ["registry"]
+            private["fields"]["pod"]["containers"][0].update({"image": image, "pull": pull})
+            return [{"kind": "secret", "name": "registry", "fields": {
+                "type": "opaque", "keys": [".dockerconfigjson"], "source": {"store": {}}}}, private]
+
+        def put_credentials(password):
+            return http(f"{self.rezn_url}/namespaces/{namespace}/secrets/registry",
+                        {"data": {".dockerconfigjson": docker_config("rezn", password)}}, method="PUT")[0]
+
+        try:
+            self.apply(program(), deployment=name, namespace=namespace)
+            raise AssertionError("a program missing its registry credentials was accepted")
+        except urllib.error.HTTPError as error:
+            assert error.code == 400 and 'key ".dockerconfigjson" of secret "registry"' in error.read().decode()
+        assert put_credentials("wrong") == 200
+        revision = self.apply(program(), deployment=name, namespace=namespace)
+
+        def refused():
+            s = self.status()
+            # Podman words it "unauthorized", "authentication required" or "denied".
+            refused = ("unauthorized", "authentication required", "denied")
+            return s if (s["observed_revision"] == revision
+                         and any(w in e.lower() for e in s["errors"] for w in refused)) else None
+        status = wait("the unauthorized pull to be reported", refused, timeout=120)
+        assert not self.pods(status, "private", name), "a pod ran without its image"
+        self.record("a pull with wrong registry credentials is reported in status and runs nothing")
+
+        assert put_credentials("s3cret") == 200
+        status = self.settled(revision)
+        replica = self.pods(status, "private", name)[0]
+        image_id = podman("image", "inspect", "--format", "{{.Id}}", PRIVATE)
+        assert replica["containers"][0]["image_id"] == image_id, (replica["containers"][0], image_id)
+        self.record("storing the right credentials lets the pod pull and run its private image (pull: always)")
+
+        revision = self.apply(program(pull="never", image=f"{REGISTRY}/acceptance/absent:1"), deployment=name,
+                              namespace=namespace)
+
+        def never():
+            s = self.status()
+            return s if (s["observed_revision"] == revision
+                         and any("pull policy never" in e for e in s["errors"])) else None
+        wait("the absent image to be reported", never, timeout=120)
+        self.record("pull: never with an absent image is reported and leaves the running pod alone")
+        self.settled(self.apply([], deployment=name, namespace=namespace))
+        http(f"{self.rezn_url}/namespaces/{namespace}/secrets/registry", method="DELETE")
+
     def services(self):
         web_service = service("web")
         status = self.settled(self.apply([replica_set("web", 2, "b"), web_service]))
@@ -967,6 +1065,7 @@ def main():
             raise
         finally:
             acceptance.cleanup()
+            stop_registry()
     print(json.dumps({"acceptance": "passed", "steps": steps}, indent=2))
 
 

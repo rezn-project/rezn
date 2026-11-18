@@ -20,6 +20,9 @@ pub struct PodSpec {
     /// Started before containers, always restarted; a startup probe gates the containers' start.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sidecars: Vec<ContainerSpec>,
+    /// Orqos secrets with `.dockerconfigjson` credentials for the pod's pulls.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_pull_secrets: Vec<String>,
     pub restart: Restart,
     pub grace_seconds: u32,
     #[serde(default)]
@@ -185,6 +188,17 @@ pub struct ContainerSpec {
     pub liveness: Option<Probe>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<Resources>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull: Option<Pull>,
+}
+
+/// Orqos's pull policy: IR v2's `if_not_present` is Podman's `missing`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Pull {
+    Missing,
+    Always,
+    Never,
 }
 
 /// Cgroup limits and requests of one container.
@@ -263,6 +277,9 @@ pub struct ContainerStatus {
     /// Restarts caused by failing startup or liveness probes.
     pub probe_restarts: u32,
     pub last_probe_failure: Option<String>,
+    /// The image the container runs (Podman's image ID).
+    #[serde(default)]
+    pub image_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -441,6 +458,7 @@ mod tests {
             hostname: "web-0".into(),
             init: vec![],
             sidecars: vec![],
+            image_pull_secrets: vec!["rz-registry".into()],
             containers: vec![ContainerSpec {
                 name: "web".into(),
                 image: "docker.io/library/nginx:1.27-alpine".into(),
@@ -484,6 +502,7 @@ mod tests {
                     memory_limit_bytes: Some(1 << 30),
                     memory_request_bytes: Some(384 << 20),
                 }),
+                pull: Some(Pull::Always),
             }],
             restart: Restart::Always,
             grace_seconds: 30,
@@ -536,7 +555,8 @@ mod tests {
                                      "readiness": {"http": {"path": "/ready", "port": 80, "scheme": "https"},
                                                    "period_seconds": 10, "timeout_seconds": 1, "failure_threshold": 3},
                                      "resources": {"cpu_limit_millis": 1000, "cpu_request_millis": 100,
-                                                   "memory_limit_bytes": 1073741824, "memory_request_bytes": 402653184}}]},
+                                                   "memory_limit_bytes": 1073741824, "memory_request_bytes": 402653184},
+                                     "pull": "always"}], "image_pull_secrets": ["rz-registry"]},
             "error": null, "updated_at": "2026-11-18T00:00:00Z"
         }]);
         let server = MockOrqos::start(move |request| match request.method.as_str() {
