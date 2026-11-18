@@ -327,7 +327,8 @@ pub fn translate(
                 used.insert(("secret", p.name.as_str()));
             }
         }
-        for env in pod.containers.iter().flat_map(|c| &c.env) {
+        let every = pod.init.iter().chain(&pod.sidecars).chain(&pod.containers);
+        for env in every.flat_map(|c| &c.env) {
             if let Some(r) = &env.secret {
                 used.insert(("secret", r.name.as_str()));
             }
@@ -478,59 +479,58 @@ pub fn translate(
                 })
                 .collect()
         };
-        let containers: Vec<ContainerSpec> = pod
-            .containers
-            .iter()
-            .map(|c| {
-                let security = c.security.as_ref();
-                ContainerSpec {
-                    name: c.name.clone(),
-                    image: c.image.clone(),
-                    command: c.command.clone(),
-                    args: c.args.clone(),
-                    env: c
-                        .env
-                        .iter()
-                        .filter_map(|e| Some((e.name.clone(), e.value.clone()?)))
-                        .collect(),
-                    secret_env: c
-                        .env
-                        .iter()
-                        .filter_map(|e| {
-                            let r = e.secret.as_ref()?;
-                            Some((
-                                e.name.clone(),
-                                SecretKeyRef {
-                                    secret: object_ids[&("secret", r.name.as_str())].clone(),
-                                    key: r.key.clone(),
-                                },
-                            ))
-                        })
-                        .collect(),
-                    user: security.and_then(|s| s.user).or(pod.user),
-                    group: security.and_then(|s| s.group).or(pod.group),
-                    read_only_root: security.and_then(|s| s.read_only_root) == Some(true),
-                    no_new_privileges: security.and_then(|s| s.allow_privilege_escalation)
-                        == Some(false),
-                    drop_all_capabilities: security
-                        .and_then(|s| s.drop_capabilities.as_ref())
-                        .is_some_and(|d| d == &["all"]),
-                    mounts: c
-                        .mounts
-                        .iter()
-                        .map(|m| MountSpec {
-                            volume: m.volume.clone(),
-                            path: m.path.clone(),
-                            read_only: m.read_only == Some(true),
-                            sub_path: m.sub_path.clone(),
-                        })
-                        .collect(),
-                    startup: c.startup.as_ref().map(|p| probe(p, c)),
-                    readiness: c.readiness.as_ref().map(|p| probe(p, c)),
-                    liveness: c.liveness.as_ref().map(|p| probe(p, c)),
-                }
-            })
-            .collect();
+        let container = |c: &ir_v2::Container| {
+            let security = c.security.as_ref();
+            ContainerSpec {
+                name: c.name.clone(),
+                image: c.image.clone(),
+                command: c.command.clone(),
+                args: c.args.clone(),
+                env: c
+                    .env
+                    .iter()
+                    .filter_map(|e| Some((e.name.clone(), e.value.clone()?)))
+                    .collect(),
+                secret_env: c
+                    .env
+                    .iter()
+                    .filter_map(|e| {
+                        let r = e.secret.as_ref()?;
+                        Some((
+                            e.name.clone(),
+                            SecretKeyRef {
+                                secret: object_ids[&("secret", r.name.as_str())].clone(),
+                                key: r.key.clone(),
+                            },
+                        ))
+                    })
+                    .collect(),
+                user: security.and_then(|s| s.user).or(pod.user),
+                group: security.and_then(|s| s.group).or(pod.group),
+                read_only_root: security.and_then(|s| s.read_only_root) == Some(true),
+                no_new_privileges: security.and_then(|s| s.allow_privilege_escalation)
+                    == Some(false),
+                drop_all_capabilities: security
+                    .and_then(|s| s.drop_capabilities.as_ref())
+                    .is_some_and(|d| d == &["all"]),
+                mounts: c
+                    .mounts
+                    .iter()
+                    .map(|m| MountSpec {
+                        volume: m.volume.clone(),
+                        path: m.path.clone(),
+                        read_only: m.read_only == Some(true),
+                        sub_path: m.sub_path.clone(),
+                    })
+                    .collect(),
+                startup: c.startup.as_ref().map(|p| probe(p, c)),
+                readiness: c.readiness.as_ref().map(|p| probe(p, c)),
+                liveness: c.liveness.as_ref().map(|p| probe(p, c)),
+            }
+        };
+        let containers: Vec<ContainerSpec> = pod.containers.iter().map(container).collect();
+        let init: Vec<ContainerSpec> = pod.init.iter().map(container).collect();
+        let sidecars: Vec<ContainerSpec> = pod.sidecars.iter().map(container).collect();
         let restart = match pod.restart() {
             ir_v2::Restart::Always => Restart::Always,
             ir_v2::Restart::OnFailure => Restart::OnFailure,
@@ -563,6 +563,8 @@ pub fn translate(
                     supplementary_groups: pod.fs_group.into_iter().collect(),
                     volumes: volumes(ordinal),
                     containers: containers.clone(),
+                    init: init.clone(),
+                    sidecars: sidecars.clone(),
                     restart,
                     grace_seconds: pod.grace_seconds.unwrap_or(30),
                     labels: BTreeMap::from([
@@ -760,12 +762,6 @@ pub fn unsupported(program: &Program) -> Vec<String> {
             }
         };
         let at = format!("{at}/fields/pod");
-        if !pod.init.is_empty() {
-            add(format!("{at}/init"), "init containers are", "orqos#19");
-        }
-        if !pod.sidecars.is_empty() {
-            add(format!("{at}/sidecars"), "sidecars are", "orqos#19");
-        }
         if pod.fs_group.is_some_and(|g| g > MAX_ID) {
             add(
                 format!("{at}/fs_group"),
@@ -780,8 +776,40 @@ pub fn unsupported(program: &Program) -> Vec<String> {
                 "orqos#23",
             );
         }
-        for (j, c) in pod.containers.iter().enumerate() {
-            let at = format!("{at}/containers/{j}");
+        let every = pod
+            .init
+            .iter()
+            .enumerate()
+            .map(|(j, c)| ("init", j, c))
+            .chain(
+                pod.sidecars
+                    .iter()
+                    .enumerate()
+                    .map(|(j, c)| ("sidecars", j, c)),
+            )
+            .chain(
+                pod.containers
+                    .iter()
+                    .enumerate()
+                    .map(|(j, c)| ("containers", j, c)),
+            );
+        for (field, j, c) in every {
+            let at = format!("{at}/{field}/{j}");
+            if field == "init" {
+                for (kind, set) in [
+                    ("startup", c.startup.is_some()),
+                    ("readiness", c.readiness.is_some()),
+                    ("liveness", c.liveness.is_some()),
+                ] {
+                    if set {
+                        add(
+                            format!("{at}/{kind}"),
+                            "probes on init containers (which run to completion; Kubernetes rejects them) are",
+                            "orqos#19",
+                        );
+                    }
+                }
+            }
             if matches!(c.pull, Some(Pull::Always | Pull::Never)) {
                 add(
                     format!("{at}/pull"),
@@ -1426,6 +1454,61 @@ mod tests {
     }
 
     #[test]
+    fn init_containers_and_sidecars_are_translated_in_order() {
+        let p = program(
+            json!({"ir": "rezn.dev/v2", "deployment": "shop", "namespace": "store", "resources": [
+                {"kind": "secret", "name": "app", "fields": {"type": "opaque", "keys": ["token"],
+                    "source": {"random": {"token": {"length": 16, "alphabet": "hex"}}}}},
+                {"kind": "replica_set", "name": "worker", "fields": {"replicas": 1, "pod": {
+                    "user": 1000,
+                    "init": [{"name": "trust", "image": "alpine:3.22", "command": ["true"]},
+                             {"name": "prepare", "image": "alpine:3.22", "command": ["true"],
+                              "env": [{"name": "TOKEN", "secret": {"name": "app", "key": "token"}}]}],
+                    "sidecars": [{"name": "credentials", "image": "alpine:3.22",
+                                  "startup": {"exec": ["test", "-s", "/run/token"], "period_seconds": 5, "failure_threshold": 120}}],
+                    "containers": [{"name": "worker", "image": "alpine:3.22"}]}}}
+            ]}),
+        );
+        let stored = BTreeMap::from([(
+            "app".to_string(),
+            BTreeMap::from([("token".to_string(), "v1".to_string())]),
+        )]);
+        let t = super::translate(OWNER_ID, &p, &stored).unwrap();
+        let spec = &t.workloads[0].pods[0].spec;
+        let names =
+            |list: &[ContainerSpec]| list.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&spec.init), ["trust", "prepare"]);
+        assert_eq!(names(&spec.sidecars), ["credentials"]);
+        assert_eq!(names(&spec.containers), ["worker"]);
+        assert_eq!(
+            spec.init[0].user,
+            Some(1000),
+            "pod defaults apply to init containers"
+        );
+        assert_eq!(
+            spec.sidecars[0].startup.as_ref().unwrap().failure_threshold,
+            120
+        );
+        assert_eq!(
+            spec.init[1].secret_env["TOKEN"].secret, t.objects[0].id,
+            "secrets used only by init containers are still provided"
+        );
+
+        // Probes on init containers and per-container limits on sidecars are reported with their own pointers.
+        let mut bad = p.clone();
+        let Spec::ReplicaSet(set) = &mut bad.resources[1].spec else {
+            panic!()
+        };
+        set.pod.init[0].readiness = set.pod.sidecars[0].startup.clone();
+        set.pod.sidecars[0].pull = Some(Pull::Always);
+        let reasons = unsupported(&bad);
+        assert_eq!(reasons.len(), 2, "{reasons:?}");
+        assert!(reasons[0]
+            .starts_with("/resources/1/fields/pod/init/0/readiness: probes on init containers"));
+        assert!(reasons[1].starts_with("/resources/1/fields/pod/sidecars/0/pull:"));
+    }
+
+    #[test]
     fn unsupported_features_are_all_reported() {
         // Probes run since rezn#71: the minimal example (a readiness probe on a named port) translates, with IR
         // v2's defaults filled in and the port resolved.
@@ -1467,7 +1550,6 @@ mod tests {
         let reasons = unsupported(&example("reference.json")).join("\n");
         for expected in [
             "jobs are",
-            "init containers are",
             "resource requests and limits are",
             "revision phases are",
             "ingresses are",
@@ -1475,8 +1557,10 @@ mod tests {
         ] {
             assert!(reasons.contains(expected), "{expected}:\n{reasons}");
         }
-        // Storage, identity, configs, secrets, certificates and probes run now.
+        // Storage, identity, configs, secrets, certificates, probes, init containers and sidecars run now.
         for gone in [
+            "init containers are",
+            "sidecars are",
             "probes",
             "certificate",
             "mounts are",

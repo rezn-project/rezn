@@ -266,10 +266,11 @@ A changed identity replaces the workload; an unchanged one preserves its contain
 ## Execution on systemd and Podman (informative)
 
 Following [ADR 0001](adr/0001-execution-foundation.md): each pod is a Podman pod run by owned Quadlet units;
-`init` containers are one-shot units, `sidecars` and `containers` are services ordered after them, and a sidecar's
-`startup` probe gates the main containers (`Notify=healthy`). `scratch` volumes are pod-scoped, not per-container
-tmpfs mounts, because Podman tmpfs volumes vanish when no container mounts them. Every restart carries explicit
-backoff. Readiness is watched by Orqos, since `Notify=healthy` gates only start.
+`init` containers are one-shot units, retried in place on failure, `sidecars` and `containers` are services ordered
+after them, and a sidecar's `startup` probe gates the main containers: they wait at an `ExecStartPre` gate that
+Orqos's prober opens once every sidecar startup probe has passed (probes are Orqos's, not Podman healthchecks, so
+`Notify=healthy` is not used). `scratch` volumes are pod-scoped, not per-container tmpfs mounts, because Podman
+tmpfs volumes vanish when no container mounts them. Every restart carries explicit backoff.
 
 Each namespace is one Podman network with aardvark-dns, and services are network aliases on their target's pods
 ([networking](DEVELOPMENT.md#networking-and-services)): a non-headless service resolves to every ready replica

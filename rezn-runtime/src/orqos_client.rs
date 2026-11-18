@@ -14,6 +14,12 @@ use utoipa::ToSchema;
 pub struct PodSpec {
     pub hostname: String,
     pub containers: Vec<ContainerSpec>,
+    /// Run once, in order, before sidecars and containers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub init: Vec<ContainerSpec>,
+    /// Started before containers, always restarted; a startup probe gates the containers' start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidecars: Vec<ContainerSpec>,
     pub restart: Restart,
     pub grace_seconds: u32,
     #[serde(default)]
@@ -221,6 +227,8 @@ pub struct PodStatus {
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct ContainerStatus {
     pub name: String,
+    /// `init`, `sidecar` or `container`.
+    pub kind: String,
     pub active_state: String,
     pub sub_state: String,
     pub result: String,
@@ -397,6 +405,8 @@ mod tests {
     fn spec() -> PodSpec {
         PodSpec {
             hostname: "web-0".into(),
+            init: vec![],
+            sidecars: vec![],
             containers: vec![ContainerSpec {
                 name: "web".into(),
                 image: "docker.io/library/nginx:1.27-alpine".into(),
@@ -473,7 +483,7 @@ mod tests {
         let observed = json!([{
             "id": "rz-1", "desired": "running", "state": "running", "ready": true,
             "pod": {"unit": "orqos-rz-1-pod.service", "active_state": "active", "sub_state": "running", "result": "success", "restarts": 0},
-            "containers": [{"name": "web", "unit": "orqos-rz-1-c-web.service", "active_state": "active", "sub_state": "running", "result": "success", "restarts": 2,
+            "containers": [{"name": "web", "kind": "container", "unit": "orqos-rz-1-c-web.service", "active_state": "active", "sub_state": "running", "result": "success", "restarts": 2,
                             "started": true, "ready": true, "probe_restarts": 1, "last_probe_failure": "liveness: HTTP 500"}],
             "spec": {"hostname": "web-0", "restart": "always", "grace_seconds": 30, "labels": {"dev.rezn.owner": "ab"},
                      "network": {"name": "rz-net", "aliases": ["web", "web.store.svc"]},

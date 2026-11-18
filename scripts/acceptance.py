@@ -302,6 +302,7 @@ class Acceptance:
         self.configuration()
         self.certificates()
         self.probes()
+        self.pod_lifecycle()
 
         networks = {n["podman_name"] for n in self.owned_networks()}
         assert len(networks) == 2, networks
@@ -754,6 +755,56 @@ class Acceptance:
         self.settled(revision)
         self.record("an ordered replica set creates each replica only once the previous one is ready")
         self.settled(apply([]))
+
+    def pod_lifecycle(self):
+        name = self.deployment + "-w"
+        namespace = "pods"
+        work = [{"volume": "work", "path": "/work"}]
+        flaky = "n=$(cat /work/n 2>/dev/null || echo 0); echo $((n+1)) > /work/n; [ $n -ge 2 ]"
+        loop = "trap 'exit 0' TERM; while true; do sleep 1; done"
+
+        def worker(level):
+            return {"kind": "replica_set", "name": "worker", "fields": {"replicas": 1, "pod": {
+                "grace_seconds": 2,
+                "volumes": [{"name": "work", "scratch": {"medium": "memory", "bytes": 1048576}}],
+                "init": [
+                    {"name": "one", "image": IMAGE, "command": ["/bin/sh", "-c", "echo -n 1 > /work/order"],
+                     "mounts": work},
+                    {"name": "two", "image": IMAGE, "command": ["/bin/sh", "-c", "echo -n 2 >> /work/order"],
+                     "mounts": work},
+                    {"name": "flaky", "image": IMAGE, "command": ["/bin/sh", "-c", flaky], "mounts": work}],
+                "sidecars": [{"name": "side", "image": IMAGE, "mounts": work,
+                              "command": ["/bin/sh", "-c", f"sleep 3; date +%s > /work/token; {loop}"],
+                              "startup": {"exec": ["test", "-s", "/work/token"], "period_seconds": 1,
+                                          "failure_threshold": 60}}],
+                "containers": [{"name": "app", "image": IMAGE, "mounts": work,
+                                "env": [{"name": "LEVEL", "value": level}],
+                                "command": ["/bin/sh", "-c", "cat /work/order > /work/main-saw; test -s /work/token && "
+                                            f"echo yes > /work/main-token; {loop}"]}]}}}
+
+        def check(status):
+            replica = self.pods(status, "worker", name)[0]
+            out = podman("exec", self.container(replica), "sh", "-c",
+                         "cat /work/order; echo; cat /work/n; cat /work/main-saw; echo; cat /work/main-token")
+            assert out.split() == ["12", "3", "12", "yes"], out
+            kinds = [(c["name"], c["kind"]) for c in replica["containers"]]
+            assert kinds == [("one", "init"), ("two", "init"), ("flaky", "init"), ("side", "sidecar"),
+                             ("app", "container")], kinds
+            assert all(c["sub_state"] == "exited" for c in replica["containers"] if c["kind"] == "init")
+            assert replica["ready"] and all(c["ready"] for c in replica["containers"] if c["kind"] != "init")
+            return replica
+
+        status = self.settled(self.apply([worker("a")], deployment=name, namespace=namespace))
+        first = check(status)
+        self.record("init containers run once, in order, and a failing one is retried until it succeeds; the main "
+                    "container starts only after its sidecar's startup probe passes; status lists every container "
+                    "with its kind")
+        status = self.settled(self.apply([worker("b")], deployment=name, namespace=namespace))
+        replica = check(status)
+        assert replica["id"] == first["id"]
+        assert podman("exec", self.container(replica), "printenv", "LEVEL") == "b"
+        self.record("a changed pod runs its init containers and gated start again, from empty scratch volumes")
+        self.settled(self.apply([], deployment=name, namespace=namespace))
 
     def services(self):
         web_service = service("web")
