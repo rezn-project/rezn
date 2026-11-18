@@ -1,23 +1,19 @@
-use std::{collections::HashMap, sync::Arc, sync::Mutex};
+use std::{sync::Arc, sync::Mutex};
 
 use axum::{body::to_bytes, extract::Request, http::Method, http::StatusCode, http::Uri, Router};
 use tokio::{net::TcpListener, task::JoinHandle};
 
 use crate::orqos_client::OrqosClient;
 
+/// The workload bearer token every test client sends.
+pub const TOKEN: &str = "test-token-0123456789abcdef0123456789";
+
 #[derive(Clone, Debug)]
 pub struct RecordedRequest {
     pub method: Method,
     pub uri: Uri,
+    pub authorization: Option<String>,
     pub body: Vec<u8>,
-}
-
-impl RecordedRequest {
-    pub fn query(&self) -> HashMap<String, String> {
-        url::form_urlencoded::parse(self.uri.query().unwrap_or_default().as_bytes())
-            .into_owned()
-            .collect()
-    }
 }
 
 pub struct MockOrqos {
@@ -51,6 +47,11 @@ impl MockOrqos {
                 let request = RecordedRequest {
                     method: parts.method,
                     uri: parts.uri,
+                    authorization: parts
+                        .headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from),
                     body: to_bytes(body, 64 * 1024).await.unwrap().to_vec(),
                 };
                 captured.lock().unwrap().push(request.clone());
@@ -59,7 +60,7 @@ impl MockOrqos {
         });
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         Self {
-            client: OrqosClient::new(format!("http://{address}")),
+            client: OrqosClient::new(format!("http://{address}"), TOKEN).unwrap(),
             requests,
             task,
         }
@@ -92,18 +93,12 @@ pub fn signed(program: impl Into<serde_json::Value>) -> common::types::Instructi
     }
 }
 
-pub fn pod(name: &str, image: &str, replicas: usize, ports: &[u16]) -> serde_json::Value {
-    serde_json::json!({"kind":"pod", "name":name, "fields":{"image":image, "replicas":replicas, "ports":ports}})
-}
-
 pub fn app(client: OrqosClient, db: Option<sled::Db>) -> Arc<crate::AppState> {
     let db = db.unwrap_or_else(|| sled::Config::new().temporary(true).open().unwrap());
     crate::store::initialize(&db).unwrap();
     Arc::new(crate::AppState {
         db: Arc::new(db),
         orqos: Arc::new(client),
-        stats: Default::default(),
-        stats_tx: tokio::sync::broadcast::channel(10).0,
         secret_store: crate::secret::SecretStore::temporary(),
         controller: Default::default(),
     })

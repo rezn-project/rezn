@@ -1,10 +1,6 @@
-use std::collections::BTreeMap;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-
-pub type DesiredMap = BTreeMap<String, Vec<Instruction>>;
 
 #[derive(Clone, Serialize, Deserialize, Debug, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -16,7 +12,7 @@ pub struct Signature {
 }
 
 /// Keep submitted program values intact until canonical signature verification.
-/// `program` is an array (IR v1) or an object (IR v2, see `crate::ir_v2`).
+/// `program` is an IR v2 program object (see `crate::ir_v2`); arrays are the retired IR v1.
 #[derive(Clone, Serialize, Deserialize, Debug, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InstructionWrapper {
@@ -30,20 +26,4 @@ pub struct InstructionMeta {
     pub sig_id: String,
     pub applied_at: DateTime<Utc>,
     pub instructions: Vec<(String, String)>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Instruction {
-    pub kind: String,
-    pub name: String,
-    pub fields: PodFields,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct PodFields {
-    pub image: String,
-    pub replicas: usize,
-    pub ports: Vec<u16>,
 }

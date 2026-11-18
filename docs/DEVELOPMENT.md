@@ -1,6 +1,9 @@
 # Development
 
-Rezn controls local Docker containers through Orqos. Use Rust 1.99.0 and the system OpenSSL development libraries (`build-essential`, `pkg-config`, `libssl-dev` on Ubuntu).
+Rezn accepts signed [IR v2](IR-v2.md) programs and reconciles them into systemd/Podman pods through
+[Orqos](https://github.com/orqos-project/orqos)'s workload backend ([ADR 0001](adr/0001-execution-foundation.md)).
+Use Rust 1.99.0 and the system OpenSSL development libraries (`build-essential`, `pkg-config`, `libssl-dev` on
+Ubuntu).
 
 ## Checks
 
@@ -9,135 +12,187 @@ cargo fmt --check
 cargo build --locked --workspace
 cargo test --locked --workspace
 cargo clippy --locked --workspace --all-targets
+python3 -m unittest discover -s scripts -p 'test_spec.py'   # needs python3-jsonschema and python3-yaml
 ```
 
-Push/PR CI runs these ordinary checks without Docker. The live acceptance script is explicit and requires Python 3, OpenSSL 3 with Ed25519 support, a reachable local Docker engine/context, Docker-only Orqos, and pre-pulled test images. Dependencies and the lockfile are unchanged.
+Push/PR CI runs these. The controller tests run against an in-memory mock of Orqos's workload API. The live
+acceptance (below) runs against real systemd and Podman in the *Acceptance* workflow on Ubuntu 26.04.
 
-Pre-existing warnings remain in the secret routes/store and stats: an unused import, unused secret import/export methods, `Option::map` returning unit, and a needless borrow. Cargo also reports future incompatibility in the existing `proc-macro-error2` dependency. The new controller code adds no warnings.
+Pre-existing warnings remain in the secret routes and store: an unused import, unused secret import/export methods
+and `Option::map` returning unit. Cargo also reports future incompatibility in the existing `proc-macro-error2`
+dependency.
 
 ## Run locally
 
-With Orqos already built in the sibling checkout, start it using the intended Docker context's socket:
+Rezn needs Orqos with the workload backend: root, systemd 254 or newer, Podman 5 or newer and subordinate IDs for
+the `containers` user (Orqos `docs/WORKLOAD_API.md`). Start Orqos from the sibling checkout with a random token:
 
 ```bash
-ORQOS_BACKENDS=docker \
-DOCKER_SOCKET="$(docker context inspect desktop-linux --format '{{.Endpoints.docker.Host}}')" \
-../orqos/target/debug/orqos
+export ORQOS_WORKLOAD_TOKEN="$(openssl rand -hex 32)"
+sudo --preserve-env=ORQOS_WORKLOAD_TOKEN ORQOS_BACKENDS=workload BIND_ADDR=127.0.0.1:9090 ../orqos/target/debug/orqos
 ```
 
-Select a **new** state database when upgrading from the previous format:
+Then Rezn, with the same token:
 
 ```bash
-STATE_DB_PATH=./rezn-local-v1 \
+STATE_DB_PATH=./rezn-local \
 SECRETS_DB_PATH=./rezn-local-secrets \
-ORQOS_API_URL=http://127.0.0.1:3000 \
-STATS_WS_URL=ws://127.0.0.1:3000/stats/ws \
+ORQOS_API_URL=http://127.0.0.1:9090 \
+ORQOS_WORKLOAD_TOKEN="$ORQOS_WORKLOAD_TOKEN" \
 RECONCILE_INTERVAL=15 \
 cargo run --locked -p rezn
 ```
 
-`BIND_ADDR` defaults to `127.0.0.1:4000`. `RECONCILE_INTERVAL` must be positive seconds. Startup creates or validates controller state before serving HTTP; a corrupt or unrecognized database stops startup. Within a running process, state-read/validation failures stop reconciliation and return HTTP 500 from the state/status endpoints.
+`ORQOS_WORKLOAD_TOKEN` is required (at least 32 bytes); `ORQOS_API_URL` defaults to `http://127.0.0.1:9090`,
+`BIND_ADDR` to `127.0.0.1:4000`. `RECONCILE_INTERVAL` must be positive seconds. Startup creates or validates
+controller state before serving HTTP; a corrupt or unrecognized database stops startup. Within a running process,
+state-read/validation failures stop reconciliation and return HTTP 500 from the state and status endpoints.
 
-Pull desired images explicitly into the same engine before applying them:
-
-```bash
-docker --context desktop-linux pull nginx:alpine
-cargo run --locked -p reznctl -- http://127.0.0.1:4000/apply demo examples/test.ir.json
-```
-
-The actual binary is `reznctl`; its first argument is the complete `/apply` URL. It prints the accepted response and includes response details on HTTP failure. `examples/test.ir.json` is a newly signed supported program, not a stripped version of an unsupported signed bundle. `examples/web.rezn` illustrates the matching DSL subset. To produce a fresh development envelope without installing the DSL:
+Sign and apply the runnable example, then watch it converge:
 
 ```bash
-python3 scripts/signed_program.py examples/web.program.json > /tmp/web.signed.json
-cargo run --locked -p reznctl -- http://127.0.0.1:4000/apply demo /tmp/web.signed.json
+python3 scripts/signed_program.py examples/ir-v2/runnable.json > /tmp/demo.signed.json
+cargo run --locked -p reznctl -- http://127.0.0.1:4000/apply demo /tmp/demo.signed.json
+curl -s http://127.0.0.1:4000/status
+sudo podman ps --filter label=dev.rezn.deployment=demo
 ```
 
-That signing helper supports this ASCII/integer subset and generates a temporary key. General JSON signing requires full JCS canonicalization. Read the [signature limits and DSL discrepancy](SIGNATURES.md) before using signed programs outside local development.
+`reznctl`'s first argument is the complete `/apply` URL. The signing helper handles programs with ASCII strings and
+integers and generates a temporary key; general JSON signing needs full JCS canonicalization. Read the
+[signature limits](SIGNATURES.md) before using signed programs outside local development. Validate a program
+offline, bare or inside a signed envelope, with `cargo run --locked -p reznctl -- validate <file>`.
 
-## Executable intent and apply contract
+## Apply contract
 
-`/apply` accepts two program shapes. An **array** is IR v1, described in this section and executed through the Docker backend. An **object** is [IR v2](IR-v2.md): Rezn verifies its signature, validates it completely (the rules of `docs/IR-v2.md`, reported as `JSON-pointer: message` in the HTTP 400 body), requires its `deployment` to equal the `/apply` name (lowercase, at most 63 characters), and stores it. IR v2 programs are **not executed yet**: `/status` lists them under `unexecuted` until the systemd/Podman backend exists ([#30](https://github.com/rezn-project/rezn/issues/30)). Applying an IR v2 program to a deployment name that held IR v1 removes that deployment's IR v1 containers, like any removed workload.
+`POST /apply` accepts `{"name": "demo", "instruction_wrapper": {"program": {...}, "signature": {"algorithm":
+"ed25519", "pub": "base64 public key", "sig": "base64 signature"}}}`. The program is an IR v2 object: Rezn verifies
+the signature over its JCS canonical form, validates it completely (the rules of `docs/IR-v2.md`, reported as
+`JSON-pointer: message` in the HTTP 400 body), requires its `deployment` to equal `name` and stores the envelope
+intact.
 
-Validate an IR v2 program offline, bare or inside a signed envelope:
+**IR v1 is retired.** Instruction arrays are refused with HTTP 400, and a state database that still holds an IR v1
+deployment is refused at startup: use a new database (IR v1 Docker containers are left untouched; remove them
+yourself). The Rezn DSL still emits IR v1, so its output is not executable until it emits IR v2
+([rezn-dsl#29](https://github.com/rezn-project/rezn-dsl/issues/29)).
 
-```bash
-cargo run --locked -p reznctl -- validate examples/ir-v2/reference.json
-```
+Invalid signatures or programs return HTTP 400 with the reason. Malformed JSON and unknown envelope keys return an
+extractor 4xx (normally 422). Invalid submissions write no state and trigger no change. Success is `202
+{"stored":true,"revision":N}`: durable stored intent, not completed deployment. Each accepted apply increments a
+global revision. Apply replaces only the named deployment; a program with `"resources": []` removes its pods while
+keeping the deployment record.
 
-The schema, examples and the [Kubernetes subset](KUBERNETES-SUBSET.md) are also checked by `python3 -m unittest discover -s scripts -p 'test_spec.py'` (needs `python3-jsonschema` and `python3-yaml`); the Rust validator's conformance tests are `cargo test -p common`.
+## What runs
 
-The IR v1 contract:
+Orqos's workload backend runs pods of plain containers: image, `command`, `args`, literal environment values,
+restart policy and grace period. A deployment runs only when **every** resource maps exactly onto that:
 
-`POST /apply` accepts `{ "name": "demo", "instruction_wrapper": { "program": [...], "signature": { "algorithm": "ed25519", "pub": "base64 public key", "sig": "base64 signature" } } }`.
+- `replica_set` resources, each replica as one Orqos pod (one Podman pod with its own network namespace, user
+  namespace and hostname `<name>-<ordinal>`);
+- `config` resources, which are inert until something consumes them;
+- containers with `pull` absent or `if_not_present`, environment `value`s, and declared `ports` (informational, as in
+  Kubernetes: nothing is published).
 
-The signature covers JCS-canonicalized **submitted program values**, before typed validation. The original signed envelope is stored intact. Deployment and pod names must be 1–63 ASCII letters/digits, `-` or `_`, starting with a letter/digit. Pod names must be unique within a deployment; the same pod name in different deployments is independent.
+Anything else leaves the whole deployment **unexecuted**: services and ingress, network policies, secrets, jobs,
+volume claims, phases, init containers and sidecars, pod and container security settings, volumes and mounts,
+probes, resource requests and limits, other pull policies, registry credentials, and secret or pod-IP environment
+references. `/status` lists every blocking field as `JSON-pointer: reason (issue)`, citing the issue that adds it.
+An unexecuted deployment's pods from an earlier revision keep running untouched. Ordered replica sets need a
+headless service, so they wait for services ([#58](https://github.com/rezn-project/rezn/issues/58)); their
+sequencing is implemented and unit-tested already.
 
-Every instruction must have exactly `kind`, `name`, and `fields`. `kind` must be `pod`; fields must contain exactly `image`, `replicas` and `ports`. Unknown keys, any `options`, `env` or `secure` fields (including null/false), and service/volume/enum/secret instructions are rejected. Replicas must be nonnegative integers. Ports must be unique TCP container-port integers from 1 to 65535; `[]` publishes none. Host ports are dynamically allocated, and Orqos currently binds them on `0.0.0.0`.
+## Reconciliation
 
-Images use a bounded Docker-reference subset: lowercase repository components, optional DNS/IPv4/localhost registry and numeric port, optional Docker tag, and optional `@sha256:<64 lowercase hex digits>`. Empty, whitespace-containing, URL-like and malformed references are rejected. IPv6 registry syntax and other digest algorithms are outside this subset. A syntactically valid but missing image is accepted as intent and appears as a backend convergence error; Rezn never pulls it.
+One serialized loop runs after every apply and every `RECONCILE_INTERVAL`. Each pass:
 
-Invalid signatures or executable intent return HTTP 400 with the reason. Malformed JSON/envelopes and unknown envelope keys return an extractor 4xx response (normally 422; malformed JSON is 400). Invalid submissions write no state and trigger no container mutation. Successful responses are `202 {"stored":true,"revision":N}`: they acknowledge durable stored intent, not completed deployment. Each accepted apply increments a global database revision. Apply replaces only the named deployment; a signed `program: []` removes all its workloads while keeping the deployment record. `replicas: 0` keeps a desired pod with no containers.
+1. loads and validates the whole stored state, translating each deployment into desired pods;
+2. lists Orqos's pods and keeps those whose labels claim this database's owner, proving each claim (below);
+3. plans and applies a bounded set of changes, per replica set:
+   - removes pods of removed resources or deployments, and replicas beyond the count (highest ordinals);
+   - creates missing replicas;
+   - replaces pods whose spec changed: those not running at once, a running one (highest ordinal first) only
+     while every other replica of the set exists and runs, so a rolling change keeps the rest serving;
+   - re-applies an unchanged pod Orqos reports `stopped` (for example after a host reboot), which starts it;
+   - leaves `restarting`, `degraded` and `failed` pods to systemd's restart backoff, and reports them.
+   Ordered replica sets with `ordered` management create the lowest missing replica only once all lower ones run,
+   and remove the highest only once the others run.
+4. observes again and succeeds only when the executed deployments match.
+
+Every planned change is attempted even if an earlier one fails; failures keep Orqos's operation, HTTP status and
+message and appear in `/status` `errors` until a later pass succeeds. If an apply lands during a pass, the pass
+retries with the new revision.
 
 ## Observable status
 
-`GET /state` and existing `GET /state/raw` return accepted desired intent keyed by deployment: an IR v1 instruction array or the IR v2 program object as signed. Corrupt, missing or invalid persisted state returns HTTP 500, never an empty map. `GET /status` reports:
+`GET /state` and `GET /state/raw` return the accepted IR v2 program objects by deployment. Corrupt, missing or
+invalid persisted state returns HTTP 500, never an empty map. `GET /status` reports:
 
 | Field | Meaning |
 | --- | --- |
 | `owner` | Persistent database ownership identity |
-| `desired_revision`, `observed_revision` | Latest stored revision and the snapshot used by the last successful owner-wide listing |
+| `desired_revision`, `observed_revision` | Latest stored revision and the revision of the last successful observation |
 | `last_observation`, `last_attempt` | UTC RFC3339 times; observation is null until a listing succeeds |
-| `observation` | `unknown` before any successful listing; `stale` after a failed pass; `pending` when observation belongs to an older revision; otherwise `fresh` |
-| `converged` | True only when the observed revision equals desired, every owned container matches desired configuration and is running, all replica counts match, and the pass has no errors |
-| `errors` | Last pass's validation, observation, mutation or convergence errors; cleared after a successful pass |
-| `unexecuted` | IR v2 deployments that are stored and valid but not executed yet; `converged` stays false while any are listed |
-| `workloads[]` | Deployment/pod, desired fields and configuration hash, current configuration hashes, desired/running replica counts and observed containers |
+| `observation` | `unknown` before any successful listing; `stale` after a failed pass; `pending` when the observation belongs to an older revision; otherwise `fresh` |
+| `converged` | True only when the observation is fresh for this revision, the last pass had no errors, no deployment is unexecuted, every desired pod runs with its exact spec and no other owned pod exists |
+| `errors` | The last pass's validation, observation, mutation or convergence errors; cleared after a successful pass |
+| `unexecuted[]` | `deployment` and `reasons` (`JSON-pointer: reason (issue)`) for each program the backend cannot run yet |
+| `workloads[]` | Per replica set: `deployment`, `kind`, `resource`, `desired_replicas` (null for pods awaiting removal or of unexecuted deployments), `running_replicas` (null until observed) and `pods[]` |
+| `pods[]` | `id`, `ordinal`, `hostname`, Orqos's `state` (`running`, `starting`, `restarting`, `degraded`, `failed`, `stopped`), `current` (runs the desired spec), `containers[]` (`name`, `active_state`, `sub_state`, `result`, `restarts`) and Orqos's last `error` |
 
-Container entries use Docker listing names: `Id`, `Image`, `State`, `Labels`, `Ports`. Current configuration hashes are in `current_configurations` and the container's `dev.rezn.configuration` label; actual images and port mappings are in its `Image` and `Ports`. Each port mapping has `IP`, `PrivatePort`, `PublicPort`, `Type`. Unpublished ports have null `PublicPort`. Read allocated host ports from these observations: the create response's requested `host: 0` is not an allocated port.
+After a failure, status keeps the last successful observation with its timestamp and marks it stale; it never
+invents zero replicas or declares success. It starts `unknown` after a restart and rebuilds from Orqos's listing.
 
-Running counts are null when observations are unknown. After a failure, the API retains the last successfully observed containers/counts with their timestamp and marks them stale; it never invents zero replicas or declares success. Stale counts for newly desired pods come from the previous complete owner-wide listing and describe that older snapshot. Status is a snapshot, not a live Docker query on each GET. It starts unknown after restart, then reconstructs containers and ports from listings. Removed pods can remain visible with desired count zero while their observed containers await deletion. A newer apply immediately prevents an older observation from claiming convergence of that revision, even when the instructions are identical.
-
-OpenAPI and Swagger are available at `/api/openapi.json` and `/swagger`.
+OpenAPI and Swagger are at `/api/openapi.json` and `/swagger`.
 
 ## State format and ownership
 
-The state database now stores one JSON value at `controller/v1`: `format` (below), a random 256-bit `owner`, a monotonic `revision`, and deployments containing their original signed envelope and instruction metadata (`sig_id`, `applied_at`, instruction names/kinds). One atomic sled insertion stores intent and metadata together, followed by a durable flush before HTTP acceptance. Rezn validates the entire record, signatures and executable fields before any reconciliation mutation.
+The state database stores one JSON value at `controller/v1`: `format`, a random 256-bit `owner`, a monotonic
+`revision`, and deployments with their original signed envelope and metadata (`sig_id`, `applied_at`, resource
+kinds and names). One atomic sled insertion stores intent and metadata, followed by a durable flush before HTTP
+acceptance. Rezn validates the whole record, signatures and programs before any change.
 
-**Format 1 → 2.** Format 1 holds only IR v1 programs. The first accepted IR v2 program rewrites the record as format 2 in the same atomic insertion; format 2 holds either version. The migration is forward-only: a binary that only knows format 1 refuses a format 2 database instead of misreading it, and a format 1 record that contains an IR v2 program is refused as invalid. Databases that never receive an IR v2 program stay at format 1.
+New databases are **format 2**. Format 1 held IR v1 programs: an empty format 1 database still loads and becomes
+format 2 on the next apply; one with deployments is refused. Databases with the older `desired`/`instruction/*`
+keys are refused too; there is no migration or adoption. Copying a state database to another controller duplicates
+its ownership identity, so run one process per identity. Losing the database leaves its pods unproven and
+untouched by a new controller.
 
-There is no automatic legacy migration or implicit adoption. Databases using the old `desired`/`instruction/*` keys without the new record are refused; select a fresh database explicitly and handle old containers manually. Copying the same state database to another controller duplicates its ownership identity, so run only one process against that identity. A restart with the original database preserves ownership; losing the database leaves those resources unproven and untouched by a new controller.
-
-Owned containers carry all five labels:
+Each replica is one Orqos pod with ID `rz-<first 24 hex digits of sha256([owner, deployment, kind, resource,
+ordinal])>` and these labels on the Podman pod and its containers:
 
 ```text
-dev.rezn.owner=<persistent 64-character hex identity>
-dev.rezn.managed=v1
-dev.rezn.deployment=<deployment name>
-dev.rezn.pod=<pod name>
-dev.rezn.configuration=<sha256 of canonical image + sorted TCP ports>
+dev.rezn.owner=<64-character hex owner identity>
+dev.rezn.deployment=<deployment>
+dev.rezn.namespace=<namespace>
+dev.rezn.kind=replica_set | ordered_replica_set
+dev.rezn.resource=<resource name>
+dev.rezn.ordinal=<replica number>
 ```
 
-Replica count is excluded from the configuration hash; port order is irrelevant. Container names are unique opaque `rezn-<random hex>` values and provide no ownership proof. The runtime requests `GET /docker/containers?all=true&label=dev.rezn.owner=...` and checks labels locally before ID-based mutations. Foreign identities and resources without the `v1` marker are untouched. Malformed proofs on resources claiming this identity and marker fail the whole observation before mutation.
+Rezn checks labels locally: a listing is not proof. Pods of other owners, or without the owner label, are
+ignored. A pod that claims this owner but has missing or malformed labels, or an ID that differs from the one its
+labels produce, fails the whole observation before any change. Orqos separately refuses to touch units and Podman
+pods it does not own (its own `dev.orqos.owner` token).
 
-One serialized loop observes all owned running **and stopped** containers, including removed workloads. It retains matching replicas, force-removes changed/excess/removed/stopped containers by ID, then creates missing replicas. Force removal makes no graceful-shutdown guarantee. Failed creates/starts/removals are reported, and subsequent passes observe and retry without trusting the previous action's outcome. Follow-up listings confirm convergence and allocated ports. Apply wakes the loop; periodic passes recover from backend outages and external stops. Image/port updates use replacement, with downtime and changing dynamic ports allowed.
+## Live acceptance
 
-## Live Docker acceptance
-
-Prerequisites: the Rezn workspace built with the command above, a prebuilt sibling `../orqos/target/debug/orqos` (or `--orqos-bin /absolute/path`), Python 3, OpenSSL 3 and a local Docker context. Explicitly pre-pull the test images:
+From this repository, with Orqos built in the sibling checkout and the prerequisites above:
 
 ```bash
-docker --context desktop-linux pull nginx:alpine
-docker --context desktop-linux pull httpd:alpine
+cargo build --locked --workspace
+sudo python3 scripts/acceptance.py --orqos-bin ../orqos/target/debug/orqos --rezn-bin target/debug/rezn
 ```
 
-One reproducible acceptance command, from this repository:
+The script starts its own Orqos (workload backend) and Rezn on loopback ports with temporary state and keys,
+applies signed IR v2 programs and checks with Podman itself:
 
-```bash
-python3 scripts/acceptance.py --docker-context desktop-linux
-```
+- a replica set runs one pod per replica with the right hostnames and environment;
+- an unchanged re-apply keeps every container;
+- scaling 2 → 3 → 1 touches only the highest ordinals;
+- a changed spec replaces replicas one at a time, highest first, never stopping both;
+- a program needing unsupported features is reported with reasons and changes nothing;
+- a restarted Rezn keeps its identity and changes nothing;
+- a killed container is restarted by systemd without Rezn replacing the pod;
+- an empty program removes every owned pod while a foreign Orqos pod stays.
 
-The script starts its own Docker-only Orqos and real Rezn processes on loopback ephemeral ports. It uses isolated temporary state/secrets databases and signing/age keys; waits are bounded. It performs signed HTTP create, unchanged reapply, scale `1 → 2 → 1 → 0`, image/port changes at equal replica count, removal of one pod, empty program, Rezn restarts, external stop recovery, and an outage/restart of its own Orqos process. It verifies nonzero published HTTP service, observed ports against Docker inspect, stable unchanged identities, no stopped leftovers and a foreign container with legacy name/labels staying untouched. It also checks signed unsupported intent changes neither state nor containers.
-
-Cleanup runs on failures and success, verifies labels and removes only its owned fixtures and marked foreign fixture, then stops its own child processes. It never stops Docker Desktop or prunes resources. Image pulls are outside the acceptance script and production controller. Failure logs are printed before temporary artifacts are discarded. Ordinary CI needs none of these live prerequisites.
-
-The full acceptance run passed locally on 2026-10-08 with the `desktop-linux` context (Docker 29.8.2), including process/backend restarts and HTTP on an observed allocated port.
+It removes everything it created, including after a failure. The *Acceptance* workflow runs it on Ubuntu 26.04
+against the Orqos commit pinned in `.github/workflows/acceptance.yml`.

@@ -1,4 +1,4 @@
-"""Ed25519 envelopes for the supported ASCII/integer pod subset (OpenSSL 3)."""
+"""Ed25519 envelopes for IR v2 programs with ASCII strings and integers only (OpenSSL 3)."""
 import base64
 import json
 import subprocess
@@ -17,7 +17,7 @@ def generate_key(directory):
 
 
 def sign(program, key):
-    # This subset has ASCII strings and integers: sorted compact JSON equals JCS.
+    # With only ASCII strings and integers, sorted compact JSON equals JCS.
     # General Unicode/floating-point programs require a full JCS implementation.
     message = json.dumps(program, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     message.encode("ascii")
@@ -36,8 +36,8 @@ def sign(program, key):
 if __name__ == "__main__":
     import argparse
     import tempfile
-    parser = argparse.ArgumentParser(description="Sign a supported ASCII pod program with an isolated development key")
-    parser.add_argument("program", type=Path, help="JSON array of pod instructions")
+    parser = argparse.ArgumentParser(description="Sign an ASCII IR v2 program with an isolated development key")
+    parser.add_argument("program", type=Path, help="IR v2 program JSON")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="rezn-sign-") as temporary:
         print(json.dumps(sign(json.loads(args.program.read_text()), generate_key(temporary))))

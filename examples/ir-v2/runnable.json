@@ -1,0 +1,45 @@
+{
+  "ir": "rezn.dev/v2",
+  "deployment": "demo",
+  "namespace": "demo",
+  "resources": [
+    {
+      "kind": "config",
+      "name": "settings",
+      "fields": {
+        "data": {
+          "greeting": "hello"
+        }
+      }
+    },
+    {
+      "kind": "replica_set",
+      "name": "web",
+      "fields": {
+        "replicas": 2,
+        "pod": {
+          "grace_seconds": 10,
+          "containers": [
+            {
+              "name": "web",
+              "image": "docker.io/library/nginx:1.27-alpine",
+              "pull": "if_not_present",
+              "env": [
+                {
+                  "name": "NGINX_ENTRYPOINT_QUIET_LOGS",
+                  "value": "1"
+                }
+              ],
+              "ports": [
+                {
+                  "name": "http",
+                  "port": 80
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

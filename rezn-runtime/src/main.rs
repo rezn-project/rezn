@@ -3,11 +3,11 @@ mod intent;
 mod orqos_client;
 mod reconcile;
 mod store;
+mod workload;
 
 mod router;
 mod routes;
 mod secret;
-mod stats;
 
 #[cfg(test)]
 mod test_support;
@@ -17,40 +17,14 @@ mod tests;
 use std::env;
 use std::sync::Arc;
 
-use crate::{router::build_router, secret::SecretStore, stats::container_stats_handler};
+use crate::{router::build_router, secret::SecretStore};
 use sled::Db;
-use utoipa::ToSchema;
-
-use tokio::{
-    net::TcpListener,
-    sync::{broadcast, RwLock},
-};
-
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-
-#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
-struct Stats {
-    cpu_avg: Option<f64>,
-    max_mem: Option<u64>,
-}
-
-type ContainerID = String;
-
-#[derive(Debug, Clone, ToSchema, Serialize)]
-struct TimestampedStats {
-    stats: Stats,
-    timestamp: u64,
-}
-
-type StatsMap = BTreeMap<ContainerID, TimestampedStats>;
+use tokio::net::TcpListener;
 
 #[derive(Clone)]
 struct AppState {
     db: Arc<Db>,
     orqos: Arc<orqos_client::OrqosClient>,
-    stats: Arc<RwLock<StatsMap>>,
-    stats_tx: broadcast::Sender<serde_json::Value>,
     secret_store: SecretStore,
     controller: Arc<reconcile::Controller>,
 }
@@ -73,20 +47,14 @@ async fn main() -> anyhow::Result<()> {
 
     store::initialize(&db)?;
 
-    let (stats_tx, _) = broadcast::channel(100);
-
-    tracing::info!("Setting up ORQOS API client");
-
-    let orqos_url = env::var("ORQOS_API_URL").unwrap_or_else(|_| "http://localhost:3000".into());
-    // Validate URL format
-    if !orqos_url.starts_with("http://") && !orqos_url.starts_with("https://") {
-        return Err(anyhow::anyhow!(
-            "Invalid ORQOS_API_URL: must start with http:// or https://"
-        ));
-    }
-    let orqos = Arc::new(orqos_client::OrqosClient::new(&orqos_url));
-
-    tracing::info!("ORQOS API client initialized with URL: {}", orqos_url);
+    let orqos_url = env::var("ORQOS_API_URL").unwrap_or_else(|_| "http://127.0.0.1:9090".into());
+    let token = env::var("ORQOS_WORKLOAD_TOKEN").map_err(|_| {
+        anyhow::anyhow!(
+            "ORQOS_WORKLOAD_TOKEN must be set to the Orqos workload backend's bearer token"
+        )
+    })?;
+    let orqos = Arc::new(orqos_client::OrqosClient::new(&orqos_url, token)?);
+    tracing::info!("Orqos workload API at {}", orqos_url);
 
     let identity = age_keys::get_identity()?.clone();
 
@@ -96,8 +64,6 @@ async fn main() -> anyhow::Result<()> {
     let app_state = Arc::new(AppState {
         db,
         orqos,
-        stats: Arc::new(RwLock::new(BTreeMap::default())),
-        stats_tx,
         secret_store,
         controller: Arc::new(reconcile::Controller::default()),
     });
@@ -110,14 +76,6 @@ async fn main() -> anyhow::Result<()> {
         app_state.clone(),
         std::time::Duration::from_secs(interval),
     ));
-
-    let container_stats_handler_clone = Arc::clone(&app_state);
-
-    tokio::spawn(async move {
-        if let Err(e) = container_stats_handler(container_stats_handler_clone).await {
-            tracing::error!("Stats handler error: {}", e);
-        }
-    });
 
     let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:4000".into());
     let listener = TcpListener::bind(&bind_addr).await?;

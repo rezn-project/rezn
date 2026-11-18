@@ -29,7 +29,7 @@ fn validate(path: &str) -> Result<ExitCode> {
         _ => &document,
     };
     if program.is_array() {
-        eprintln!("{path}: an IR v1 instruction array; `reznctl validate` checks IR v2 programs");
+        eprintln!("{path}: an IR v1 instruction array; IR v1 is retired and Rezn accepts only IR v2 programs");
         return Ok(ExitCode::FAILURE);
     }
     match ir_v2::validate(program) {

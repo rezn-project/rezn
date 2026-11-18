@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 #[utoipa::path(
     get, path = "/state",
-    responses((status = 200, description = "Accepted desired intent per deployment, not runtime outcomes: an IR v1 instruction array or an IR v2 program object", body = Object), (status = 500, description = "Persisted state cannot be read or validated", body = String)), tag = "State"
+    responses((status = 200, description = "Accepted desired intent per deployment, not runtime outcomes: the IR v2 program object as signed", body = Object), (status = 500, description = "Persisted state cannot be read or validated", body = String)), tag = "State"
 )]
 pub async fn get_state_handler(
     State(app): State<Arc<AppState>>,

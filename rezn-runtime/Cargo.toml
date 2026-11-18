@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Andrea M. <andrea@andreamancuso.dev>"]
 license = "MIT"
-description = "Minimal Rust runtime for executing signed IR emitted by the Rezn DSL compiler."
+description = "Rezn runtime: reconciles signed IR v2 programs into systemd/Podman pods through Orqos."
 repository = "https://github.com/rezn-project/rezn"
 
 [dependencies]
@@ -12,7 +12,7 @@ common = { path = "../common" }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 utoipa = "5"
 utoipa-axum = "0.2"
-axum = { version = "0.8", features = ["ws", "macros"] }
+axum = { version = "0.8", features = ["macros"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
@@ -40,9 +40,6 @@ ed25519-dalek = "2.1.1"
 sha2 = "0.10.9"
 hex = "0.4.3"
 serde_json_canonicalizer = "0.3.0"
-futures-util = "0.3.31"
-url = "2.5.4"
-tokio-tungstenite = "0.22.0"
 axum-debug = "0.3.3"
 age = "0.11.1"
 once_cell = "1.21.3"

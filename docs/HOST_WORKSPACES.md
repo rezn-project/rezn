@@ -11,9 +11,9 @@ Current documentation, assuming sibling checkouts under `~/dev`:
 
 ## Rezn scope
 
-Rezn remains a local Docker controller using Orqos's Docker API. Its supported signed program is container-oriented: `pod` instructions with image, replicas and ports. Native development workspaces are managed by RawPair through Orqos's separate, token-protected `/host` API; they do not use Rezn reconciliation or signed DSL intent.
+Rezn reconciles signed IR v2 programs into systemd/Podman pods through Orqos's token-protected `/workload` API (it no longer uses Orqos's Docker API). Native development workspaces are managed by RawPair through Orqos's separate, token-protected `/host` API; they do not use Rezn reconciliation or signed intent.
 
-Orqos kept its Docker routes and semantics consumed by Rezn. Native mode (`ORQOS_BACKENDS=host`) does not mount the Docker routes, so Rezn needs an Orqos instance running with the `docker` or `both` backend.
+Orqos's host mode (`ORQOS_BACKENDS=host`) is exclusive, so Rezn needs a separate Orqos instance running the `workload` backend.
 
 ## Possible later work
 

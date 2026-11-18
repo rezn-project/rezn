@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
-"""Live signed HTTP lifecycle acceptance. Owns only its child processes/fixtures."""
+"""Live acceptance: signed IR v2 programs become systemd/Podman pods through Orqos's workload backend.
+
+Requires root, systemd >= 254, Podman >= 5 and subordinate ID ranges for the `containers` user (see Orqos
+docs/WORKLOAD_API.md). Starts its own Orqos (ORQOS_BACKENDS=workload) and Rezn on loopback ports with temporary
+state, and removes everything it created, including after a failure.
+
+    sudo python3 scripts/acceptance.py --orqos-bin ../orqos/target/debug/orqos --rezn-bin target/debug/rezn
+"""
 import argparse
 import json
 import os
 from pathlib import Path
+import secrets
 import signal
 import socket
 import subprocess
 import tempfile
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
-import uuid
 
 from signed_program import generate_key, sign
 
 ROOT = Path(__file__).resolve().parents[1]
+IMAGE = "docker.io/library/alpine:3.22"
+OWNER = "dev.rezn.owner"
 
 
 def free_port():
@@ -25,15 +33,18 @@ def free_port():
         return listener.getsockname()[1]
 
 
-def http(url, body=None, timeout=3):
+def http(url, body=None, method=None, token=None, timeout=10):
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     data = None if body is None else json.dumps(body).encode()
-    request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         raw = response.read()
         return response.status, json.loads(raw) if raw else None
 
 
-def wait(description, check, timeout=60):
+def wait(description, check, timeout=180, interval=0.5):
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
@@ -41,289 +52,261 @@ def wait(description, check, timeout=60):
             result = check()
             if result:
                 return result
-        except (OSError, ValueError, AssertionError) as error:
-            last = str(error)
-        time.sleep(0.2)
-    raise AssertionError(f"Timed out waiting for {description}; last error: {last}")
+        except (OSError, ValueError, AssertionError, KeyError) as error:
+            last = repr(error)
+        time.sleep(interval)
+    raise AssertionError(f"timed out waiting for {description}; last: {last}")
 
 
-def pod(name="web", image="nginx:alpine", replicas=1, ports=(80,)):
-    return {"kind": "pod", "name": name,
-            "fields": {"image": image, "replicas": replicas, "ports": list(ports)}}
+def podman(*args, check=True):
+    result = subprocess.run(["podman", *args], check=check, capture_output=True, text=True, timeout=60)
+    return result.stdout.strip()
+
+
+def replica_set(name, replicas, level):
+    return {"kind": "replica_set", "name": name, "fields": {"replicas": replicas, "pod": {
+        "grace_seconds": 5,
+        "containers": [{"name": "app", "image": IMAGE, "pull": "if_not_present",
+                        "command": ["/bin/sh", "-c", "trap 'exit 0' TERM; while true; do sleep 1; done"],
+                        "env": [{"name": "LEVEL", "value": level}]}]}}}
 
 
 class Acceptance:
     def __init__(self, args, directory):
         self.args = args
         self.directory = Path(directory)
-        self.run = "rezn-accept-" + uuid.uuid4().hex
+        self.deployment = "accept-" + secrets.token_hex(4)
+        self.foreign = "accept-foreign-" + secrets.token_hex(4)
         self.key = generate_key(directory)
+        self.token = secrets.token_hex(32)
         self.orqos_url = f"http://127.0.0.1:{free_port()}"
         self.rezn_url = f"http://127.0.0.1:{free_port()}"
         self.children = {}
-        self.logs = []
         self.owner = None
-        self.foreign = None
         self.steps = []
 
-    def docker(self, *args):
-        result = subprocess.run(["docker", "--context", self.args.docker_context, *args],
-                                check=True, capture_output=True, text=True, timeout=30)
-        return result.stdout.strip()
+    # Processes
 
-    def start(self, name, binary, env):
-        assert name not in self.children, f"{name} is still registered"
-        log = self.directory / f"{name}-{len(self.logs)}.log"
-        self.logs.append(log)
-        with log.open("wb") as output:
-            process = subprocess.Popen([str(binary)], cwd=self.directory,
-                                       env={**os.environ, **env}, stdout=output, stderr=output)
+    def start(self, name, binary, env, ready_url):
+        assert name not in self.children, f"{name} is still running"
+        log = (self.directory / f"{name}.log").open("ab")
+        process = subprocess.Popen([str(binary)], cwd=self.directory, stdout=log, stderr=log, env={
+            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "RUST_LOG": "info", **env})
         self.children[name] = process
-        url = self.rezn_url + "/state" if name == "rezn" else self.orqos_url + "/docker/containers?all=true"
 
         def ready():
-            assert process.poll() is None, f"{name} exited: {log.read_text()}"
-            return http(url)[0] == 200
-        wait(f"{name} startup", ready, 20)
+            assert process.poll() is None, f"{name} exited; see {self.directory / (name + '.log')}"
+            try:
+                return http(ready_url)[0] == 200
+            except urllib.error.HTTPError:
+                return True
+        wait(f"{name} startup", ready, 30)
 
     def stop(self, name):
-        process = self.children.get(name)
-        if process is None:
-            return
-        if process.poll() is None:
+        process = self.children.pop(name, None)
+        if process and process.poll() is None:
             process.send_signal(signal.SIGINT)
             try:
-                process.wait(timeout=10)
+                process.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
-        # The handle is terminal before any restart.
-        del self.children[name]
 
     def start_orqos(self):
-        endpoint = self.docker("context", "inspect", self.args.docker_context,
-                               "--format", "{{.Endpoints.docker.Host}}")
-        self.start("orqos", self.args.orqos_bin, {"ORQOS_BACKENDS": "docker",
-                   "DOCKER_SOCKET": endpoint, "BIND_ADDR": self.orqos_url.removeprefix("http://")})
+        self.start("orqos", self.args.orqos_bin, {
+            "ORQOS_BACKENDS": "workload", "ORQOS_WORKLOAD_TOKEN": self.token,
+            "BIND_ADDR": self.orqos_url.removeprefix("http://")}, self.orqos_url + "/healthz")
 
     def start_rezn(self):
         self.start("rezn", self.args.rezn_bin, {
             "STATE_DB_PATH": str(self.directory / "state"),
             "SECRETS_DB_PATH": str(self.directory / "secrets"),
             "REZN_AGE_IDENTITY": str(self.directory / "identity.txt"),
-            "ORQOS_API_URL": self.orqos_url, "STATS_WS_URL": self.orqos_url.replace("http://", "ws://") + "/stats/ws",
-            "BIND_ADDR": self.rezn_url.removeprefix("http://"), "RECONCILE_INTERVAL": "1"})
-        status = http(self.rezn_url + "/status")[1]
-        if self.owner is not None:
-            assert status["owner"] == self.owner, "restart changed ownership"
-        self.owner = status["owner"]
+            "ORQOS_API_URL": self.orqos_url, "ORQOS_WORKLOAD_TOKEN": self.token,
+            "BIND_ADDR": self.rezn_url.removeprefix("http://"), "RECONCILE_INTERVAL": "1"},
+            self.rezn_url + "/status")
+        owner = http(self.rezn_url + "/status")[1]["owner"]
+        assert self.owner in (None, owner), "a restart changed Rezn's ownership identity"
+        self.owner = owner
 
-    def apply(self, program):
+    # Rezn
+
+    def apply(self, resources):
+        program = {"ir": "rezn.dev/v2", "deployment": self.deployment, "namespace": "acceptance",
+                   "resources": resources}
         code, accepted = http(self.rezn_url + "/apply", {
-            "name": self.run, "instruction_wrapper": sign(program, self.key)})
-        assert code == 202 and accepted["stored"] is True
+            "name": self.deployment, "instruction_wrapper": sign(program, self.key)})
+        assert code == 202 and accepted["stored"] is True, accepted
         return accepted["revision"]
 
-    def owned_ids(self):
-        return sorted(self.docker("ps", "-aq", "--no-trunc", "--filter", f"label=dev.rezn.owner={self.owner}").split())
+    def status(self):
+        return http(self.rezn_url + "/status")[1]
 
-    def assert_foreign(self):
-        fixture = json.loads(self.docker("inspect", self.foreign))[0]
-        assert fixture["State"]["Running"] and fixture["Id"] == self.foreign
-        assert fixture["Config"]["Labels"]["dev.rezn.acceptance"] == self.run
-
-    def settled(self, revision, program):
-        desired = {p["name"]: p["fields"] for p in program}
+    def settled(self, revision):
         def check():
-            status = http(self.rezn_url + "/status")[1]
-            if not (status["converged"] and status["desired_revision"] == revision
-                    and status["observed_revision"] == revision and status["observation"] == "fresh"):
-                return False
-            workloads = {w["pod"]: w for w in status["workloads"] if w["deployment"] == self.run}
-            assert set(workloads) == set(desired), status
-            for name, fields in desired.items():
-                w = workloads[name]
-                assert w["desired"] == fields and w["desired_replicas"] == fields["replicas"]
-                assert w["running_replicas"] == fields["replicas"]
-                assert len(w["containers"]) == fields["replicas"]
-                for c in w["containers"]:
-                    assert c["State"] == "running" and c["Image"] == fields["image"]
-                    assert c["Labels"]["dev.rezn.configuration"] == w["desired_configuration"]
-                    for port in fields["ports"]:
-                        assert any(p["PrivatePort"] == port and p["Type"] == "tcp" and p.get("PublicPort", 0) > 0 for p in c["Ports"])
-            return status
-        status = wait(f"revision {revision} convergence", check)
-        status_ids = sorted(c["Id"] for w in status["workloads"] for c in w["containers"])
-        assert status_ids == self.owned_ids(), "stopped or unreported owned leftovers"
-        # Compare observed mappings against Docker itself, independently of Rezn.
-        for w in status["workloads"]:
-            for c in w["containers"]:
-                inspected = json.loads(self.docker("inspect", c["Id"]))[0]
-                assert inspected["State"]["Running"]
-                for p in c["Ports"]:
-                    if p.get("PublicPort"):
-                        bindings = inspected["NetworkSettings"]["Ports"][f'{p["PrivatePort"]}/{p["Type"]}']
-                        assert any(int(b["HostPort"]) == p["PublicPort"] and b["HostIp"] == p["IP"] for b in bindings)
-        self.assert_foreign()
-        return status
+            status = self.status()
+            return status if (status["converged"] and status["observation"] == "fresh"
+                              and status["desired_revision"] == revision
+                              and status["observed_revision"] == revision) else None
+        return wait(f"convergence of revision {revision}", check)
+
+    def pods(self, status, resource="web"):
+        return {p["ordinal"]: p for w in status["workloads"]
+                if w["deployment"] == self.deployment and w["resource"] == resource for p in w["pods"]}
 
     @staticmethod
-    def ids(status, name="web"):
-        return sorted(c["Id"] for w in status["workloads"] if w["pod"] == name for c in w["containers"])
+    def container(pod):
+        return f"orqos-{pod['id']}-app"
 
-    def serves_http(self, status):
-        mappings = [p for w in status["workloads"] if w["pod"] == "web" for c in w["containers"] for p in c["Ports"]
-                    if p["PrivatePort"] == 80 and p["Type"] == "tcp" and p.get("PublicPort", 0) > 0 and p.get("IP") == "0.0.0.0"]
-        assert mappings, "no nonzero observed HTTP mapping"
-        port = mappings[0]["PublicPort"]
-        def responds():
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}", timeout=3) as response:
-                return response.status == 200 and bool(response.read())
-        wait(f"HTTP on observed host port {port}", responds, 20)
-        return port
+    def container_ids(self, status, resource="web"):
+        return {n: podman("inspect", "--format", "{{.Id}}", self.container(p))
+                for n, p in self.pods(status, resource).items()}
+
+    def owned_podman_pods(self):
+        return podman("pod", "ps", "-q", "--filter", f"label={OWNER}={self.owner}").split()
 
     def record(self, description):
         self.steps.append(description)
         print(f"PASS {description}", flush=True)
 
+    def foreign_intact(self):
+        code, pod = http(f"{self.orqos_url}/workload/pods/{self.foreign}", token=self.token)
+        assert code == 200 and pod["state"] == "running", pod
+
+    # Scenario
+
     def execute(self):
-        self.docker("info", "--format", "{{.ServerVersion}}")
-        for image in ("nginx:alpine", "httpd:alpine"):
-            self.docker("image", "inspect", image)  # Never pull implicitly.
+        podman("pull", "-q", IMAGE)
         self.start_orqos()
         self.start_rezn()
-        self.foreign = self.docker("run", "-d", "--pull=never", "--name", self.run + "-web-foreign",
-                                   "--label", f"dev.rezn.acceptance={self.run}",
-                                   "--label", f"mol={self.run}", "--label", f"pod={self.run}:web", "nginx:alpine")
-        program = [pod()]
-        revision = self.apply(program)
-        first = self.settled(revision, program)
-        port = self.serves_http(first)
-        self.record(f"signed HTTP apply creates a replica; observed host port {port} serves HTTP")
-        revision = self.apply(program)
-        repeated = self.settled(revision, program)
-        assert self.ids(first) == self.ids(repeated)
-        self.record("unchanged reapply preserves container identities")
-        before = http(self.rezn_url + "/state")[1]
-        invalid = [pod()]
-        invalid[0]["fields"]["env"] = {"IGNORED": "must-be-rejected"}
-        try:
-            self.apply(invalid)
-            raise AssertionError("unsupported signed program was accepted")
-        except urllib.error.HTTPError as error:
-            assert error.code == 400 and b"unknown field" in error.read()
-        assert http(self.rezn_url + "/state")[1] == before
-        assert self.owned_ids() == self.ids(repeated)
-        self.record("unsupported signed intent changes neither state nor containers")
-        for replicas in (2, 1, 0):
-            program = [pod(replicas=replicas)]
-            revision = self.apply(program)
-            current = self.settled(revision, program)
-            if replicas == 2:
-                assert set(self.ids(first)).issubset(self.ids(current))
-            self.record(f"scale to {replicas} without stopped leftovers")
-        program = [pod()]
-        current = self.settled(self.apply(program), program)
-        program = [pod(image="httpd:alpine")]
-        changed = self.settled(self.apply(program), program)
-        assert self.ids(current) != self.ids(changed)
-        self.serves_http(changed)
-        self.record("image change replaces containers at equal replica count")
-        program = [pod(image="httpd:alpine", ports=(80, 81))]
-        changed_ports = self.settled(self.apply(program), program)
-        assert self.ids(changed) != self.ids(changed_ports)
-        self.record("port change replaces containers at equal replica count")
-        program = [*program, pod(name="side", ports=())]
-        two = self.settled(self.apply(program), program)
-        program = [program[0]]
-        removed = self.settled(self.apply(program), program)
-        assert self.ids(two) == self.ids(removed)
-        assert not self.ids(removed, "side")
-        self.record("remove one pod while preserving the remaining workload")
-        revision = removed["desired_revision"]
+        http(f"{self.orqos_url}/workload/pods/{self.foreign}", method="PUT", token=self.token, timeout=700, body={
+            "hostname": "foreign", "labels": {"example.org/app": "foreign"},
+            "containers": [{"name": "app", "image": IMAGE, "command": ["sleep", "infinity"]}]})
+
+        status = self.settled(self.apply([replica_set("web", 2, "a")]))
+        pods = self.pods(status)
+        assert sorted(pods) == [0, 1]
+        for n, pod in pods.items():
+            assert podman("exec", self.container(pod), "hostname") == f"web-{n}"
+            assert podman("exec", self.container(pod), "printenv", "LEVEL") == "a"
+        first = self.container_ids(status)
+        self.record("a signed IR v2 replica set runs as one systemd/Podman pod per replica")
+
+        status = self.settled(self.apply([replica_set("web", 2, "a")]))
+        assert self.container_ids(status) == first
+        self.record("re-applying an unchanged program keeps every container")
+
+        status = self.settled(self.apply([replica_set("web", 3, "a")]))
+        three = self.container_ids(status)
+        assert sorted(three) == [0, 1, 2] and {n: three[n] for n in (0, 1)} == first
+        status = self.settled(self.apply([replica_set("web", 1, "a")]))
+        assert self.container_ids(status) == {0: first[0]}
+        self.record("scaling 2 -> 3 -> 1 adds and removes the highest ordinals only")
+
+        status = self.settled(self.apply([replica_set("web", 2, "a")]))
+        before = self.container_ids(status)
+        names = {n: self.container(p) for n, p in self.pods(status).items()}
+        revision = self.apply([replica_set("web", 2, "b")])
+        changed_at = {}
+        while True:
+            running = 0
+            for n, name in names.items():
+                state = podman("inspect", "--format", "{{.Id}} {{.State.Running}}", name, check=False).split()
+                if state and state[1] == "true":
+                    running += 1
+                    if state[0] != before[n]:
+                        changed_at.setdefault(n, time.monotonic())
+            assert running >= 1, "a rolling replacement stopped both replicas at once"
+            status = self.status()
+            if status["converged"] and status["observed_revision"] == revision:
+                break
+            time.sleep(0.2)
+        assert set(changed_at) == {0, 1} and changed_at[1] < changed_at[0], changed_at
+        for pod in self.pods(status).values():
+            assert podman("exec", self.container(pod), "printenv", "LEVEL") == "b"
+        self.record("a changed spec replaces replicas one at a time, highest ordinal first")
+
+        current = self.container_ids(status)
+        probed = replica_set("web", 2, "c")
+        probed["fields"]["pod"]["containers"][0]["readiness"] = {"exec": ["true"]}
+        revision = self.apply([probed])
+
+        def unexecuted():
+            s = self.status()
+            return s if s["observed_revision"] == revision and s["unexecuted"] else None
+        status = wait("the unexecuted report", unexecuted)
+        assert not status["converged"] and status["unexecuted"][0]["deployment"] == self.deployment
+        assert "readiness: probes are not executed yet" in status["unexecuted"][0]["reasons"][0], status
+        time.sleep(3)
+        assert self.container_ids(self.status()) == current
+        self.record("a program needing unsupported features is reported with reasons and changes nothing")
+
+        status = self.settled(self.apply([replica_set("web", 2, "b")]))
+        current = self.container_ids(status)
+        revision = status["desired_revision"]
         self.stop("rezn")
         self.start_rezn()
-        restarted = self.settled(revision, program)
-        assert self.ids(removed) == self.ids(restarted)
-        self.serves_http(restarted)
-        self.record("real process restart preserves ownership, IDs and observed port mappings")
-        self.docker("stop", self.ids(restarted)[0])
-        wait("stopped replica replacement", lambda: self.ids(http(self.rezn_url + "/status")[1]) != self.ids(restarted))
-        recovered = self.settled(revision, program)
-        assert self.ids(recovered) != self.ids(restarted)
-        self.record("stopped replica is replaced with no debris")
-        self.stop("orqos")
-        wait("stale backend status", lambda: http(self.rezn_url + "/status")[1]["observation"] == "stale", 30)
-        stale = http(self.rezn_url + "/status")[1]
-        assert not stale["converged"] and stale["errors"]
-        assert stale["last_observation"] and stale["workloads"][0]["running_replicas"] == 1
-        retained = self.owned_ids()
-        program = [pod(image="nginx:alpine", replicas=2)]
-        revision = self.apply(program)
-        assert self.owned_ids() == retained
-        self.assert_foreign()
-        self.start_orqos()
-        recovered = self.settled(revision, program)
-        self.serves_http(recovered)
-        self.record("backend failure reports stale observations; stored updates converge after recovery")
-        revision = self.apply([])
-        self.settled(revision, [])
-        self.record("signed empty program removes all owned workloads and leaves foreign container untouched")
-        self.stop("rezn")
-        self.start_rezn()
-        self.settled(revision, [])
-        self.record("restart after empty intent does not resurrect workloads")
-        return {"docker_context": self.args.docker_context, "steps": self.steps}
+        status = self.settled(revision)
+        assert self.container_ids(status) == current
+        self.record("a restarted Rezn keeps its identity and changes no running container")
+
+        victim = self.pods(status)[0]
+        podman("kill", self.container(victim))
+
+        def restarted():
+            s = self.status()
+            pod = self.pods(s)[0]
+            return s if pod["state"] == "running" and pod["containers"][0]["restarts"] >= 1 else None
+        wait("systemd to restart the killed container", restarted)
+        status = self.settled(revision)
+        assert self.pods(status)[0]["id"] == victim["id"]
+        self.record("a killed container is restarted by systemd without Rezn replacing the pod")
+
+        status = self.settled(self.apply([]))
+        assert not self.pods(status)
+        wait("owned Podman pods to disappear", lambda: not self.owned_podman_pods(), 60)
+        self.foreign_intact()
+        self.record("an empty program removes every owned pod; a foreign Orqos pod is untouched")
+        return self.steps
 
     def cleanup(self):
         errors = []
-        for name in list(self.children):
+        self.stop("rezn")
+        if "orqos" in self.children:
             try:
-                self.stop(name)
-            except Exception as error:
-                errors.append(f"stop {name}: {error}")
-        if self.owner:
-            try:
-                for container_id in self.owned_ids():
-                    container = json.loads(self.docker("inspect", container_id))[0]
-                    labels = container["Config"]["Labels"]
-                    assert labels.get("dev.rezn.owner") == self.owner and labels.get("dev.rezn.managed") == "v1"
-                    self.docker("rm", "-f", container_id)
-                assert not self.owned_ids()
-            except Exception as error:
-                errors.append(f"owned fixtures: {error}")
-        # The run marker also handles a fixture created before the response was lost.
-        try:
-            ids = self.docker("ps", "-aq", "--no-trunc", "--filter", f"label=dev.rezn.acceptance={self.run}").split()
-            for container_id in ids:
-                container = json.loads(self.docker("inspect", container_id))[0]
-                assert container["Config"]["Labels"].get("dev.rezn.acceptance") == self.run
-                self.docker("rm", "-f", container_id)
-        except Exception as error:
-            errors.append(f"foreign fixture: {error}")
+                _, pods = http(self.orqos_url + "/workload/pods", token=self.token)
+                for pod in pods:
+                    if pod["spec"].get("labels", {}).get(OWNER) == self.owner or pod["id"] == self.foreign:
+                        http(f"{self.orqos_url}/workload/pods/{pod['id']}", method="DELETE", token=self.token,
+                             timeout=120)
+            except Exception as error:  # cleanup must continue
+                errors.append(f"removing pods: {error!r}")
+        self.stop("orqos")
         if errors:
             raise AssertionError("cleanup failed: " + "; ".join(errors))
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--docker-context", required=True, help="explicit local Docker context")
-    parser.add_argument("--orqos-bin", type=lambda p: Path(p).resolve(), default=ROOT.parent / "orqos/target/debug/orqos")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--orqos-bin", type=lambda p: Path(p).resolve(),
+                        default=ROOT.parent / "orqos/target/debug/orqos")
     parser.add_argument("--rezn-bin", type=lambda p: Path(p).resolve(), default=ROOT / "target/debug/rezn")
     args = parser.parse_args()
-    for binary in (args.orqos_bin, args.rezn_bin):
-        assert binary.is_file(), f"Build prerequisite binary first: {binary}"
+    if os.geteuid() != 0:
+        raise SystemExit("run as root: Orqos's workload backend drives rootful Podman")
     with tempfile.TemporaryDirectory(prefix="rezn-acceptance-") as directory:
         acceptance = Acceptance(args, directory)
         try:
-            report = acceptance.execute()
+            steps = acceptance.execute()
         except BaseException:
-            for log in acceptance.logs:
-                print(f"\n{log.name}:\n{log.read_text()[-8000:]}", flush=True)
+            for name in ("orqos", "rezn"):
+                log = Path(directory) / f"{name}.log"
+                if log.exists():
+                    print(f"--- {name} log (last 60 lines) ---\n" + "\n".join(log.read_text().splitlines()[-60:]))
             raise
         finally:
             acceptance.cleanup()
-        print(json.dumps(report, indent=2))
+    print(json.dumps({"acceptance": "passed", "steps": steps}, indent=2))
 
 
 if __name__ == "__main__":
