@@ -259,6 +259,7 @@ A changed identity replaces the workload; an unchanged one preserves its contain
   ingress services, ports and `tls` secrets, policy workloads, certificate `ca` secrets.
 - `replica_set` and `ordered_replica_set` pods use `restart: always`; `job` pods use `never` or `on_failure`.
 - `run_as_non_root` pods have a non-zero effective user for every container.
+- A container's `cpu_request_millis` and `memory_request_bytes` are at most its limits when both are set.
 - `tls` secrets declare exactly `tls.crt` and `tls.key`; a `random` source covers every declared key.
 - `image_pull_secrets` name secrets that declare the key `.dockerconfigjson` (registry credentials in Docker's
   configuration format).
@@ -283,7 +284,9 @@ immutable Orqos object whose ID covers its content (the config's data or the sto
 changed input replaces exactly the workloads that use it ([configs and
 secrets](DEVELOPMENT.md#configs-and-secrets)). `ca` and `certificate` secrets are ECDSA P-256; certificates are
 renewed once two thirds of their lifetime have passed, and a CA is not rotated in v2.0. Probes are run by Orqos itself rather than as
-Podman healthchecks, which allow one check per container and run inside it; HTTP probes connect from a thread that
+Podman healthchecks, which allow one check per container and run inside it; resource limits are cgroup limits
+set through Podman and requests are admitted against the host's capacity minus a reserve
+([admission](DEVELOPMENT.md#resources-and-admission)); HTTP probes connect from a thread that
 enters the pod's network namespace. Until readiness-aware membership
 ([#59](https://github.com/rezn-project/rezn/issues/59)), services resolve to running replicas.
 

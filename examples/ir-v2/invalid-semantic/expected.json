@@ -9,6 +9,7 @@
   "policy-on-unknown-workload.json": "/resources/4/fields/targets/0",
   "probe-port-of-another-container.json": "/resources/0/fields/pod/containers/0/readiness/http/port",
   "pull-secret-without-dockerconfigjson.json": "/resources/7/fields/pod/image_pull_secrets/0",
+  "request-above-limit.json": "/resources/0/fields/pod/containers/0/resources/cpu_request_millis",
   "target-port-not-a-container-port.json": "/resources/1/fields/ports/0/target_port",
   "undeclared-secret-key.json": "/resources/1/fields/pod/containers/0/env/0/secret",
   "unknown-service-target.json": "/resources/1/fields/target",

@@ -105,11 +105,12 @@ scratch and secret-file volumes. A deployment runs only when **every** resource 
 - `config` and `secret` resources (every source: `store`, `seed_once`, `random`, `ca` and `certificate`), as
   `config` and `secret` pod volumes and `secret` environment references (below);
 - containers with `pull` absent or `if_not_present`, environment `value`s, declared `ports` (informational, as in
-  Kubernetes: nothing is published on the host), and `startup`, `readiness` and `liveness` probes (below).
+  Kubernetes: nothing is published on the host), `startup`, `readiness` and `liveness` probes, and `resources`
+  (below).
 
 Anything else leaves the whole deployment **unexecuted**: services that remap ports
 ([#123](https://github.com/rezn-project/rezn/issues/123)), ingress, network policies, jobs, phases, probes on init
-containers, probes beyond the backend's limits, resource requests and limits, other pull policies, registry credentials, pod-IP environment references, a group
+containers, probes and resources beyond the backend's limits, other pull policies, registry credentials, pod-IP environment references, a group
 without a user or `run_as_non_root` without an explicit user (both need the image's user), IDs above 65535, a claim
 mounted by pods with different `fs_group`s, and referenced secret keys missing from the secret store.
 `/status` lists every blocking field as `JSON-pointer: reason (issue)`, citing the issue that adds it. An
@@ -148,6 +149,21 @@ both and stop before the sidecars. When a sidecar has a `startup` probe, the con
 has passed. Scratch volumes are shared by all of them for the pod's lifetime. A replica is ready when its sidecars
 and containers are; `/status` lists every container with its `kind` (`init`, `sidecar`, `container`), and a
 completed init container reads `exited`. A changed pod is replaced whole, so its init containers run again.
+
+### Resources and admission
+
+Limits become the container's cgroup limits (Orqos, through Podman): `memory_limit_bytes` sets `memory.max` with no
+swap, `cpu_limit_millis` sets `cpu.max` (capped at the host's CPUs). Requests set `memory.low` and the CPU weight
+(Kubernetes' shares), and a request left out defaults to its limit, as in Kubernetes.
+
+On one host requests cannot choose a node, but they can refuse a revision that does not fit: `/apply` adds the new
+program's requests to every other stored deployment's and refuses (400) when CPU or memory exceeds **allocatable**,
+the host's capacity (`GET /workload/capacity` from Orqos) minus a reserve for the host itself
+(`REZN_RESERVED_CPU_MILLIS`, default 250; `REZN_RESERVED_MEMORY_BYTES`, default 512 MiB). The message gives the
+totals, the new deployment's share and its largest workloads. A pod requests its effective request (the larger of
+its biggest init container and the sum of its sidecars and containers) times its replicas; jobs are not counted
+until they run ([#42](https://github.com/rezn-project/rezn/issues/42)). When Orqos cannot report capacity, `/apply`
+refuses with 503 rather than admitting blind. `/status` shows `resources.requested` and `resources.allocatable`.
 
 ### Probes and readiness
 
@@ -284,6 +300,7 @@ invalid persisted state returns HTTP 500, never an empty map. `GET /status` repo
 | `errors` | The last pass's validation, observation, mutation or convergence errors; cleared after a successful pass |
 | `unexecuted[]` | `deployment` and `reasons` (`JSON-pointer: reason (issue)`) for each program the backend cannot run yet |
 | `workloads[]` | Per replica set: `deployment`, `kind`, `resource`, `desired_replicas` (null for pods awaiting removal or of unexecuted deployments), `running_replicas` and `ready_replicas` (null until observed), `rollout` (null when settled; `waiting_for` the pods that run but are not ready while a replacement or ordered step waits) and `pods[]` |
+| `resources` | `requested` (CPU millis and memory bytes summed over the stored deployments) and `allocatable` (the host's capacity minus the reserve; null until Orqos reports it) |
 | `volumes[]` | Owned volumes: `id`, `deployment`, `claim`, `workload` and `ordinal` (per-replica volumes), `desired` (wanted by the accepted programs; otherwise retained or awaiting deletion), `retain`, `exists` and `mounted_by` |
 | `pods[]` | `id`, `ordinal`, `hostname`, Orqos's `state` (`running`, `starting`, `restarting`, `degraded`, `failed`, `stopped`), `ready` (runs with every container ready), `current` (runs the desired spec), `changes` (why it is not current: `config "<name>"`, `secret "<name>"`, `pod template`), `aliases` (its DNS names on the namespace network), `containers[]` (`name`, `kind`, `active_state`, `sub_state`, `result`, `restarts`, `started`, `ready`, `probe_restarts`, `last_probe_failure`) and Orqos's last `error` |
 
@@ -354,7 +371,7 @@ applies signed IR v2 programs and checks with Podman itself:
 - an unchanged re-apply keeps every container;
 - scaling 2 → 3 → 1 touches only the highest ordinals;
 - a changed spec replaces replicas one at a time, highest first, never stopping both;
-- a program needing unsupported features (resource limits) is reported with reasons and changes nothing;
+- a program needing unsupported features (a pull policy) is reported with reasons and changes nothing;
 - a restarted Rezn keeps its identity and changes nothing;
 - a killed container is restarted by systemd without Rezn replacing the pod;
 - a service's names resolve inside the namespace to every replica of its target, and connections by name arrive;
@@ -389,6 +406,10 @@ applies signed IR v2 programs and checks with Podman itself:
 - init containers run once, in order, a failing one is retried until it succeeds, and the main container starts
   only after its sidecar's startup probe passes; status lists every container with its kind;
 - a changed pod runs its init containers and gated start again, from empty scratch volumes;
+- limits and requests reach the container's cgroup (`memory.max` without swap, `memory.low`, `cpu.max`, the CPU
+  weight);
+- a revision whose CPU requests exceed the host's allocatable CPU with the other deployments' is refused with the
+  figures, shrinking another deployment makes room, and status shows the totals;
 - empty programs remove every owned pod and then the namespace networks, while a foreign Orqos pod stays.
 
 It removes everything it created, including after a failure. The *Acceptance* workflow runs it on Ubuntu 26.04

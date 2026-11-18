@@ -33,6 +33,9 @@ struct Engine {
     start_state: Option<&'static str>,
     /// Newly applied pods run but are not ready (their readiness probes fail).
     start_unready: bool,
+    /// The host's CPU millis and memory; 4 CPUs and 8 GiB when unset.
+    capacity: Option<(u64, u64)>,
+    fail_capacity: bool,
 }
 
 impl Engine {
@@ -46,6 +49,16 @@ impl Engine {
                 request.method.as_str(),
                 rest.trim_start_matches('/'),
                 &request.body,
+            );
+        }
+        if path == "/workload/capacity" {
+            if self.fail_capacity {
+                return (StatusCode::SERVICE_UNAVAILABLE, "no capacity".into());
+            }
+            let (cpu, memory) = self.capacity.unwrap_or((4000, 8 << 30));
+            return (
+                StatusCode::OK,
+                json!({"cpu_millis": cpu, "memory_bytes": memory}).to_string(),
             );
         }
         if let Some(rest) = path.strip_prefix("/workload/secrets") {
@@ -690,7 +703,7 @@ async fn unexecuted_deployments_report_reasons_and_keep_their_pods() {
 
     let before = backend.requests().len();
     let mut limited = replica_set("hello", 1, "a");
-    limited["fields"]["pod"]["containers"][0]["resources"] = json!({"cpu_limit_millis": 500});
+    limited["fields"]["pod"]["containers"][0]["pull"] = json!("always");
     apply(&app, "hello", program("hello", json!([limited]))).await;
     let service = json!({"kind": "service", "name": "db", "fields": {"target": "db", "headless": true,
         "ports": [{"name": "pg", "port": 5433, "target_port": 5432}]}});
@@ -719,13 +732,13 @@ async fn unexecuted_deployments_report_reasons_and_keep_their_pods() {
     assert_eq!(
         status.unexecuted[1].reasons,
         vec![
-            "/resources/0/fields/pod/containers/0/resources: resource requests and limits are not executed yet (rezn#40)",
+            "/resources/0/fields/pod/containers/0/pull: pull policies other than if_not_present are not executed yet (orqos#23)",
         ]
     );
 
     // A running deployment whose new program cannot run keeps its pods from the earlier revision.
     let mut limited = replica_set("web", 3, "b");
-    limited["fields"]["pod"]["containers"][0]["resources"] = json!({"memory_limit_bytes": 1048576});
+    limited["fields"]["pod"]["containers"][0]["pull"] = json!("never");
     let before = backend.requests().len();
     apply(&app, "shop", program("shop", json!([limited]))).await;
     reconcile(&app).await.unwrap();
@@ -755,7 +768,7 @@ async fn unexecuted_deployments_report_reasons_and_keep_their_pods() {
     assert!(body["unexecuted"][2]["reasons"][0]
         .as_str()
         .unwrap()
-        .contains("/resources: resource requests"));
+        .contains("/pull: pull policies"));
 }
 
 #[tokio::test]
@@ -1272,10 +1285,17 @@ async fn older_observation_cannot_report_convergence_of_newer_intent_and_passes_
         let (e, r) = (e.clone(), r.clone());
         // Pod listings block until released; volume listings answer at once.
         let blocks = request.uri.path() == "/workload/pods";
+        let capacity = request.uri.path() == "/workload/capacity";
         async move {
             if blocks {
                 e.notify_one();
                 wait_for(&r).await;
+            }
+            if capacity {
+                return (
+                    StatusCode::OK,
+                    r#"{"cpu_millis": 4000, "memory_bytes": 8589934592}"#.into(),
+                );
             }
             (StatusCode::OK, "[]".into())
         }
@@ -1484,7 +1504,10 @@ async fn corrupt_missing_legacy_and_ir_v1_state_never_become_deletion_plans() {
     }
     app.db.remove(STATE_KEY).unwrap();
     assert!(reconcile(&app).await.is_err());
-    assert!(backend.requests().is_empty());
+    assert!(backend
+        .requests()
+        .iter()
+        .all(|r| r.uri.path() == "/workload/capacity"));
     let legacy = sled::Config::new().temporary(true).open().unwrap();
     legacy.insert("desired", b"{}").unwrap();
     assert!(store::initialize(&legacy)
@@ -2250,4 +2273,82 @@ async fn unready_replicas_hold_the_rollout_and_are_reported() {
     let status = converged(&app).await;
     assert_eq!(status.workloads[0].ready_replicas, Some(2));
     assert!(status.workloads[0].rollout.is_none());
+}
+
+fn requesting(name: &str, replicas: u32, cpu_millis: u64) -> Value {
+    let mut set = replica_set(name, replicas, "a");
+    set["fields"]["pod"]["containers"][0]["resources"] = json!({"cpu_request_millis": cpu_millis, "cpu_limit_millis": cpu_millis, "memory_limit_bytes": 67108864});
+    set
+}
+
+#[tokio::test]
+async fn requests_are_admitted_against_the_hosts_allocatable_capacity() {
+    let (backend, engine) = backend().await;
+    let app = app(backend.client.clone(), None);
+    let try_apply = |name: &'static str, resources: Value| {
+        let app = app.clone();
+        async move {
+            apply_handler(
+                State(app),
+                Json(ApplyPayload {
+                    name: name.into(),
+                    instruction_wrapper: signed(program(name, resources)),
+                }),
+            )
+            .await
+            .map(|(code, _)| code)
+        }
+    };
+    // 4 CPUs, minus the default 250m reserve: 3750m allocatable.
+    assert_eq!(
+        try_apply("a", json!([requesting("web", 2, 1000)]))
+            .await
+            .unwrap(),
+        StatusCode::ACCEPTED
+    );
+    let (code, message) = try_apply("b", json!([requesting("api", 2, 1000)]))
+        .await
+        .unwrap_err();
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert!(
+        message.contains("CPU: 4000m requested of 3750m allocatable (deployment \"b\" 2000m: api 2 × 1000m; other deployments 2000m)"),
+        "{message}"
+    );
+    // The refusal changed nothing; shrinking the other deployment makes room.
+    assert_eq!(
+        try_apply("a", json!([requesting("web", 1, 1000)]))
+            .await
+            .unwrap(),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        try_apply("b", json!([requesting("api", 2, 1000)]))
+            .await
+            .unwrap(),
+        StatusCode::ACCEPTED
+    );
+
+    reconcile(&app).await.unwrap();
+    let status = converged(&app).await;
+    assert_eq!(status.resources.requested.cpu_millis, 3000);
+    assert_eq!(
+        status.resources.requested.memory_bytes,
+        3 * 67108864,
+        "requests default to limits"
+    );
+    assert_eq!(status.resources.allocatable.unwrap().cpu_millis, 3750);
+    let pods = engine.lock().unwrap().pods.clone();
+    let spec = &pods.values().next().unwrap()["spec"]["containers"][0]["resources"];
+    assert_eq!(spec["memory_request_bytes"], 67108864);
+
+    // Without capacity, nothing is admitted blind.
+    engine.lock().unwrap().fail_capacity = true;
+    let (code, message) = try_apply("c", json!([requesting("tiny", 1, 1)]))
+        .await
+        .unwrap_err();
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        message.contains("cannot check the revision against the host's capacity"),
+        "{message}"
+    );
 }

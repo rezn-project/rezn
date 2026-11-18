@@ -17,8 +17,8 @@ use common::ir_v2::{self, Kind, PodManagement, PortRef, Program, Pull, Spec};
 use sha2::{Digest, Sha256};
 
 use crate::orqos_client::{
-    ContainerSpec, HttpProbe, Medium, MountSpec, Network, PodSpec, PodVolume, Probe, Restart,
-    Scheme, Scratch, SecretFiles, SecretItem, SecretKeyRef, VolumeSpec,
+    ContainerSpec, HttpProbe, Medium, MountSpec, Network, PodSpec, PodVolume, Probe, Resources,
+    Restart, Scheme, Scratch, SecretFiles, SecretItem, SecretKeyRef, VolumeSpec,
 };
 use crate::secret::Versions;
 
@@ -526,6 +526,7 @@ pub fn translate(
                 startup: c.startup.as_ref().map(|p| probe(p, c)),
                 readiness: c.readiness.as_ref().map(|p| probe(p, c)),
                 liveness: c.liveness.as_ref().map(|p| probe(p, c)),
+                resources: c.resources.as_ref().map(resources),
             }
         };
         let containers: Vec<ContainerSpec> = pod.containers.iter().map(container).collect();
@@ -588,6 +589,16 @@ pub fn translate(
         });
     }
     Ok(translation)
+}
+
+/// IR v2 resources as Orqos applies them; a request left out defaults to its limit, as in Kubernetes.
+pub fn resources(r: &ir_v2::Resources) -> Resources {
+    Resources {
+        cpu_limit_millis: r.cpu_limit_millis,
+        cpu_request_millis: r.cpu_request_millis.or(r.cpu_limit_millis),
+        memory_limit_bytes: r.memory_limit_bytes,
+        memory_request_bytes: r.memory_request_bytes.or(r.memory_limit_bytes),
+    }
 }
 
 /// Whether Orqos accepts the probe (IR v2 only requires positive values and an absolute path).
@@ -839,12 +850,21 @@ pub fn unsupported(program: &Program) -> Vec<String> {
                     );
                 }
             }
-            if c.resources.is_some() {
-                add(
-                    format!("{at}/resources"),
-                    "resource requests and limits are",
-                    "rezn#40",
-                );
+            if let Some(r) = &c.resources {
+                let cpu = [r.cpu_limit_millis, r.cpu_request_millis];
+                let memory = [r.memory_limit_bytes, r.memory_request_bytes];
+                if cpu.iter().flatten().any(|v| *v > 1_000_000)
+                    || memory
+                        .iter()
+                        .flatten()
+                        .any(|v| !(6 << 20..=1 << 40).contains(v))
+                {
+                    add(
+                        format!("{at}/resources"),
+                        "resources outside the backend's range (CPU up to 1000000 m, memory 6 MiB to 1 TiB) are",
+                        "rezn#40",
+                    );
+                }
             }
             let security = c.security.as_ref();
             let user = security.and_then(|s| s.user).or(pod.user);
@@ -1550,15 +1570,17 @@ mod tests {
         let reasons = unsupported(&example("reference.json")).join("\n");
         for expected in [
             "jobs are",
-            "resource requests and limits are",
             "revision phases are",
             "ingresses are",
             "network policies are",
         ] {
             assert!(reasons.contains(expected), "{expected}:\n{reasons}");
         }
-        // Storage, identity, configs, secrets, certificates, probes, init containers and sidecars run now.
+        // Storage, identity, configs, secrets, certificates, probes, init containers, sidecars and resources run
+        // now.
         for gone in [
+            "resource requests",
+            "resources outside",
             "init containers are",
             "sidecars are",
             "probes",

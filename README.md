@@ -15,8 +15,8 @@ secret value replaces exactly the pods that use it. Volumes are mounted idmapped
 one Podman pod with its own network and user namespace, supervised by systemd with restart backoff, on its
 namespace's network, where `<service>`, `<service>.<namespace>.svc` and, for headless services,
 `<name>-<N>.<service>` resolve. Scaling touches the highest ordinals, ordered sets start one replica at a time,
-changed specs roll one replica at a time, and stopped pods are started again. Pods may have init containers (run once, in order) and sidecars (started first; a sidecar's startup probe gates the main containers). Orqos runs startup, readiness and liveness probes (exec, and HTTP(S) from inside the pod), and rollouts, ordered starts and convergence wait for readiness. A program that needs anything else
-(port-remapping services, resource limits, jobs, ingress and so on) is stored but left **unexecuted**, and `/status` names every blocking field with the issue that adds it. Nothing
+changed specs roll one replica at a time, and stopped pods are started again. Pods may have init containers (run once, in order) and sidecars (started first; a sidecar's startup probe gates the main containers). Resource limits become cgroup limits, and a revision whose requests do not fit the host is refused. Orqos runs startup, readiness and liveness probes (exec, and HTTP(S) from inside the pod), and rollouts, ordered starts and convergence wait for readiness. A program that needs anything else
+(port-remapping services, jobs, ingress, registry credentials and so on) is stored but left **unexecuted**, and `/status` names every blocking field with the issue that adds it. Nothing
 is silently dropped. IR v1 programs are refused; the [Kubernetes manifest subset](docs/KUBERNETES-SUBSET.md) is
 specified for import.
 

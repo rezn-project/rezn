@@ -183,6 +183,28 @@ pub struct ContainerSpec {
     pub readiness: Option<Probe>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub liveness: Option<Probe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<Resources>,
+}
+
+/// Cgroup limits and requests of one container.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Resources {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_limit_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_request_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_limit_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_request_bytes: Option<u64>,
+}
+
+/// The host's CPUs (× 1000) and memory, as Orqos reports them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Capacity {
+    pub cpu_millis: u64,
+    pub memory_bytes: u64,
 }
 
 /// A probe Orqos runs: `exec` in the container, or HTTP(S) from inside the pod's network namespace.
@@ -343,6 +365,18 @@ impl OrqosClient {
         Ok(())
     }
 
+    pub async fn capacity(&self) -> Result<Capacity> {
+        self.send(
+            "read the host's capacity",
+            self.client
+                .get(format!("{}/workload/capacity", self.base_url)),
+        )
+        .await?
+        .json()
+        .await
+        .context("Failed to parse the host's capacity")
+    }
+
     pub async fn list_secrets(&self) -> Result<Vec<SecretStatus>> {
         self.send(
             "list workload secrets",
@@ -444,6 +478,12 @@ mod tests {
                     failure_threshold: 3,
                 }),
                 liveness: None,
+                resources: Some(Resources {
+                    cpu_limit_millis: Some(1000),
+                    cpu_request_millis: Some(100),
+                    memory_limit_bytes: Some(1 << 30),
+                    memory_request_bytes: Some(384 << 20),
+                }),
             }],
             restart: Restart::Always,
             grace_seconds: 30,
@@ -494,7 +534,9 @@ mod tests {
                                      "user": 1000, "read_only_root": true, "drop_all_capabilities": true,
                                      "mounts": [{"volume": "data", "path": "/data", "sub_path": "v1"}],
                                      "readiness": {"http": {"path": "/ready", "port": 80, "scheme": "https"},
-                                                   "period_seconds": 10, "timeout_seconds": 1, "failure_threshold": 3}}]},
+                                                   "period_seconds": 10, "timeout_seconds": 1, "failure_threshold": 3},
+                                     "resources": {"cpu_limit_millis": 1000, "cpu_request_millis": 100,
+                                                   "memory_limit_bytes": 1073741824, "memory_request_bytes": 402653184}}]},
             "error": null, "updated_at": "2026-11-18T00:00:00Z"
         }]);
         let server = MockOrqos::start(move |request| match request.method.as_str() {

@@ -831,6 +831,27 @@ impl<'a> Checker<'a> {
                     self.positive(format!("{at}/resources/{field}"), value);
                 }
             }
+            for (request, limit, name) in [
+                (
+                    r.cpu_request_millis,
+                    r.cpu_limit_millis,
+                    "cpu_request_millis",
+                ),
+                (
+                    r.memory_request_bytes,
+                    r.memory_limit_bytes,
+                    "memory_request_bytes",
+                ),
+            ] {
+                if let (Some(request), Some(limit)) = (request, limit) {
+                    if request > limit {
+                        self.add(
+                            format!("{at}/resources/{name}"),
+                            "a request is at most its limit",
+                        );
+                    }
+                }
+            }
         }
         let security = c.security.as_ref();
         if let Some(s) = security {
