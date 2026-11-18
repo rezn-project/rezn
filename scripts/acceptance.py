@@ -918,8 +918,10 @@ class Acceptance:
 
         def refused():
             s = self.status()
+            # Podman words it "unauthorized", "authentication required" or "denied".
+            refused = ("unauthorized", "authentication required", "denied")
             return s if (s["observed_revision"] == revision
-                         and any("unauthorized" in e.lower() for e in s["errors"])) else None
+                         and any(w in e.lower() for e in s["errors"] for w in refused)) else None
         status = wait("the unauthorized pull to be reported", refused, timeout=120)
         assert not self.pods(status, "private", name), "a pod ran without its image"
         self.record("a pull with wrong registry credentials is reported in status and runs nothing")
