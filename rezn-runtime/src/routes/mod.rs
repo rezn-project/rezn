@@ -2,6 +2,7 @@ pub mod apply;
 pub mod common;
 pub mod delete_secret;
 pub mod get_secrets;
+pub mod program_secrets;
 pub mod put_secret;
 pub mod state;
 

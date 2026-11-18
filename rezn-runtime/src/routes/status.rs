@@ -14,6 +14,9 @@ pub async fn get_status_handler(
     State(app): State<Arc<AppState>>,
 ) -> Result<Json<Status>, AppError> {
     Ok(Json(
-        app.controller.status(&app.db).await.map_err(app_error)?,
+        app.controller
+            .status(&app.db, &app.secret_store)
+            .await
+            .map_err(app_error)?,
     ))
 }

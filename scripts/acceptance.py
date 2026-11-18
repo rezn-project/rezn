@@ -250,6 +250,10 @@ class Acceptance:
             if status["converged"] and status["observed_revision"] == revision:
                 break
             time.sleep(0.2)
+        # A replica replaced between this iteration's inspection and the status call is seen only now.
+        for n, name in names.items():
+            if podman("inspect", "--format", "{{.Id}}", name) != before[n]:
+                changed_at.setdefault(n, time.monotonic())
         assert set(changed_at) == {0, 1} and changed_at[1] < changed_at[0], changed_at
         for pod in self.pods(status).values():
             assert podman("exec", self.container(pod), "printenv", "LEVEL") == "b"
@@ -293,6 +297,7 @@ class Acceptance:
 
         self.services()
         self.storage()
+        self.configuration()
 
         networks = {n["podman_name"] for n in self.owned_networks()}
         assert len(networks) == 2, networks
@@ -382,6 +387,134 @@ class Acceptance:
         self.settled(self.apply([], deployment=name, namespace="storage"))
         self.record("removing the deployment keeps its volumes, and applying it again reuses them")
 
+    def configuration(self):
+        name = self.deployment + "-k"
+        namespace = "config"
+        password = "pw-1 $HOME \"quoted\""
+
+        def program(settings, bystander_level="a"):
+            return [
+                {"kind": "config", "name": "settings", "fields": {"data": {"app.json": settings, "ca.crt": "CA"}}},
+                {"kind": "secret", "name": "db", "fields": {"type": "opaque", "keys": ["password"],
+                                                            "source": {"store": {}}}},
+                {"kind": "secret", "name": "app", "fields": {"type": "opaque", "keys": ["token"], "source": {
+                    "random": {"token": {"length": 32, "alphabet": "hex"}}}}},
+                {"kind": "replica_set", "name": "api", "fields": {"replicas": 2, "pod": {
+                    "grace_seconds": 5, "user": 1000, "group": 1000, "fs_group": 2000,
+                    "volumes": [
+                        {"name": "conf", "config": {"name": "settings", "items": [
+                            {"key": "app.json", "path": "conf/app.json"}, {"key": "ca.crt", "path": "ca.crt"}]}},
+                        {"name": "creds", "secret": {"name": "db", "mode": 0o440}}],
+                    "containers": [{"name": "app", "image": IMAGE, "pull": "if_not_present", "command": COMMAND,
+                                    "env": [{"name": "DB_PASSWORD", "secret": {"name": "db", "key": "password"}},
+                                            {"name": "TOKEN", "secret": {"name": "app", "key": "token"}}],
+                                    "security": {"read_only_root": True},
+                                    "mounts": [{"volume": "conf", "path": "/etc/api"},
+                                               {"volume": "conf", "path": "/opt/app.json", "sub_path": "conf/app.json"},
+                                               {"volume": "creds", "path": "/run/creds"}]}]}}},
+                {"kind": "replica_set", "name": "bystander", "fields": {"replicas": 1, "pod": pod(bystander_level)}},
+            ]
+
+        def apply(resources):
+            return self.settled(self.apply(resources, deployment=name, namespace=namespace))
+
+        def api(status):
+            return self.pods(status, "api", name)
+
+        def ids(status, resource):
+            return {n: podman("inspect", "--format", "{{.Id}}", self.container(p))
+                    for n, p in self.pods(status, resource, name).items()}
+
+        def run(replica, script):
+            return podman("exec", self.container(replica), "sh", "-c", script)
+
+        def put_secret(secret, data):
+            try:
+                return http(f"{self.rezn_url}/namespaces/{namespace}/secrets/{secret}", {"data": data}, method="PUT")
+            except urllib.error.HTTPError as error:
+                return error.code, error.read().decode()
+
+        def delete_secret(secret):
+            try:
+                return http(f"{self.rezn_url}/namespaces/{namespace}/secrets/{secret}", method="DELETE")[0]
+            except urllib.error.HTTPError as error:
+                return error.code
+
+        def owned_secrets():
+            _, listed = http(self.orqos_url + "/workload/secrets", token=self.token)
+            return [s for s in listed if s["labels"].get(OWNER) == self.owner]
+
+        try:
+            self.apply(program('{"v":1}'), deployment=name, namespace=namespace)
+            raise AssertionError("a program missing a stored secret was accepted")
+        except urllib.error.HTTPError as error:
+            body = error.read().decode()
+            assert error.code == 400 and 'key "password" of secret "db" is not in the secret store' in body, body
+        code, body = put_secret("db", {"password": password})
+        assert code == 200 and body["keys"][0]["key"] == "password", body
+        status = apply(program('{"v":1}'))
+        pods = api(status)
+        tokens = set()
+        for replica in pods.values():
+            out = run(replica, "ls /etc/api | tr '\\n' ' '; echo; cat /etc/api/conf/app.json; echo; cat /opt/app.json; echo; "
+                           "stat -c '%u %g %a' /run/creds /run/creds/password; cat /run/creds/password; echo; "
+                           "printf '%s\\n' \"$DB_PASSWORD\" \"$TOKEN\"; touch /etc/api/x 2>/dev/null || echo read-only")
+            lines = out.splitlines()
+            assert lines[0].split() == ["ca.crt", "conf"] and lines[1] == lines[2] == '{"v":1}', lines
+            assert lines[3:5] == ["0 2000 550", "0 2000 440"] and lines[5] == password, lines
+            assert lines[6] == password and len(lines[7]) == 32 and lines[8] == "read-only", lines
+            tokens.add(lines[7])
+        assert len(tokens) == 1, tokens
+        self.record("config and secret files reach pods as root:<fs_group> read-only directories and files with "
+                    "their modes, and stored and generated secrets become environment variables")
+
+        first, bystander = ids(status, "api"), ids(status, "bystander")
+        status = apply(program('{"v":1}'))
+        assert ids(status, "api") == first and run(api(status)[0], 'echo "$TOKEN"') in tokens
+        status = apply(program('{"v":2}'))
+        assert ids(status, "bystander") == bystander
+        changed = ids(status, "api")
+        assert all(changed[n] != first[n] for n in first), (first, changed)
+        assert all(run(p, "cat /etc/api/conf/app.json") == '{"v":2}' for p in api(status).values())
+        assert run(api(status)[0], 'echo "$TOKEN"') in tokens
+        self.record("a random secret is generated once and kept; a changed config replaces only the pods that use it")
+
+        code, _ = put_secret("db", {"password": password})
+        assert code == 200
+        time.sleep(4)
+        assert ids(self.status(), "api") == changed
+        code, _ = put_secret("db", {"password": "pw-2"})
+        assert code == 200
+
+        def rotated():
+            s = self.status()
+            return s if s["converged"] and all(run(p, 'echo "$DB_PASSWORD"') == "pw-2"
+                                               for p in api(s).values()) else None
+        status = wait("the new secret value to reach every replica", rotated)
+        assert ids(status, "bystander") == bystander
+        self.record("storing the same secret value changes nothing; a new value replaces only the pods that use it")
+
+        code, body = put_secret("app", {"token": "mine"})
+        assert code == 409 and "generated by Rezn" in body, (code, body)
+        assert delete_secret("db") == 409
+        token = next(iter(tokens))
+        for url, auth in [(self.rezn_url + "/status", None), (self.rezn_url + "/state", None),
+                          (f"{self.rezn_url}/namespaces/{namespace}/secrets", None),
+                          (self.orqos_url + "/workload/pods", self.token),
+                          (self.orqos_url + "/workload/secrets", self.token)]:
+            text = json.dumps(http(url, token=auth)[1])
+            assert "pw-2" not in text and token not in text and "pw-1" not in text, url
+        assert len(owned_secrets()) == 3, owned_secrets()
+        self.record("generated secrets cannot be overwritten, declared ones cannot be deleted, and no value appears "
+                    "in Rezn's or Orqos's responses")
+
+        apply([])
+        wait("owned Orqos secrets to disappear", lambda: not owned_secrets(), 60)
+        _, listed = http(f"{self.rezn_url}/namespaces/{namespace}/secrets")
+        assert sorted(s["name"] for s in listed) == ["app", "db"], listed
+        assert delete_secret("db") == 200 and delete_secret("app") == 200
+        self.record("removing the deployment removes its Orqos secrets and keeps stored values until deleted")
+
     def services(self):
         web_service = service("web")
         status = self.settled(self.apply([replica_set("web", 2, "b"), web_service]))
@@ -469,6 +602,14 @@ class Acceptance:
                              token=self.token, timeout=120)
             except Exception as error:  # cleanup must continue
                 errors.append(f"removing volumes: {error!r}")
+            try:
+                _, owned = http(self.orqos_url + "/workload/secrets", token=self.token)
+                for secret in owned:
+                    if secret.get("labels", {}).get(OWNER) == self.owner:
+                        http(f"{self.orqos_url}/workload/secrets/{secret['name']}", method="DELETE",
+                             token=self.token, timeout=120)
+            except Exception as error:  # cleanup must continue
+                errors.append(f"removing secrets: {error!r}")
         self.stop("orqos")
         if errors:
             raise AssertionError("cleanup failed: " + "; ".join(errors))

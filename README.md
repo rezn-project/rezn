@@ -7,14 +7,15 @@ See the [roadmap](https://github.com/rezn-project/rezn/issues/25).
 
 What runs today: `replica_set` and `ordered_replica_set` resources (image, command, arguments, literal environment
 values, user and groups, read-only root, no privilege escalation, no capabilities, grace period), `service`
-resources as DNS names, `volume_claim`s and per-replica claims with retention, scratch volumes, and inert `config`
-resources. Volumes are mounted idmapped, so data keeps its container IDs across pods and restarts. Each replica is
+resources as DNS names, `volume_claim`s and per-replica claims with retention, scratch volumes, and `config` and
+`secret` resources as read-only files and secret environment variables. Secret values come from Rezn's encrypted
+secret store (set per namespace by an operator, or generated once), never from the program, and a changed config or
+secret value replaces exactly the pods that use it. Volumes are mounted idmapped, so data keeps its container IDs across pods and restarts. Each replica is
 one Podman pod with its own network and user namespace, supervised by systemd with restart backoff, on its
 namespace's network, where `<service>`, `<service>.<namespace>.svc` and, for headless services,
 `<name>-<N>.<service>` resolve. Scaling touches the highest ordinals, ordered sets start one replica at a time,
 changed specs roll one replica at a time, and stopped pods are started again. A program that needs anything else
-(port-remapping services, secrets, config and secret files, probes, resource limits, init containers, jobs and so
-on) is stored but left **unexecuted**, and `/status` names every blocking field with the issue that adds it. Nothing
+(port-remapping services, generated certificates, probes, resource limits, init containers, jobs and so on) is stored but left **unexecuted**, and `/status` names every blocking field with the issue that adds it. Nothing
 is silently dropped. IR v1 programs are refused; the [Kubernetes manifest subset](docs/KUBERNETES-SUBSET.md) is
 specified for import.
 
