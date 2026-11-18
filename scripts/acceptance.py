@@ -250,6 +250,10 @@ class Acceptance:
             if status["converged"] and status["observed_revision"] == revision:
                 break
             time.sleep(0.2)
+        # A replica replaced between this iteration's inspection and the status call is seen only now.
+        for n, name in names.items():
+            if podman("inspect", "--format", "{{.Id}}", name) != before[n]:
+                changed_at.setdefault(n, time.monotonic())
         assert set(changed_at) == {0, 1} and changed_at[1] < changed_at[0], changed_at
         for pod in self.pods(status).values():
             assert podman("exec", self.container(pod), "printenv", "LEVEL") == "b"
