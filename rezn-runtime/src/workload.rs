@@ -234,7 +234,7 @@ pub struct Missing<'a> {
     pub index: usize,
     pub secret: &'a str,
     pub key: &'a str,
-    /// Rezn generates it (a `random` source); otherwise the operator stores it.
+    /// Rezn generates it (a `random`, `ca` or `certificate` source); otherwise the operator stores it.
     pub generated: bool,
 }
 
@@ -255,9 +255,9 @@ pub fn missing_keys<'a>(program: &'a Program, stored: &Stored) -> Vec<Missing<'a
         let Spec::Secret(secret) = &resource.spec else {
             continue;
         };
-        if secret.source.ca.is_some() || secret.source.certificate.is_some() {
-            continue;
-        }
+        let source = &secret.source;
+        let generated =
+            source.random.is_some() || source.ca.is_some() || source.certificate.is_some();
         let have = stored.get(&resource.name);
         for key in referenced.get(resource.name.as_str()).into_iter().flatten() {
             if !have.is_some_and(|h| h.contains_key(*key)) {
@@ -265,7 +265,7 @@ pub fn missing_keys<'a>(program: &'a Program, stored: &Stored) -> Vec<Missing<'a
                     index,
                     secret: &resource.name,
                     key,
-                    generated: secret.source.random.is_some(),
+                    generated,
                 });
             }
         }
@@ -333,6 +333,7 @@ pub fn translate(
             }
         }
     }
+    let referenced = referenced_keys(program);
     let mut object_ids: BTreeMap<(&str, &str), String> = BTreeMap::new();
     for resource in &program.resources {
         let (kind, content, source) = match &resource.spec {
@@ -342,10 +343,13 @@ pub fn translate(
                 ObjectSource::Config(c.data.clone()),
             ),
             Spec::Secret(s) if used.contains(&("secret", resource.name.as_str())) => {
+                // Only the keys pods reference: mounting a CA's certificate leaves its key in Rezn.
                 let have = stored.get(&resource.name);
+                let wanted = referenced.get(resource.name.as_str());
                 let versions: Versions = s
                     .keys
                     .iter()
+                    .filter(|k| wanted.is_some_and(|w| w.contains(k.as_str())))
                     .filter_map(|k| Some((k.clone(), have?.get(k)?.clone())))
                     .collect();
                 (
@@ -651,17 +655,7 @@ pub fn unsupported(program: &Program) -> Vec<String> {
         let pod = match &resource.spec {
             Spec::ReplicaSet(s) => &s.pod,
             Spec::OrderedReplicaSet(s) => &s.pod,
-            Spec::Config(_) => continue,
-            Spec::Secret(s) => {
-                if s.source.ca.is_some() || s.source.certificate.is_some() {
-                    add(
-                        format!("{at}/fields/source"),
-                        "generated certificate authorities and certificates are",
-                        "rezn#54",
-                    );
-                }
-                continue;
-            }
+            Spec::Config(_) | Spec::Secret(_) => continue,
             Spec::VolumeClaim(_) => {
                 if claim_groups(program)
                     .get(resource.name.as_str())
@@ -1369,16 +1363,15 @@ mod tests {
             BTreeSet::from(["tls.crt", "tls.key"])
         );
         assert!(env_keys(&reference).contains(&("db", "password")));
-        // Certificate secrets wait for rezn#54 instead of being reported missing.
-        let missing: Vec<&str> = missing_keys(&reference, &Stored::new())
+        // Rezn generates certificates and random values; only stored keys need an operator.
+        let missing = missing_keys(&reference, &Stored::new());
+        let operator: Vec<&str> = missing
             .iter()
+            .filter(|m| !m.generated)
             .map(|m| m.secret)
             .collect();
-        assert!(
-            !missing.contains(&"api-tls")
-                && missing.contains(&"registry")
-                && missing.contains(&"db")
-        );
+        assert_eq!(operator, ["registry", "edge-tls", "edge-tls"]);
+        assert!(missing.iter().any(|m| m.generated && m.secret == "api-tls"));
     }
 
     #[test]
@@ -1392,7 +1385,6 @@ mod tests {
         );
         let reasons = unsupported(&example("reference.json")).join("\n");
         for expected in [
-            "generated certificate authorities and certificates are",
             "jobs are",
             "init containers are",
             "resource requests and limits are",
@@ -1402,8 +1394,9 @@ mod tests {
         ] {
             assert!(reasons.contains(expected), "{expected}:\n{reasons}");
         }
-        // Storage, identity, configs and secrets run now.
+        // Storage, identity, configs, secrets and certificates run now.
         for gone in [
+            "certificate",
             "mounts are",
             "volume claims are",
             "security settings",

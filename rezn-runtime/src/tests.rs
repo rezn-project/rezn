@@ -1958,3 +1958,166 @@ fn object_ownership_is_proven_from_labels() {
     .is_err());
     assert!(owned_objects(&owner, vec![status(good, labels("volume"))]).is_err());
 }
+
+/// A CA, a certificate for `web` and a client trusting the CA by its certificate only.
+fn tls_program(names: &[&str]) -> Value {
+    program(
+        "certs",
+        json!([
+            {"kind": "secret", "name": "ca", "fields": {"type": "tls", "keys": ["tls.crt", "tls.key"],
+                "source": {"ca": {"common_name": "apps CA", "days": 3650}}}},
+            {"kind": "secret", "name": "web-tls", "fields": {"type": "tls", "keys": ["tls.crt", "tls.key"],
+                "source": {"certificate": {"ca": "ca", "dns_names": names, "days": 30}}}},
+            {"kind": "replica_set", "name": "web", "fields": {"replicas": 1, "pod": {
+                "volumes": [{"name": "tls", "secret": {"name": "web-tls", "mode": 288}}],
+                "containers": [{"name": "web", "image": "docker.io/library/alpine:3.22",
+                    "mounts": [{"volume": "tls", "path": "/run/tls"}]}]}}},
+            {"kind": "replica_set", "name": "client", "fields": {"replicas": 1, "pod": {
+                "volumes": [{"name": "ca", "secret": {"name": "ca", "items": [{"key": "tls.crt", "path": "ca.crt"}]}}],
+                "containers": [{"name": "client", "image": "docker.io/library/alpine:3.22",
+                    "mounts": [{"volume": "ca", "path": "/run/ca"}]}]}}}
+        ]),
+    )
+}
+
+#[tokio::test]
+async fn generated_certificates_are_issued_reissued_renewed_and_trusted_by_their_ca_only() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use openssl::x509::X509;
+    let (backend, engine) = backend().await;
+    let app = app(backend.client.clone(), None);
+    let http = HttpRezn::start(app.clone()).await;
+    let client = reqwest::Client::new();
+    let object = |pod: &str, volume: usize| -> String {
+        engine.lock().unwrap().pods[pod]["spec"]["volumes"][volume]["secret"]["name"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let data = |object: &str, key: &str| -> Option<Vec<u8>> {
+        let engine = engine.lock().unwrap();
+        engine.secrets[object]["data"][key]
+            .as_str()
+            .map(|v| STANDARD.decode(v).unwrap())
+    };
+    let sans = |pem: &[u8]| -> Vec<String> {
+        let cert = X509::from_pem(pem).unwrap();
+        let mut names: Vec<String> = cert
+            .subject_alt_names()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n.dnsname().map(String::from))
+            .collect();
+        names.sort();
+        names
+    };
+    let web = id(&app, "certs", "replica_set", "web", 0);
+    let reader = id(&app, "certs", "replica_set", "client", 0);
+
+    // Apply generates the CA and issues the certificate; the client's object holds the CA certificate only.
+    apply(&app, "certs", tls_program(&["web", "web.apps.svc"])).await;
+    reconcile(&app).await.unwrap();
+    converged(&app).await;
+    let (ca_object, tls_object) = (object(&reader, 0), object(&web, 0));
+    let ca_pem = data(&ca_object, "tls.crt").unwrap();
+    assert!(
+        data(&ca_object, "tls.key").is_none(),
+        "the CA key never leaves Rezn"
+    );
+    let leaf = data(&tls_object, "tls.crt").unwrap();
+    assert!(data(&tls_object, "tls.key").is_some());
+    assert_eq!(sans(&leaf), ["web", "web.apps.svc"]);
+    let ca = X509::from_pem(&ca_pem).unwrap();
+    assert!(X509::from_pem(&leaf)
+        .unwrap()
+        .verify(&ca.public_key().unwrap())
+        .unwrap());
+
+    // An unchanged re-apply and pass change nothing.
+    apply(&app, "certs", tls_program(&["web", "web.apps.svc"])).await;
+    let before = backend.requests().len();
+    reconcile(&app).await.unwrap();
+    assert!(changes(&backend, before).is_empty());
+
+    // A changed name list reissues the certificate from the same CA: only `web` is replaced.
+    apply(
+        &app,
+        "certs",
+        tls_program(&["web", "web.apps", "web.apps.svc"]),
+    )
+    .await;
+    reconcile(&app).await.unwrap();
+    converged(&app).await;
+    let reissued = object(&web, 0);
+    assert_ne!(reissued, tls_object);
+    assert_eq!(object(&reader, 0), ca_object);
+    let leaf = data(&reissued, "tls.crt").unwrap();
+    assert_eq!(sans(&leaf), ["web", "web.apps", "web.apps.svc"]);
+    assert!(X509::from_pem(&leaf)
+        .unwrap()
+        .verify(&ca.public_key().unwrap())
+        .unwrap());
+    assert!(!engine.lock().unwrap().secrets.contains_key(&tls_object));
+
+    // A certificate two thirds through its lifetime is renewed by the next pass, which rolls its users.
+    let store = &app.secret_store;
+    let past = chrono::Utc::now() - chrono::Duration::days(25);
+    let ca_key = store
+        .get_program("apps", "ca", "tls.key")
+        .unwrap()
+        .unwrap()
+        .0;
+    let old = crate::certificates::issue(
+        &["web", "web.apps", "web.apps.svc"].map(String::from),
+        30,
+        &ca_pem,
+        &ca_key,
+        past,
+    )
+    .unwrap();
+    let mut meta = crate::certificates::metas(store, "apps").unwrap()["web-tls"].clone();
+    (meta.not_before, meta.not_after) = (old.not_before, old.not_after);
+    store
+        .put_generated(
+            "apps",
+            "web-tls",
+            &BTreeMap::from([
+                ("tls.crt".to_string(), old.cert_pem),
+                ("tls.key".to_string(), old.key_pem),
+            ]),
+            &serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+    reconcile(&app).await.unwrap();
+    reconcile(&app).await.unwrap();
+    converged(&app).await;
+    let renewed = object(&web, 0);
+    assert_ne!(renewed, reissued);
+    assert_eq!(object(&reader, 0), ca_object, "the CA is unchanged");
+    let fresh = crate::certificates::metas(store, "apps").unwrap()["web-tls"].clone();
+    assert!(fresh.not_before > past + chrono::Duration::days(24));
+
+    // Generated secrets cannot be set; the listing shows their validity.
+    let response = client
+        .put(format!("{}/namespaces/apps/secrets/ca", http.url))
+        .json(&json!({"data": {"tls.crt": "x", "tls.key": "y"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let listed: Value = client
+        .get(format!("{}/namespaces/apps/secrets", http.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed[0]["name"], "ca");
+    assert_eq!(listed[0]["certificate"]["kind"], "ca");
+    assert!(listed[0]["certificate"]["renew_after"].is_null());
+    assert_eq!(listed[1]["certificate"]["kind"], "certificate");
+    assert_eq!(listed[1]["certificate"]["spec_changed"], false);
+    assert!(listed[1]["certificate"]["renew_after"].is_string());
+    assert!(!listed.to_string().contains("BEGIN"));
+}

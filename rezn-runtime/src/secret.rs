@@ -35,6 +35,8 @@ pub struct SecretStore {
     id: x25519::Identity,
     values: Tree,
     versions: Tree,
+    /// Plain-text metadata of generated certificates (validity, what issued them), by `<namespace>/<secret>`.
+    generated: Tree,
     mac_key: [u8; 32],
 }
 
@@ -51,6 +53,7 @@ impl SecretStore {
     fn with_db(db: Db, id: x25519::Identity) -> Result<Self> {
         let values = db.open_tree("program-secrets")?;
         let versions = db.open_tree("program-secret-versions")?;
+        let generated = db.open_tree("program-certificates")?;
         let meta = db.open_tree("program-secret-meta")?;
         let mac_key = match meta.get("version-key")? {
             Some(cipher) => decrypt(&id, &cipher)?,
@@ -70,6 +73,7 @@ impl SecretStore {
             id,
             values,
             versions,
+            generated,
             mac_key,
         })
     }
@@ -139,6 +143,58 @@ impl SecretStore {
             .map_err(|e| anyhow!("writing secret {namespace}/{secret}: {e:?}"))?;
         self.db.flush()?;
         Ok(versions)
+    }
+
+    /// Replaces every stored key of a generated secret and its metadata together, returning the new versions.
+    pub fn put_generated(
+        &self,
+        namespace: &str,
+        secret: &str,
+        data: &BTreeMap<String, Vec<u8>>,
+        meta: &[u8],
+    ) -> Result<Versions> {
+        let prefix = format!("{namespace}/{secret}/");
+        let old: Vec<sled::IVec> = self
+            .versions
+            .scan_prefix(&prefix)
+            .keys()
+            .collect::<sled::Result<_>>()?;
+        let mut encrypted = Vec::new();
+        let mut versions = Versions::new();
+        for (key, value) in data {
+            let path = Self::path(namespace, secret, key);
+            let version = self.version(&path, value);
+            encrypted.push((path, encrypt(&self.id.to_public(), value)?, version.clone()));
+            versions.insert(key.clone(), version);
+        }
+        let name = format!("{namespace}/{secret}");
+        (&self.values, &self.versions, &self.generated)
+            .transaction(|(values, stored, generated)| {
+                for key in &old {
+                    values.remove(key)?;
+                    stored.remove(key)?;
+                }
+                for (path, cipher, version) in &encrypted {
+                    values.insert(path.as_bytes(), cipher.as_slice())?;
+                    stored.insert(path.as_bytes(), version.as_bytes())?;
+                }
+                generated.insert(name.as_bytes(), meta)?;
+                Ok::<_, ConflictableTransactionError<()>>(())
+            })
+            .map_err(|e| anyhow!("writing secret {namespace}/{secret}: {e:?}"))?;
+        self.db.flush()?;
+        Ok(versions)
+    }
+
+    /// Metadata of a namespace's generated secrets, by secret name.
+    pub fn generated_meta(&self, namespace: &str) -> Result<BTreeMap<String, Vec<u8>>> {
+        let mut found = BTreeMap::new();
+        for entry in self.generated.scan_prefix(format!("{namespace}/")) {
+            let (key, meta) = entry?;
+            let key = String::from_utf8(key.to_vec())?;
+            found.insert(key[namespace.len() + 1..].to_string(), meta.to_vec());
+        }
+        Ok(found)
     }
 
     /// Stores one key unless it already has a value; returns whether it was written.
@@ -211,6 +267,8 @@ impl SecretStore {
             .next()
             .is_some();
         self.put_program(namespace, secret, &BTreeMap::new())?;
+        self.generated.remove(format!("{namespace}/{secret}"))?;
+        self.db.flush()?;
         Ok(existed)
     }
 
@@ -392,6 +450,32 @@ mod tests {
             random_value(32, Alphabet::Hex).unwrap(),
             random_value(32, Alphabet::Hex).unwrap()
         );
+    }
+
+    #[test]
+    fn generated_secrets_keep_their_metadata_with_their_values() {
+        let store = SecretStore::temporary();
+        let data = BTreeMap::from([
+            ("tls.crt".to_string(), b"CERT".to_vec()),
+            ("tls.key".to_string(), b"KEY".to_vec()),
+        ]);
+        let versions = store
+            .put_generated("ns", "web-tls", &data, b"{\"m\":1}")
+            .unwrap();
+        assert_eq!(store.program_versions("ns").unwrap()["web-tls"], versions);
+        assert_eq!(store.generated_meta("ns").unwrap()["web-tls"], b"{\"m\":1}");
+        assert!(store.generated_meta("n").unwrap().is_empty());
+        let fewer = BTreeMap::from([("tls.crt".to_string(), b"NEW".to_vec())]);
+        store
+            .put_generated("ns", "web-tls", &fewer, b"{\"m\":2}")
+            .unwrap();
+        assert!(store
+            .get_program("ns", "web-tls", "tls.key")
+            .unwrap()
+            .is_none());
+        assert_eq!(store.generated_meta("ns").unwrap()["web-tls"], b"{\"m\":2}");
+        assert!(store.delete_program("ns", "web-tls").unwrap());
+        assert!(store.generated_meta("ns").unwrap().is_empty());
     }
 
     #[test]
