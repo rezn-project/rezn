@@ -17,7 +17,10 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
+    # Side by side: an Orqos checkout inside the Rezn workspace would be mistaken for a workspace member.
     - uses: actions/checkout@v4
+      with:
+        path: rezn
     - uses: actions/checkout@v4
       with:
         repository: orqos-project/orqos
@@ -28,14 +31,14 @@ jobs:
         sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
         rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
     - name: Build Rezn
-      run: cargo build --locked -p rezn
+      run: cargo build --locked -p rezn --manifest-path rezn/Cargo.toml
     - name: Build Orqos
       run: cargo build --locked --manifest-path orqos/Cargo.toml
     - uses: actions/upload-artifact@v4
       with:
         name: binaries
         path: |
-          target/debug/rezn
+          rezn/target/debug/rezn
           orqos/target/debug/orqos
         retention-days: 1
 
@@ -58,8 +61,8 @@ jobs:
         done
     - name: Acceptance
       run: |
-        chmod +x bin/target/debug/rezn bin/orqos/target/debug/orqos
-        sudo python3 scripts/acceptance.py --orqos-bin bin/orqos/target/debug/orqos --rezn-bin bin/target/debug/rezn
+        chmod +x bin/rezn/target/debug/rezn bin/orqos/target/debug/orqos
+        sudo python3 scripts/acceptance.py --orqos-bin bin/orqos/target/debug/orqos --rezn-bin bin/rezn/target/debug/rezn
     - name: Diagnostics
       if: failure()
       run: |
