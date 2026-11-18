@@ -507,7 +507,18 @@ mod tests {
                 )
                 .unwrap()
         };
-        let store = SecretStore::open(&dir, id).unwrap();
+        // sled's background flusher can hold the file lock briefly after the first store is dropped.
+        let mut attempts = 0;
+        let store = loop {
+            match SecretStore::open(&dir, id.clone()) {
+                Ok(store) => break store,
+                Err(_) if attempts < 100 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => panic!("{e:#}"),
+            }
+        };
         assert_eq!(store.program_versions("ns").unwrap()["s"], first);
         assert!(store.get_program("ns", "s", "k").unwrap().is_some());
         drop(store);

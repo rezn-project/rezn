@@ -36,6 +36,8 @@ type Reasons = BTreeMap<String, Vec<String>>;
 #[derive(Clone, Default)]
 struct Progress {
     observation: Option<Observation>,
+    /// The host's capacity as last read from Orqos.
+    capacity: Option<crate::orqos_client::Capacity>,
     last_attempt: Option<String>,
     stale: bool,
     errors: Vec<String>,
@@ -120,6 +122,16 @@ pub struct Status {
     pub unexecuted: Vec<Unexecuted>,
     pub workloads: Vec<WorkloadStatus>,
     pub volumes: Vec<VolumeView>,
+    pub resources: ResourcesView,
+}
+
+/// What the stored programs request against what the host allows (rezn#40).
+#[derive(Serialize, ToSchema)]
+pub struct ResourcesView {
+    /// Summed requests of every stored deployment's replica sets and ordered sets.
+    pub requested: crate::admission::Totals,
+    /// The host's capacity minus Rezn's reserve; null until Orqos has reported capacity.
+    pub allocatable: Option<crate::admission::Totals>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -858,6 +870,16 @@ impl Controller {
                     }
                 })
                 .collect(),
+            resources: ResourcesView {
+                requested: state
+                    .desired()?
+                    .values()
+                    .map(crate::admission::program)
+                    .sum(),
+                allocatable: progress
+                    .capacity
+                    .map(|c| crate::admission::allocatable(c, crate::admission::reserve())),
+            },
             volumes: {
                 let observed_volumes = observed.map(|o| o.volumes.as_slice()).unwrap_or_default();
                 let wanted: BTreeSet<&str> = volumes.iter().map(|v| v.id.as_str()).collect();
@@ -945,9 +967,14 @@ impl Controller {
             volumes,
             objects,
         };
+        // Capacity only feeds status; a failed read keeps the last one.
+        let capacity = orqos.capacity().await.ok();
         let mut progress = self.progress.write().await;
         progress.observation = Some(observation.clone());
         progress.stale = false;
+        if capacity.is_some() {
+            progress.capacity = capacity;
+        }
         Ok(observation)
     }
 

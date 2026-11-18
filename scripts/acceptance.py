@@ -262,7 +262,7 @@ class Acceptance:
 
         current = self.container_ids(status)
         limited = replica_set("web", 2, "c")
-        limited["fields"]["pod"]["containers"][0]["resources"] = {"memory_limit_bytes": 67108864}
+        limited["fields"]["pod"]["containers"][0]["pull"] = "always"
         revision = self.apply([limited])
 
         def unexecuted():
@@ -270,7 +270,7 @@ class Acceptance:
             return s if s["observed_revision"] == revision and s["unexecuted"] else None
         status = wait("the unexecuted report", unexecuted)
         assert not status["converged"] and status["unexecuted"][0]["deployment"] == self.deployment
-        assert "resources: resource requests and limits are not executed yet" in \
+        assert "pull: pull policies other than if_not_present are not executed yet" in \
             status["unexecuted"][0]["reasons"][0], status
         time.sleep(3)
         assert self.container_ids(self.status()) == current
@@ -303,6 +303,7 @@ class Acceptance:
         self.certificates()
         self.probes()
         self.pod_lifecycle()
+        self.resources()
 
         networks = {n["podman_name"] for n in self.owned_networks()}
         assert len(networks) == 2, networks
@@ -805,6 +806,46 @@ class Acceptance:
         assert podman("exec", self.container(replica), "printenv", "LEVEL") == "b"
         self.record("a changed pod runs its init containers and gated start again, from empty scratch volumes")
         self.settled(self.apply([], deployment=name, namespace=namespace))
+
+    def resources(self):
+        namespace = "resources"
+        limited = replica_set("limited", 1, "a")
+        limited["fields"]["pod"]["containers"][0]["resources"] = {
+            "cpu_limit_millis": 500, "cpu_request_millis": 250,
+            "memory_limit_bytes": 64 << 20, "memory_request_bytes": 32 << 20}
+        name = self.deployment + "-r"
+        status = self.settled(self.apply([limited], deployment=name, namespace=namespace))
+        replica = self.pods(status, "limited", name)[0]
+        read = podman("exec", self.container(replica), "sh", "-c",
+                      "cd /sys/fs/cgroup && cat memory.max memory.swap.max memory.low cpu.max cpu.weight").splitlines()
+        assert read[:4] == ["67108864", "0", "33554432", "50000 100000"] and read[4] != "100", read
+        self.record("limits become the container's cgroup limits (memory.max without swap, cpu.max) and requests its "
+                    "memory protection and CPU weight")
+
+        _, capacity = http(self.orqos_url + "/workload/capacity", token=self.token)
+        allocatable = capacity["cpu_millis"] - 250
+        share = allocatable * 6 // 10
+
+        def cpu(replicas, millis):
+            workload = replica_set("busy", replicas, "a")
+            workload["fields"]["pod"]["containers"][0]["resources"] = {"cpu_request_millis": millis}
+            return [workload]
+        first, second = self.deployment + "-ra", self.deployment + "-rb"
+        self.settled(self.apply(cpu(1, share), deployment=first, namespace="admit-a"))
+        try:
+            self.apply(cpu(1, share), deployment=second, namespace="admit-b")
+            raise AssertionError("a revision over the host's allocatable CPU was accepted")
+        except urllib.error.HTTPError as error:
+            body = error.read().decode()
+            assert error.code == 400 and f"CPU: {2 * share + 250}m requested of {allocatable}m allocatable" in body, body
+        self.settled(self.apply(cpu(1, share // 6), deployment=first, namespace="admit-a"))
+        status = self.settled(self.apply(cpu(1, share), deployment=second, namespace="admit-b"))
+        assert status["resources"]["requested"]["cpu_millis"] == share // 6 + share + 250, status["resources"]
+        assert status["resources"]["allocatable"]["cpu_millis"] == allocatable, status["resources"]
+        self.record("a revision whose requests exceed the host's allocatable CPU, with the other deployments', is "
+                    "refused with the figures; shrinking another deployment makes room, and status shows the totals")
+        for deployment, ns in ((first, "admit-a"), (second, "admit-b"), (name, namespace)):
+            self.settled(self.apply([], deployment=deployment, namespace=ns))
 
     def services(self):
         web_service = service("web")

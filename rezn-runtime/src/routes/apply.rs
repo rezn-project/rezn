@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
-    certificates,
+    admission, certificates,
     intent::{instructions, validate_envelope},
     routes::common::{app_error, AppError},
     secret,
@@ -35,8 +35,9 @@ pub struct Accepted {
     request_body(content = ApplyPayload, description = "Replace one deployment with a signed program: an IR v2 program object, validated, stored and then executed through the Orqos workload backend (programs needing features it lacks are listed under /status unexecuted). IR v1 instruction arrays are refused. The signature covers the canonical submitted program, including its deployment and namespace.", content_type = "application/json"),
     responses(
         (status = 202, description = "Intent stored durably; inspect /status for convergence", body = Accepted),
-        (status = 400, description = "Invalid signature or program, resource names colliding with another deployment of the same namespace, or referenced store or seed_once secret keys missing from the secret store (or holding control characters where they become environment variables)", body = String),
+        (status = 400, description = "Invalid signature or program, resource names colliding with another deployment of the same namespace, or referenced store or seed_once secret keys missing from the secret store (or holding control characters where they become environment variables), or requests that, with the other deployments', exceed the host's allocatable CPU or memory", body = String),
         (status = 422, description = "Malformed request or unknown envelope fields", body = String),
+        (status = 503, description = "The host's capacity could not be read from Orqos, so requests cannot be checked", body = String),
         (status = 500, description = "Unreadable/corrupt persisted state or storage failure", body = String)
     ), tag = "Apply"
 )]
@@ -62,6 +63,26 @@ pub async fn apply_handler(
     if !collisions.is_empty() {
         return Err((StatusCode::BAD_REQUEST, collisions.join("\n")));
     }
+    // Local checks first: Orqos is asked nothing for a request that fails on its own.
+    let next_revision = state
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| app_error("revision exhausted"))?;
+    // Requests are admission checks against the host: a revision that does not fit is refused, not started.
+    let capacity = app.orqos.capacity().await.map_err(|e| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("cannot check the revision against the host's capacity: {e:#}"),
+        )
+    })?;
+    let allocatable = admission::allocatable(capacity, admission::reserve());
+    admission::check(
+        &payload.name,
+        &program,
+        &state.desired().map_err(app_error)?,
+        allocatable,
+    )
+    .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     // A revision whose referenced secret keys are missing fails before any workload changes.
     let namespace = &program.namespace;
     let stored = app
@@ -113,10 +134,7 @@ pub async fn apply_handler(
     {
         tracing::info!("{change}");
     }
-    state.revision = state
-        .revision
-        .checked_add(1)
-        .ok_or_else(|| app_error("revision exhausted"))?;
+    state.revision = next_revision;
     // Forward-only migration: an empty format 1 database becomes format 2 in this same write.
     state.format = store::FORMAT_V2;
     state.deployments.insert(
