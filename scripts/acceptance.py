@@ -52,7 +52,8 @@ def wait(description, check, timeout=180, interval=0.5):
             result = check()
             if result:
                 return result
-        except (OSError, ValueError, AssertionError, KeyError) as error:
+        # A podman command can fail while a container is being replaced: that is "not yet", not a failure.
+        except (OSError, ValueError, AssertionError, KeyError, subprocess.CalledProcessError) as error:
             last = repr(error)
         time.sleep(interval)
     raise AssertionError(f"timed out waiting for {description}; last: {last}")
