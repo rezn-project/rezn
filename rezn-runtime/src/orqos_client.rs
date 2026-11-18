@@ -20,6 +20,62 @@ pub struct PodSpec {
     pub labels: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<Network>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supplementary_groups: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<PodVolume>,
+}
+
+/// A pod volume: an owned volume (`volume`, created with `PUT /workload/volumes/{name}`) or a scratch volume.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PodVolume {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<Scratch>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Scratch {
+    pub medium: Medium,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Medium {
+    Disk,
+    Memory,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MountSpec {
+    pub volume: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_path: Option<String>,
+}
+
+/// An owned volume's spec: the group owning its root (setgid 2775) and Rezn's labels, kept by Orqos.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct VolumeSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<u32>,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+}
+
+/// One owned volume as Orqos reports it.
+#[derive(Clone, Debug, Deserialize)]
+pub struct VolumeStatus {
+    pub name: String,
+    pub exists: bool,
+    pub spec: VolumeSpec,
+    /// Pods whose records mount it.
+    pub pods: Vec<String>,
 }
 
 /// An Orqos-owned Podman network the pod joins, with the DNS names that resolve to it there.
@@ -48,6 +104,18 @@ pub struct ContainerSpec {
     pub args: Option<Vec<String>>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only_root: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_new_privileges: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub drop_all_capabilities: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<MountSpec>,
 }
 
 /// One pod as Orqos reports it.
@@ -138,6 +206,39 @@ impl OrqosClient {
         Ok(())
     }
 
+    pub async fn list_volumes(&self) -> Result<Vec<VolumeStatus>> {
+        self.send(
+            "list workload volumes",
+            self.client
+                .get(format!("{}/workload/volumes", self.base_url)),
+        )
+        .await?
+        .json()
+        .await
+        .context("Failed to parse the workload volume list")
+    }
+
+    pub async fn put_volume(&self, name: &str, spec: &VolumeSpec) -> Result<()> {
+        self.send(
+            &format!("apply workload volume {name}"),
+            self.client
+                .put(format!("{}/workload/volumes/{name}", self.base_url))
+                .json(spec),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_volume(&self, name: &str) -> Result<()> {
+        self.send(
+            &format!("remove workload volume {name}"),
+            self.client
+                .delete(format!("{}/workload/volumes/{name}", self.base_url)),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn send(&self, operation: &str, request: RequestBuilder) -> Result<Response> {
         let response = request
             .bearer_auth(&self.token)
@@ -173,6 +274,17 @@ mod tests {
                 command: None,
                 args: Some(vec!["-g".into(), "daemon off;".into()]),
                 env: BTreeMap::from([("LEVEL".into(), "info".into())]),
+                user: Some(1000),
+                group: None,
+                read_only_root: true,
+                no_new_privileges: false,
+                drop_all_capabilities: true,
+                mounts: vec![MountSpec {
+                    volume: "data".into(),
+                    path: "/data".into(),
+                    read_only: false,
+                    sub_path: Some("v1".into()),
+                }],
             }],
             restart: Restart::Always,
             grace_seconds: 30,
@@ -181,6 +293,12 @@ mod tests {
                 name: "rz-net".into(),
                 aliases: vec!["web".into(), "web.store.svc".into()],
             }),
+            supplementary_groups: vec![2000],
+            volumes: vec![PodVolume {
+                name: "data".into(),
+                volume: Some("rz-vol".into()),
+                scratch: None,
+            }],
         }
     }
 
@@ -192,7 +310,10 @@ mod tests {
             "containers": [{"name": "web", "unit": "orqos-rz-1-c-web.service", "active_state": "active", "sub_state": "running", "result": "success", "restarts": 2}],
             "spec": {"hostname": "web-0", "restart": "always", "grace_seconds": 30, "labels": {"dev.rezn.owner": "ab"},
                      "network": {"name": "rz-net", "aliases": ["web", "web.store.svc"]},
-                     "containers": [{"name": "web", "image": "docker.io/library/nginx:1.27-alpine", "args": ["-g", "daemon off;"], "env": {"LEVEL": "info"}}]},
+                     "supplementary_groups": [2000], "volumes": [{"name": "data", "volume": "rz-vol"}],
+                     "containers": [{"name": "web", "image": "docker.io/library/nginx:1.27-alpine", "args": ["-g", "daemon off;"], "env": {"LEVEL": "info"},
+                                     "user": 1000, "read_only_root": true, "drop_all_capabilities": true,
+                                     "mounts": [{"volume": "data", "path": "/data", "sub_path": "v1"}]}]},
             "error": null, "updated_at": "2026-11-18T00:00:00Z"
         }]);
         let server = MockOrqos::start(move |request| match request.method.as_str() {

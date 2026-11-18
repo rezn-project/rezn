@@ -292,6 +292,7 @@ class Acceptance:
         self.record("a killed container is restarted by systemd without Rezn replacing the pod")
 
         self.services()
+        self.storage()
 
         networks = {n["podman_name"] for n in self.owned_networks()}
         assert len(networks) == 2, networks
@@ -306,6 +307,80 @@ class Acceptance:
         self.record("empty programs remove every owned pod and then the namespace networks; a foreign Orqos pod "
                     "is untouched")
         return self.steps
+
+    def storage(self):
+        name = self.deployment + "-s"
+
+        def program(replicas, level="a"):
+            return [
+                {"kind": "volume_claim", "name": "shared", "fields": {"bytes": 1048576}},
+                {"kind": "ordered_replica_set", "name": "db", "fields": {
+                    "replicas": replicas, "service": "db", "pod_management": "parallel",
+                    "volume_claims": [{"name": "data", "bytes": 1048576}],
+                    "pod": {"grace_seconds": 5, "user": 1000, "group": 1000, "fs_group": 2000,
+                            "fs_group_policy": "on_root_mismatch", "run_as_non_root": True,
+                            "volumes": [{"name": "data", "claim": "data"}, {"name": "shared", "claim": "shared"},
+                                        {"name": "tmp", "scratch": {"medium": "memory", "bytes": 1048576}}],
+                            "containers": [{"name": "app", "image": IMAGE, "pull": "if_not_present",
+                                            "command": COMMAND, "env": [{"name": "LEVEL", "value": level}],
+                                            "security": {"read_only_root": True,
+                                                         "allow_privilege_escalation": False,
+                                                         "drop_capabilities": ["all"]},
+                                            "mounts": [{"volume": "data", "path": "/data"},
+                                                       {"volume": "shared", "path": "/shared"},
+                                                       {"volume": "tmp", "path": "/tmp"}]}]}}},
+                {"kind": "service", "name": "db", "fields": {"target": "db", "headless": True, "ports": []}},
+            ]
+
+        def apply(resources):
+            return self.settled(self.apply(resources, deployment=name, namespace="storage"))
+
+        def replicas(status):
+            return self.pods(status, "db", name)
+
+        def run(pod, script):
+            return podman("exec", self.container(pod), "sh", "-c", script)
+
+        def volumes(status):
+            return {(v["claim"], v["ordinal"]): v for v in status["volumes"] if v["deployment"] == name}
+
+        status = apply(program(2))
+        pods = replicas(status)
+        for n, pod in pods.items():
+            run(pod, f"echo db-{n} > /data/marker && echo {n} >> /shared/log && echo scratch > /tmp/t")
+        ident = run(pods[0], "id; grep CapEff /proc/self/status; touch /x 2>/dev/null || echo read-only")
+        assert "uid=1000" in ident and ",2000" in ident.split("groups=")[1] and "CapEff:\t0000000000000000" in ident \
+            and "read-only" in ident, ident
+        own = volumes(status)
+        assert len(own) == 3 and all(v["desired"] and v["exists"] for v in own.values()), own
+        marker = Path(podman("volume", "inspect", f"orqos-vol-{own[('data', 1)]['id']}", "--format",
+                             "{{.Mountpoint}}")) / "marker"
+        stat = marker.stat()
+        assert (stat.st_uid, stat.st_gid) == (1000, 2000), (stat.st_uid, stat.st_gid)
+        assert sorted(run(pods[1], "cat /shared/log").split()) == ["0", "1"]
+        self.record("pods run as their user with fs_group-owned volumes, read-only and without capabilities; "
+                    "files keep container IDs on disk and a shared claim is shared")
+
+        status = apply(program(1))
+        retained = volumes(status)[("data", 1)]
+        assert not retained["desired"] and retained["retain"] and retained["exists"], retained
+        status = apply(program(2))
+        assert run(replicas(status)[1], "cat /data/marker") == "db-1"
+        self.record("scaling 2 -> 1 -> 2 brings replica 1 back with its own volume")
+
+        status = apply(program(2, "b"))
+        for n, pod in replicas(status).items():
+            assert run(pod, "cat /data/marker; printenv LEVEL; ls /tmp | wc -l").split() == [f"db-{n}", "b", "0"]
+        self.record("replacing every replica keeps each one's volume and starts its scratch volume empty")
+
+        status = apply([])
+        assert not replicas(status)
+        own = volumes(status)
+        assert len(own) == 3 and all(not v["desired"] and v["retain"] for v in own.values()), own
+        status = apply(program(2))
+        assert run(replicas(status)[0], "cat /data/marker") == "db-0"
+        self.settled(self.apply([], deployment=name, namespace="storage"))
+        self.record("removing the deployment keeps its volumes, and applying it again reuses them")
 
     def services(self):
         web_service = service("web")
@@ -386,6 +461,14 @@ class Acceptance:
                              timeout=120)
             except Exception as error:  # cleanup must continue
                 errors.append(f"removing pods: {error!r}")
+            try:
+                _, volumes = http(self.orqos_url + "/workload/volumes", token=self.token)
+                for volume in volumes:
+                    if volume["spec"].get("labels", {}).get(OWNER) == self.owner:
+                        http(f"{self.orqos_url}/workload/volumes/{volume['name']}", method="DELETE",
+                             token=self.token, timeout=120)
+            except Exception as error:  # cleanup must continue
+                errors.append(f"removing volumes: {error!r}")
         self.stop("orqos")
         if errors:
             raise AssertionError("cleanup failed: " + "; ".join(errors))

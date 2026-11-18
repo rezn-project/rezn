@@ -16,9 +16,12 @@ use tokio::sync::{Mutex, RwLock};
 use utoipa::ToSchema;
 
 use crate::{
-    orqos_client::{ContainerStatus, OrqosClient, PodSpec, PodStatus},
+    orqos_client::{ContainerStatus, OrqosClient, PodSpec, PodStatus, VolumeSpec, VolumeStatus},
     store::{self, StoredState},
-    workload::{self, Workload, DEPLOYMENT, KIND, NAMESPACE, ORDINAL, OWNER, RESOURCE},
+    workload::{
+        self, DesiredVolume, Workload, CLAIM, DEPLOYMENT, KIND, NAMESPACE, ORDINAL, OWNER,
+        RESOURCE, RETAIN, WORKLOAD,
+    },
 };
 
 /// (deployment, kind, resource) of one replica set.
@@ -39,6 +42,18 @@ struct Observation {
     revision: u64,
     at: String,
     pods: Vec<Owned>,
+    volumes: Vec<OwnedVolume>,
+}
+
+/// A volume proven to belong to this database.
+#[derive(Clone, Debug)]
+pub struct OwnedVolume {
+    pub deployment: String,
+    pub claim: String,
+    /// The ordered set and ordinal of a per-replica volume.
+    pub replica: Option<(String, u32)>,
+    pub retain: bool,
+    pub status: VolumeStatus,
 }
 
 /// A pod proven to belong to this database.
@@ -85,6 +100,25 @@ pub struct Status {
     /// created, changed or removed; pods of an earlier revision keep running. `converged` stays false.
     pub unexecuted: Vec<Unexecuted>,
     pub workloads: Vec<WorkloadStatus>,
+    pub volumes: Vec<VolumeView>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct VolumeView {
+    pub id: String,
+    pub deployment: String,
+    pub claim: String,
+    /// The ordered set of a per-replica volume.
+    pub workload: Option<String>,
+    pub ordinal: Option<u32>,
+    /// The accepted programs want it; otherwise it is retained (or awaiting deletion).
+    pub desired: bool,
+    /// Kept once its workload or deployment is gone.
+    pub retain: bool,
+    /// Observed in Orqos (false until created, or after a failed observation).
+    pub exists: bool,
+    /// Pods whose records mount it.
+    pub mounted_by: Vec<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -127,18 +161,24 @@ pub struct PodView {
 pub enum Action {
     Remove(String),
     Apply(String, PodSpec),
+    PutVolume(String, VolumeSpec),
+    RemoveVolume(String),
 }
 
-/// Desired workloads of every executable deployment, and the reasons of the others.
-fn desired(state: &StoredState) -> Result<(Vec<Workload>, Reasons)> {
+/// Desired workloads and volumes of every executable deployment, and the reasons of the others.
+fn desired(state: &StoredState) -> Result<(Vec<Workload>, Vec<DesiredVolume>, Reasons)> {
     let mut workloads = Vec::new();
+    let mut volumes = Vec::new();
     let mut unexecuted = BTreeMap::new();
     let programs = state.desired()?;
     for (name, program) in &programs {
         // `/apply` refuses colliding names; this covers state stored before that check.
         let collisions = workload::collisions(name, program, &programs);
         match workload::translate(&state.owner, program) {
-            Ok(w) if collisions.is_empty() => workloads.extend(w),
+            Ok(t) if collisions.is_empty() => {
+                workloads.extend(t.workloads);
+                volumes.extend(t.volumes);
+            }
             Ok(_) => {
                 unexecuted.insert(name.clone(), collisions);
             }
@@ -147,7 +187,136 @@ fn desired(state: &StoredState) -> Result<(Vec<Workload>, Reasons)> {
             }
         }
     }
-    Ok((workloads, unexecuted))
+    Ok((workloads, volumes, unexecuted))
+}
+
+/// Proves volume ownership locally, like [`owned`]: volumes of other owners are ignored; one claiming this owner
+/// with malformed labels, or an ID that does not match them, fails the observation.
+pub fn owned_volumes(owner: &str, volumes: Vec<VolumeStatus>) -> Result<Vec<OwnedVolume>> {
+    let mut result = Vec::new();
+    for volume in volumes {
+        let labels = &volume.spec.labels;
+        if labels.get(OWNER).map(String::as_str) != Some(owner) {
+            continue;
+        }
+        let label = |key: &str| {
+            labels
+                .get(key)
+                .with_context(|| format!("volume {} lacks ownership label {key}", volume.name))
+        };
+        let deployment = label(DEPLOYMENT)?.clone();
+        let claim = label(CLAIM)?.clone();
+        ensure!(
+            ir_v2::is_name(&deployment, 63)
+                && ir_v2::is_name(label(NAMESPACE)?, 63)
+                && ir_v2::is_name(&claim, 63),
+            "volume {} has malformed ownership labels",
+            volume.name
+        );
+        let retain = match label(RETAIN)?.as_str() {
+            "true" => true,
+            "false" => false,
+            other => bail!(
+                "volume {} has a malformed retain label {other:?}",
+                volume.name
+            ),
+        };
+        let replica = match (labels.get(WORKLOAD), labels.get(ORDINAL)) {
+            (None, None) => None,
+            (Some(set), Some(n)) => {
+                let ordinal: u32 = n
+                    .parse()
+                    .ok()
+                    .filter(|o: &u32| o.to_string() == *n)
+                    .with_context(|| {
+                        format!("volume {} has a malformed ordinal label", volume.name)
+                    })?;
+                ensure!(
+                    ir_v2::is_name(set, 63),
+                    "volume {} has a malformed workload label",
+                    volume.name
+                );
+                Some((set.clone(), ordinal))
+            }
+            _ => bail!(
+                "volume {} has only one of the workload and ordinal labels",
+                volume.name
+            ),
+        };
+        let id = workload::volume_id(
+            owner,
+            &deployment,
+            replica.as_ref().map(|(set, _)| set.as_str()),
+            &claim,
+            replica.as_ref().map(|(_, n)| *n),
+        );
+        ensure!(
+            volume.name == id,
+            "volume {} claims this owner but its name does not match its labels",
+            volume.name
+        );
+        result.push(OwnedVolume {
+            deployment,
+            claim,
+            replica,
+            retain,
+            status: volume,
+        });
+    }
+    result.sort_by(|a, b| a.status.name.cmp(&b.status.name));
+    Ok(result)
+}
+
+/// Volume changes: desired volumes that are missing or whose spec differs are put (before any pod change, so pods
+/// can mount them); owned volumes nobody wants are removed (after) once no pod mounts them and their policy says
+/// so: a per-replica volume beyond its set's replica count when the set does not retain on scale-down, or any
+/// volume whose retain label is false once its set or deployment is gone. Unexecuted deployments' volumes stay.
+pub fn plan_volumes(
+    workloads: &[Workload],
+    volumes: &[DesiredVolume],
+    unexecuted: &Reasons,
+    observed: &[OwnedVolume],
+) -> (Vec<Action>, Vec<Action>) {
+    let by_id: BTreeMap<&str, &OwnedVolume> = observed
+        .iter()
+        .map(|v| (v.status.name.as_str(), v))
+        .collect();
+    let puts = volumes
+        .iter()
+        .filter(|v| {
+            by_id
+                .get(v.id.as_str())
+                .is_none_or(|o| o.status.spec != v.spec)
+        })
+        .map(|v| Action::PutVolume(v.id.clone(), v.spec.clone()))
+        .collect();
+    let wanted: BTreeSet<&str> = volumes.iter().map(|v| v.id.as_str()).collect();
+    let removes = observed
+        .iter()
+        .filter(|v| {
+            !wanted.contains(v.status.name.as_str())
+                && !unexecuted.contains_key(&v.deployment)
+                && v.status.pods.is_empty()
+        })
+        .filter(|v| {
+            let set = v.replica.as_ref().and_then(|(set, n)| {
+                workloads
+                    .iter()
+                    .find(|w| {
+                        w.deployment == v.deployment
+                            && w.kind == Kind::OrderedReplicaSet
+                            && &w.resource == set
+                    })
+                    .map(|w| (w, *n))
+            });
+            match set {
+                Some((w, n)) => w.delete_on_scale_down && n as usize >= w.pods.len(),
+                None => !v.retain,
+            }
+        })
+        .map(|v| Action::RemoveVolume(v.status.name.clone()))
+        .collect();
+    (puts, removes)
 }
 
 /// Proves ownership locally: a server-side listing is no proof. Pods of other owners are ignored; a pod claiming
@@ -313,16 +482,34 @@ fn executed_converged(workloads: &[Workload], unexecuted: &Reasons, observed: &[
         })
 }
 
+/// Every desired volume exists with its spec and no owned volume awaits deletion.
+fn volumes_converged(
+    workloads: &[Workload],
+    volumes: &[DesiredVolume],
+    unexecuted: &Reasons,
+    observed: &[OwnedVolume],
+) -> bool {
+    let (puts, removes) = plan_volumes(workloads, volumes, unexecuted, observed);
+    puts.is_empty() && removes.is_empty()
+}
+
 /// Converged: every deployment is executed and matches what Orqos runs.
-fn converged(workloads: &[Workload], unexecuted: &Reasons, observed: &[Owned]) -> bool {
-    unexecuted.is_empty() && executed_converged(workloads, unexecuted, observed)
+fn converged(
+    workloads: &[Workload],
+    volumes: &[DesiredVolume],
+    unexecuted: &Reasons,
+    observation: &Observation,
+) -> bool {
+    unexecuted.is_empty()
+        && executed_converged(workloads, unexecuted, &observation.pods)
+        && volumes_converged(workloads, volumes, unexecuted, &observation.volumes)
 }
 
 impl Controller {
     pub async fn status(&self, db: &sled::Db) -> Result<Status> {
         let _intent = self.intent.lock().await;
         let state = store::load(db)?;
-        let (workloads, unexecuted) = desired(&state)?;
+        let (workloads, volumes, unexecuted) = desired(&state)?;
         let progress = self.progress.read().await;
         let observed = progress.observation.as_ref();
         let pending = observed.is_some_and(|o| o.revision != state.revision);
@@ -357,7 +544,7 @@ impl Controller {
             converged: !progress.stale
                 && !pending
                 && progress.errors.is_empty()
-                && observed.is_some_and(|o| converged(&workloads, &unexecuted, &o.pods)),
+                && observed.is_some_and(|o| converged(&workloads, &volumes, &unexecuted, o)),
             errors: progress.errors.clone(),
             unexecuted: unexecuted
                 .iter()
@@ -401,6 +588,44 @@ impl Controller {
                     }
                 })
                 .collect(),
+            volumes: {
+                let observed_volumes = observed.map(|o| o.volumes.as_slice()).unwrap_or_default();
+                let wanted: BTreeSet<&str> = volumes.iter().map(|v| v.id.as_str()).collect();
+                let mut views: BTreeMap<String, VolumeView> = observed_volumes
+                    .iter()
+                    .map(|v| {
+                        (
+                            v.status.name.clone(),
+                            VolumeView {
+                                id: v.status.name.clone(),
+                                deployment: v.deployment.clone(),
+                                claim: v.claim.clone(),
+                                workload: v.replica.as_ref().map(|(set, _)| set.clone()),
+                                ordinal: v.replica.as_ref().map(|(_, n)| *n),
+                                desired: wanted.contains(v.status.name.as_str()),
+                                retain: v.retain,
+                                exists: v.status.exists,
+                                mounted_by: v.status.pods.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+                for v in &volumes {
+                    let labels = &v.spec.labels;
+                    views.entry(v.id.clone()).or_insert_with(|| VolumeView {
+                        id: v.id.clone(),
+                        deployment: labels[DEPLOYMENT].clone(),
+                        claim: labels[CLAIM].clone(),
+                        workload: labels.get(WORKLOAD).cloned(),
+                        ordinal: labels.get(ORDINAL).and_then(|n| n.parse().ok()),
+                        desired: true,
+                        retain: labels.get(RETAIN).map(String::as_str) == Some("true"),
+                        exists: false,
+                        mounted_by: vec![],
+                    });
+                }
+                views.into_values().collect()
+            },
         })
     }
 
@@ -416,7 +641,7 @@ impl Controller {
         result
     }
 
-    async fn observe(&self, state: &StoredState, orqos: &OrqosClient) -> Result<Vec<Owned>> {
+    async fn observe(&self, state: &StoredState, orqos: &OrqosClient) -> Result<Observation> {
         let pods = owned(
             &state.owner,
             orqos
@@ -424,40 +649,55 @@ impl Controller {
                 .await
                 .context("required workload observation failed")?,
         )?;
-        let mut progress = self.progress.write().await;
-        progress.observation = Some(Observation {
+        let volumes = owned_volumes(
+            &state.owner,
+            orqos
+                .list_volumes()
+                .await
+                .context("required volume observation failed")?,
+        )?;
+        let observation = Observation {
             revision: state.revision,
             at: Utc::now().to_rfc3339(),
-            pods: pods.clone(),
-        });
+            pods,
+            volumes,
+        };
+        let mut progress = self.progress.write().await;
+        progress.observation = Some(observation.clone());
         progress.stale = false;
-        Ok(pods)
+        Ok(observation)
     }
 
     async fn pass(&self, db: &sled::Db, orqos: &OrqosClient) -> Result<()> {
         // Validate the complete persisted snapshot before observation or mutation.
         let state = store::load(db)?;
-        let (workloads, unexecuted) = desired(&state)?;
-        let pods = self.observe(&state, orqos).await?;
+        let (workloads, volumes, unexecuted) = desired(&state)?;
+        let observation = self.observe(&state, orqos).await?;
         // If apply won the race during observation, start again with its snapshot.
         ensure!(
             store::load(db)?.revision == state.revision,
             "intent changed during observation; retry pending revision"
         );
-        let actions = plan(&workloads, &unexecuted, &pods);
+        // Volumes first (pods mount them), then pods, then volume removals (only volumes no pod mounts).
+        let (mut actions, removals) =
+            plan_volumes(&workloads, &volumes, &unexecuted, &observation.volumes);
+        actions.extend(plan(&workloads, &unexecuted, &observation.pods));
+        actions.extend(removals);
         // Pods are independent: one failing pod must not block the others, so every action is attempted.
         let mut failures = Vec::new();
         for action in &actions {
             let result = match action {
                 Action::Remove(id) => orqos.delete_pod(id).await,
                 Action::Apply(id, spec) => orqos.put_pod(id, spec).await,
+                Action::PutVolume(id, spec) => orqos.put_volume(id, spec).await,
+                Action::RemoveVolume(id) => orqos.delete_volume(id).await,
             };
             if let Err(error) = result {
                 failures.push(format!("{error:#}"));
             }
         }
         let after = if actions.is_empty() {
-            Ok(pods)
+            Ok(observation)
         } else {
             self.observe(&state, orqos).await
         };
@@ -469,9 +709,10 @@ impl Controller {
             }
             Ok(_) if !failures.is_empty() => bail!("{}", failures.join("; ")),
             // Unexecuted deployments are not errors (status lists them); the executed ones must converge.
-            Ok(pods) => ensure!(
-                executed_converged(&workloads, &unexecuted, &pods),
-                "observed pods have not converged; retrying on next pass"
+            Ok(after) => ensure!(
+                executed_converged(&workloads, &unexecuted, &after.pods)
+                    && volumes_converged(&workloads, &volumes, &unexecuted, &after.volumes),
+                "observed pods and volumes have not converged; retrying on next pass"
             ),
         }
         self.progress.write().await.errors.clear();

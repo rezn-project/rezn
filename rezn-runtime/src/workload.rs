@@ -12,7 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use common::ir_v2::{self, Kind, PodManagement, PortRef, Program, Pull, Spec};
 use sha2::{Digest, Sha256};
 
-use crate::orqos_client::{ContainerSpec, Network, PodSpec, Restart};
+use crate::orqos_client::{
+    ContainerSpec, Medium, MountSpec, Network, PodSpec, PodVolume, Restart, Scratch, VolumeSpec,
+};
 
 pub const OWNER: &str = "dev.rezn.owner";
 pub const DEPLOYMENT: &str = "dev.rezn.deployment";
@@ -20,6 +22,28 @@ pub const NAMESPACE: &str = "dev.rezn.namespace";
 pub const KIND: &str = "dev.rezn.kind";
 pub const RESOURCE: &str = "dev.rezn.resource";
 pub const ORDINAL: &str = "dev.rezn.ordinal";
+pub const CLAIM: &str = "dev.rezn.claim";
+pub const WORKLOAD: &str = "dev.rezn.workload";
+/// `true` or `false`: whether the volume is kept once its workload or deployment is gone. Kept in Orqos's volume
+/// record, so the decision survives the program that made it.
+pub const RETAIN: &str = "dev.rezn.retain";
+
+/// Highest user or group ID a pod can use: Orqos gives each pod a user namespace of 65536 IDs.
+const MAX_ID: u32 = 65535;
+
+/// A deployment's pods and volumes.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Translation {
+    pub workloads: Vec<Workload>,
+    pub volumes: Vec<DesiredVolume>,
+}
+
+/// An owned volume: a `volume_claim`'s, or one replica's from an ordered set's `volume_claims`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DesiredVolume {
+    pub id: String,
+    pub spec: VolumeSpec,
+}
 
 /// One replica set of a deployment, expanded into its pods by ordinal.
 #[derive(Clone, Debug, PartialEq)]
@@ -29,6 +53,8 @@ pub struct Workload {
     pub resource: String,
     /// Ordered replica sets with `ordered` pod management start, stop and scale one replica at a time.
     pub sequential: bool,
+    /// Per-replica volumes of ordinals beyond the replica count are deleted (`retain.on_scale_down: false`).
+    pub delete_on_scale_down: bool,
     pub pods: Vec<DesiredPod>,
 }
 
@@ -42,6 +68,20 @@ pub struct DesiredPod {
 /// The Orqos pod ID of one replica: stable for its identity, distinct across owners, at most 48 characters.
 pub fn pod_id(owner: &str, deployment: &str, kind: &str, resource: &str, ordinal: u32) -> String {
     let identity = serde_json::json!([owner, deployment, kind, resource, ordinal]);
+    let digest = Sha256::digest(identity.to_string().as_bytes());
+    format!("rz-{}", &hex::encode(digest)[..24])
+}
+
+/// The Orqos volume of a claim: a deployment's `volume_claim` (no workload or ordinal) or one replica's volume from
+/// an ordered set's `volume_claims`. Stable, so retained volumes come back to the same claim and ordinal.
+pub fn volume_id(
+    owner: &str,
+    deployment: &str,
+    workload: Option<&str>,
+    claim: &str,
+    ordinal: Option<u32>,
+) -> String {
+    let identity = serde_json::json!([owner, "volume", deployment, workload, claim, ordinal]);
     let digest = Sha256::digest(identity.to_string().as_bytes());
     format!("rz-{}", &hex::encode(digest)[..24])
 }
@@ -80,7 +120,7 @@ pub fn hostname(resource: &str, ordinal: u32) -> String {
 }
 
 /// The pods of every replica set, or every reason the program cannot run on the workload backend yet.
-pub fn translate(owner: &str, program: &Program) -> Result<Vec<Workload>, Vec<String>> {
+pub fn translate(owner: &str, program: &Program) -> Result<Translation, Vec<String>> {
     let reasons = unsupported(program);
     if !reasons.is_empty() {
         return Err(reasons);
@@ -96,31 +136,136 @@ pub fn translate(owner: &str, program: &Program) -> Result<Vec<Workload>, Vec<St
         }
     }
     let network = network_name(owner, &program.namespace);
-    let mut workloads = Vec::new();
+    let labels = |workload: Option<&str>, claim: &str, ordinal: Option<u32>, retain: bool| {
+        let mut labels = BTreeMap::from([
+            (OWNER.to_string(), owner.to_string()),
+            (DEPLOYMENT.into(), program.deployment.clone()),
+            (NAMESPACE.into(), program.namespace.clone()),
+            (CLAIM.into(), claim.into()),
+            (RETAIN.into(), retain.to_string()),
+        ]);
+        if let (Some(workload), Some(ordinal)) = (workload, ordinal) {
+            labels.insert(WORKLOAD.into(), workload.into());
+            labels.insert(ORDINAL.into(), ordinal.to_string());
+        }
+        labels
+    };
+    let claim_groups = claim_groups(program);
+    let mut translation = Translation::default();
     for resource in &program.resources {
-        let (replicas, sequential, pod) = match &resource.spec {
-            Spec::ReplicaSet(s) => (s.replicas, false, &s.pod),
+        if let Spec::VolumeClaim(_) = resource.spec {
+            translation.volumes.push(DesiredVolume {
+                id: volume_id(owner, &program.deployment, None, &resource.name, None),
+                spec: VolumeSpec {
+                    group: claim_groups
+                        .get(resource.name.as_str())
+                        .and_then(|groups| groups.iter().next().copied().flatten()),
+                    // IR v2: a volume claim is kept when its deployment is removed.
+                    labels: labels(None, &resource.name, None, true),
+                },
+            });
+        }
+    }
+    for resource in &program.resources {
+        let (replicas, sequential, pod, templates, retain) = match &resource.spec {
+            Spec::ReplicaSet(s) => (s.replicas, false, &s.pod, &[][..], None),
             Spec::OrderedReplicaSet(s) => (
                 s.replicas,
                 s.pod_management.unwrap_or(PodManagement::Ordered) == PodManagement::Ordered,
                 &s.pod,
+                &s.volume_claims[..],
+                s.retain.as_ref(),
             ),
             _ => continue,
         };
         let kind = resource.kind();
+        let retain_on_removal = retain.and_then(|r| r.on_removal).unwrap_or(true);
+        let delete_on_scale_down = !retain.and_then(|r| r.on_scale_down).unwrap_or(true);
+        for ordinal in 0..replicas {
+            for template in templates {
+                let id = volume_id(
+                    owner,
+                    &program.deployment,
+                    Some(&resource.name),
+                    &template.name,
+                    Some(ordinal),
+                );
+                translation.volumes.push(DesiredVolume {
+                    id,
+                    spec: VolumeSpec {
+                        group: pod.fs_group,
+                        labels: labels(
+                            Some(&resource.name),
+                            &template.name,
+                            Some(ordinal),
+                            retain_on_removal,
+                        ),
+                    },
+                });
+            }
+        }
+        let volumes = |ordinal: u32| -> Vec<PodVolume> {
+            pod.volumes
+                .iter()
+                .map(|v| PodVolume {
+                    name: v.name.clone(),
+                    scratch: v.scratch.as_ref().map(|s| Scratch {
+                        medium: match s.medium {
+                            ir_v2::Medium::Disk => Medium::Disk,
+                            ir_v2::Medium::Memory => Medium::Memory,
+                        },
+                        bytes: s.bytes,
+                    }),
+                    volume: v.claim.as_ref().map(|claim| {
+                        if templates.iter().any(|t| &t.name == claim) {
+                            volume_id(
+                                owner,
+                                &program.deployment,
+                                Some(&resource.name),
+                                claim,
+                                Some(ordinal),
+                            )
+                        } else {
+                            volume_id(owner, &program.deployment, None, claim, None)
+                        }
+                    }),
+                })
+                .collect()
+        };
         let containers: Vec<ContainerSpec> = pod
             .containers
             .iter()
-            .map(|c| ContainerSpec {
-                name: c.name.clone(),
-                image: c.image.clone(),
-                command: c.command.clone(),
-                args: c.args.clone(),
-                env: c
-                    .env
-                    .iter()
-                    .filter_map(|e| Some((e.name.clone(), e.value.clone()?)))
-                    .collect(),
+            .map(|c| {
+                let security = c.security.as_ref();
+                ContainerSpec {
+                    name: c.name.clone(),
+                    image: c.image.clone(),
+                    command: c.command.clone(),
+                    args: c.args.clone(),
+                    env: c
+                        .env
+                        .iter()
+                        .filter_map(|e| Some((e.name.clone(), e.value.clone()?)))
+                        .collect(),
+                    user: security.and_then(|s| s.user).or(pod.user),
+                    group: security.and_then(|s| s.group).or(pod.group),
+                    read_only_root: security.and_then(|s| s.read_only_root) == Some(true),
+                    no_new_privileges: security.and_then(|s| s.allow_privilege_escalation)
+                        == Some(false),
+                    drop_all_capabilities: security
+                        .and_then(|s| s.drop_capabilities.as_ref())
+                        .is_some_and(|d| d == &["all"]),
+                    mounts: c
+                        .mounts
+                        .iter()
+                        .map(|m| MountSpec {
+                            volume: m.volume.clone(),
+                            path: m.path.clone(),
+                            read_only: m.read_only == Some(true),
+                            sub_path: m.sub_path.clone(),
+                        })
+                        .collect(),
+                }
             })
             .collect();
         let restart = match pod.restart() {
@@ -152,6 +297,8 @@ pub fn translate(owner: &str, program: &Program) -> Result<Vec<Workload>, Vec<St
                         ),
                     }),
                     hostname: hostname(&resource.name, ordinal),
+                    supplementary_groups: pod.fs_group.into_iter().collect(),
+                    volumes: volumes(ordinal),
                     containers: containers.clone(),
                     restart,
                     grace_seconds: pod.grace_seconds.unwrap_or(30),
@@ -166,15 +313,34 @@ pub fn translate(owner: &str, program: &Program) -> Result<Vec<Workload>, Vec<St
                 },
             })
             .collect();
-        workloads.push(Workload {
+        translation.workloads.push(Workload {
             deployment: program.deployment.clone(),
             kind,
             resource: resource.name.clone(),
             sequential,
+            delete_on_scale_down,
             pods,
         });
     }
-    Ok(workloads)
+    Ok(translation)
+}
+
+/// For each `volume_claim`, the `fs_group`s of the pods that mount it (`None` for a pod without one).
+fn claim_groups(program: &Program) -> BTreeMap<&str, BTreeSet<Option<u32>>> {
+    let mut groups: BTreeMap<&str, BTreeSet<Option<u32>>> = BTreeMap::new();
+    for resource in &program.resources {
+        let Some(pod) = resource.pod() else { continue };
+        let templates: BTreeSet<&str> = match &resource.spec {
+            Spec::OrderedReplicaSet(s) => s.volume_claims.iter().map(|t| t.name.as_str()).collect(),
+            _ => BTreeSet::new(),
+        };
+        for claim in pod.volumes.iter().filter_map(|v| v.claim.as_deref()) {
+            if !templates.contains(claim) {
+                groups.entry(claim).or_default().insert(pod.fs_group);
+            }
+        }
+    }
+    groups
 }
 
 /// IR v2's name classes: workload kinds share one, every other kind is its own.
@@ -228,17 +394,21 @@ pub fn unsupported(program: &Program) -> Vec<String> {
         }
         let pod = match &resource.spec {
             Spec::ReplicaSet(s) => &s.pod,
-            Spec::OrderedReplicaSet(s) => {
-                if !s.volume_claims.is_empty() {
+            Spec::OrderedReplicaSet(s) => &s.pod,
+            Spec::Config(_) => continue,
+            Spec::VolumeClaim(_) => {
+                if claim_groups(program)
+                    .get(resource.name.as_str())
+                    .is_some_and(|groups| groups.len() > 1)
+                {
                     add(
-                        format!("{at}/fields/volume_claims"),
-                        "volume claims are",
+                        at,
+                        "claims mounted by pods with different fs_group values are",
                         "rezn#67",
                     );
                 }
-                &s.pod
+                continue;
             }
-            Spec::Config(_) => continue,
             Spec::Service(s) => {
                 // Services are DNS names for the target's replicas: clients connect to the container's own port.
                 let target_ports: BTreeMap<&str, u16> = program
@@ -274,7 +444,6 @@ pub fn unsupported(program: &Program) -> Vec<String> {
                 let (what, issue) = match other {
                     Spec::Job(_) => ("jobs are", "rezn#42"),
                     Spec::ScheduledJob(_) => ("scheduled jobs are", "rezn#46"),
-                    Spec::VolumeClaim(_) => ("volume claims are", "rezn#67"),
                     Spec::Secret(_) => ("secrets are", "rezn#52, rezn#53"),
                     Spec::Ingress(_) => ("ingresses are", "rezn#60"),
                     _ => ("network policies are", "rezn#64"),
@@ -290,21 +459,12 @@ pub fn unsupported(program: &Program) -> Vec<String> {
         if !pod.sidecars.is_empty() {
             add(format!("{at}/sidecars"), "sidecars are", "orqos#19");
         }
-        for (field, set) in [
-            ("user", pod.user.is_some()),
-            ("group", pod.group.is_some()),
-            ("run_as_non_root", pod.run_as_non_root.is_some()),
-            ("fs_group", pod.fs_group.is_some()),
-            ("fs_group_policy", pod.fs_group_policy.is_some()),
-            ("seccomp", pod.seccomp.is_some()),
-        ] {
-            if set {
-                add(
-                    format!("{at}/{field}"),
-                    "pod security settings are",
-                    "orqos#20",
-                );
-            }
+        if pod.fs_group.is_some_and(|g| g > MAX_ID) {
+            add(
+                format!("{at}/fs_group"),
+                "user and group IDs above 65535 are",
+                "orqos#20",
+            );
         }
         if !pod.image_pull_secrets.is_empty() {
             add(
@@ -313,12 +473,14 @@ pub fn unsupported(program: &Program) -> Vec<String> {
                 "orqos#23",
             );
         }
-        if !pod.volumes.is_empty() {
-            add(
-                format!("{at}/volumes"),
-                "volumes are",
-                "orqos#21, orqos#22, orqos#24",
-            );
+        for (k, volume) in pod.volumes.iter().enumerate() {
+            if volume.config.is_some() || volume.secret.is_some() {
+                add(
+                    format!("{at}/volumes/{k}"),
+                    "config and secret volumes are",
+                    "rezn#51, rezn#52, orqos#24",
+                );
+            }
         }
         for (j, c) in pod.containers.iter().enumerate() {
             let at = format!("{at}/containers/{j}");
@@ -361,18 +523,27 @@ pub fn unsupported(program: &Program) -> Vec<String> {
                     "rezn#40",
                 );
             }
-            if c.security.is_some() {
+            let security = c.security.as_ref();
+            let user = security.and_then(|s| s.user).or(pod.user);
+            let group = security.and_then(|s| s.group).or(pod.group);
+            if user.is_some_and(|u| u > MAX_ID) || group.is_some_and(|g| g > MAX_ID) {
+                add(at.clone(), "user and group IDs above 65535 are", "orqos#20");
+            }
+            if group.is_some() && user.is_none() {
                 add(
-                    format!("{at}/security"),
-                    "container security settings are",
+                    at.clone(),
+                    "a group without a user (the image's user with another group) is",
                     "orqos#20",
                 );
             }
-            if !c.mounts.is_empty() {
+            let non_root = security
+                .and_then(|s| s.run_as_non_root)
+                .or(pod.run_as_non_root);
+            if non_root == Some(true) && user.is_none() {
                 add(
-                    format!("{at}/mounts"),
-                    "mounts are",
-                    "orqos#21, orqos#22, orqos#24",
+                    at.clone(),
+                    "run_as_non_root without an explicit user (an image user check) is",
+                    "orqos#20",
                 );
             }
         }
@@ -417,7 +588,7 @@ mod tests {
 
     #[test]
     fn replica_sets_become_labelled_pods() {
-        let workloads = translate(OWNER_ID, &program(web(2))).unwrap();
+        let workloads = translate(OWNER_ID, &program(web(2))).unwrap().workloads;
         assert_eq!(workloads.len(), 2);
         let set = &workloads[0];
         assert_eq!(
@@ -463,8 +634,8 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("pod_management");
-        assert!(translate(OWNER_ID, &program(ordered)).unwrap()[1].sequential);
-        assert!(translate(OWNER_ID, &program(web(0))).unwrap()[0]
+        assert!(translate(OWNER_ID, &program(ordered)).unwrap().workloads[1].sequential);
+        assert!(translate(OWNER_ID, &program(web(0))).unwrap().workloads[0]
             .pods
             .is_empty());
     }
@@ -478,7 +649,7 @@ mod tests {
             json!({"kind": "service", "name": "front", "fields": {"target": "web",
                     "ports": [{"name": "http", "port": 80, "target_port": 80}]}}),
         ]);
-        let workloads = translate(OWNER_ID, &program(value)).unwrap();
+        let workloads = translate(OWNER_ID, &program(value)).unwrap().workloads;
         let network = network_name(OWNER_ID, "store");
         let names = |w: usize, p: usize| {
             let spec = &workloads[w].pods[p].spec;
@@ -513,7 +684,7 @@ mod tests {
         // A workload no service targets still joins the namespace network, without aliases.
         let mut lone = web(1);
         lone["resources"].as_array_mut().unwrap().truncate(2);
-        let spec = &translate(OWNER_ID, &program(lone)).unwrap()[0].pods[0].spec;
+        let spec = &translate(OWNER_ID, &program(lone)).unwrap().workloads[0].pods[0].spec;
         assert_eq!(
             spec.network,
             Some(Network {
@@ -590,6 +761,152 @@ mod tests {
         assert!(collisions("shop", &shop, [(&"shop".to_string(), &shop)]).is_empty());
     }
 
+    /// An ordered set with a per-replica claim, a shared claim, scratch, identity and hardening.
+    fn stateful() -> serde_json::Value {
+        json!({"ir": "rezn.dev/v2", "deployment": "shop", "namespace": "store", "resources": [
+            {"kind": "volume_claim", "name": "shared", "fields": {"bytes": 1048576}},
+            {"kind": "ordered_replica_set", "name": "db", "fields": {"replicas": 2, "service": "db",
+                "volume_claims": [{"name": "data", "bytes": 1048576}],
+                "retain": {"on_scale_down": false, "on_removal": false},
+                "pod": {"user": 1000, "group": 1000, "fs_group": 2000, "fs_group_policy": "on_root_mismatch",
+                    "run_as_non_root": true, "seccomp": "runtime_default",
+                    "volumes": [{"name": "data", "claim": "data"}, {"name": "shared", "claim": "shared"},
+                                {"name": "tmp", "scratch": {"medium": "memory", "bytes": 1024}}],
+                    "containers": [{"name": "db", "image": "postgres:17",
+                        "security": {"user": 1001, "read_only_root": true, "allow_privilege_escalation": false,
+                                     "drop_capabilities": ["all"]},
+                        "mounts": [{"volume": "data", "path": "/var/lib/db", "sub_path": "v1"},
+                                   {"volume": "shared", "path": "/shared", "read_only": true},
+                                   {"volume": "tmp", "path": "/tmp"}]}]}}},
+            {"kind": "service", "name": "db", "fields": {"target": "db", "headless": true, "ports": []}}
+        ]})
+    }
+
+    #[test]
+    fn storage_and_identity_translate() {
+        let t = translate(OWNER_ID, &program(stateful())).unwrap();
+        let shared = volume_id(OWNER_ID, "shop", None, "shared", None);
+        let data = |n| volume_id(OWNER_ID, "shop", Some("db"), "data", Some(n));
+        assert_eq!(
+            t.volumes.iter().map(|v| v.id.clone()).collect::<Vec<_>>(),
+            [shared.clone(), data(0), data(1)]
+        );
+        assert_eq!(t.volumes[0].spec.group, Some(2000));
+        assert_eq!(t.volumes[0].spec.labels[RETAIN], "true");
+        assert!(!t.volumes[0].spec.labels.contains_key(ORDINAL));
+        let replica = &t.volumes[2].spec;
+        assert_eq!(replica.group, Some(2000));
+        assert_eq!(
+            (
+                replica.labels[RETAIN].as_str(),
+                replica.labels[WORKLOAD].as_str(),
+                replica.labels[ORDINAL].as_str(),
+                replica.labels[CLAIM].as_str()
+            ),
+            ("false", "db", "1", "data")
+        );
+        assert_ne!(data(0), volume_id(OWNER_ID, "shop", None, "data", Some(0)));
+
+        let db = &t.workloads[0];
+        assert!(db.delete_on_scale_down);
+        let spec = &db.pods[1].spec;
+        assert_eq!(spec.supplementary_groups, [2000]);
+        assert_eq!(
+            spec.volumes,
+            [
+                PodVolume {
+                    name: "data".into(),
+                    volume: Some(data(1)),
+                    scratch: None
+                },
+                PodVolume {
+                    name: "shared".into(),
+                    volume: Some(shared),
+                    scratch: None
+                },
+                PodVolume {
+                    name: "tmp".into(),
+                    volume: None,
+                    scratch: Some(Scratch {
+                        medium: Medium::Memory,
+                        bytes: 1024
+                    })
+                },
+            ]
+        );
+        let c = &spec.containers[0];
+        assert_eq!((c.user, c.group), (Some(1001), Some(1000)));
+        assert!(c.read_only_root && c.no_new_privileges && c.drop_all_capabilities);
+        assert_eq!(
+            c.mounts[0],
+            MountSpec {
+                volume: "data".into(),
+                path: "/var/lib/db".into(),
+                read_only: false,
+                sub_path: Some("v1".into())
+            }
+        );
+        assert!(c.mounts[1].read_only);
+
+        // Defaults: retain everything, no hardening unless asked.
+        let mut plain = stateful();
+        plain["resources"][1]["fields"]
+            .as_object_mut()
+            .unwrap()
+            .remove("retain");
+        plain["resources"][1]["fields"]["pod"]["containers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("security");
+        let t = translate(OWNER_ID, &program(plain)).unwrap();
+        assert!(!t.workloads[0].delete_on_scale_down);
+        assert_eq!(t.volumes[1].spec.labels[RETAIN], "true");
+        let c = &t.workloads[0].pods[0].spec.containers[0];
+        assert_eq!((c.user, c.group), (Some(1000), Some(1000)));
+        assert!(!c.read_only_root && !c.no_new_privileges && !c.drop_all_capabilities);
+    }
+
+    #[test]
+    fn identity_and_storage_that_need_more_are_reported() {
+        let pod = "/resources/1/fields/pod";
+        let reasons = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut v = stateful();
+            edit(&mut v["resources"][1]["fields"]["pod"]);
+            unsupported(&program(v))
+        };
+        assert_eq!(
+            reasons(&|p| {
+                p.as_object_mut().unwrap().remove("user");
+                p["containers"][0]["security"].as_object_mut().unwrap().remove("user");
+            }),
+            [
+                format!("{pod}/containers/0: a group without a user (the image's user with another group) is not executed yet (orqos#20)"),
+                format!("{pod}/containers/0: run_as_non_root without an explicit user (an image user check) is not executed yet (orqos#20)"),
+            ]
+        );
+        assert_eq!(
+            reasons(&|p| p["containers"][0]["security"]["user"] = json!(70000)),
+            [format!("{pod}/containers/0: user and group IDs above 65535 are not executed yet (orqos#20)")]
+        );
+        assert_eq!(
+            reasons(&|p| p["fs_group"] = json!(70000)),
+            [format!(
+                "{pod}/fs_group: user and group IDs above 65535 are not executed yet (orqos#20)"
+            )]
+        );
+
+        // A shared claim mounted by pods with different fs_groups cannot get one group.
+        let mut v = stateful();
+        v["resources"].as_array_mut().unwrap().push(json!(
+            {"kind": "replica_set", "name": "reader", "fields": {"replicas": 1, "pod": {
+                "volumes": [{"name": "shared", "claim": "shared"}],
+                "containers": [{"name": "r", "image": "alpine", "mounts": [{"volume": "shared", "path": "/s"}]}]}}}));
+        assert_eq!(
+            unsupported(&program(v)),
+            ["/resources/0: claims mounted by pods with different fs_group values are not executed yet (rezn#67)"]
+        );
+    }
+
     #[test]
     fn ids_are_stable_short_and_distinct() {
         let id = pod_id(OWNER_ID, "shop", "replica_set", "web", 0);
@@ -622,7 +939,9 @@ mod tests {
     #[test]
     fn the_runnable_example_runs_and_the_others_need_more() {
         assert_eq!(
-            translate(OWNER_ID, &example("runnable.json")).unwrap()[0]
+            translate(OWNER_ID, &example("runnable.json"))
+                .unwrap()
+                .workloads[0]
                 .pods
                 .len(),
             2
@@ -653,17 +972,24 @@ mod tests {
             "secrets are",
             "jobs are",
             "init containers are",
-            "volumes are",
-            "mounts are",
+            "config and secret volumes are",
             "secret references are",
-            "pod security settings are",
             "resource requests and limits are",
             "revision phases are",
             "ingresses are",
             "network policies are",
-            "volume claims are",
         ] {
             assert!(reasons.contains(expected), "{expected}:\n{reasons}");
+        }
+        // Storage and identity run now.
+        for gone in [
+            "mounts are",
+            "volume claims are",
+            "security settings",
+            "IDs above",
+            "without",
+        ] {
+            assert!(!reasons.contains(gone), "{gone}:\n{reasons}");
         }
         let mut always = web(1);
         always["resources"].as_array_mut().unwrap().truncate(2);
