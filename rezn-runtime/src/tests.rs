@@ -92,7 +92,7 @@ impl Engine {
                     .as_array()
                     .unwrap()
                     .iter()
-                    .map(|c| json!({"name": c["name"], "unit": format!("orqos-{id}-c-{}.service", c["name"].as_str().unwrap()),
+                    .map(|c| json!({"name": c["name"], "kind": "container", "unit": format!("orqos-{id}-c-{}.service", c["name"].as_str().unwrap()),
                                     "active_state": "active", "sub_state": "running", "result": "success", "restarts": 0,
                                     "started": true, "ready": !self.start_unready, "probe_restarts": 0, "last_probe_failure": null}))
                     .collect();

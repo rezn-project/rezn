@@ -93,7 +93,8 @@ user and groups, hardening, restart policy and grace period) on owned networks w
 scratch and secret-file volumes. A deployment runs only when **every** resource maps exactly onto that:
 
 - `replica_set` and `ordered_replica_set` resources, each replica as one Orqos pod: one Podman pod with its own
-  network namespace, user namespace and hostname `<name>-<ordinal>`;
+  network namespace, user namespace and hostname `<name>-<ordinal>`, with its `init` containers, `sidecars` and
+  `containers` (below);
 - `volume_claim` resources and ordered sets' `volume_claims`, pod volumes from `claim` and `scratch`, and container
   `mounts` (below);
 - `user`, `group`, `fs_group`, `fs_group_policy: on_root_mismatch`, `seccomp: runtime_default`,
@@ -107,8 +108,8 @@ scratch and secret-file volumes. A deployment runs only when **every** resource 
   Kubernetes: nothing is published on the host), and `startup`, `readiness` and `liveness` probes (below).
 
 Anything else leaves the whole deployment **unexecuted**: services that remap ports
-([#123](https://github.com/rezn-project/rezn/issues/123)), ingress, network policies, jobs, phases, init containers and sidecars,
-probes beyond the backend's limits, resource requests and limits, other pull policies, registry credentials, pod-IP environment references, a group
+([#123](https://github.com/rezn-project/rezn/issues/123)), ingress, network policies, jobs, phases, probes on init
+containers, probes beyond the backend's limits, resource requests and limits, other pull policies, registry credentials, pod-IP environment references, a group
 without a user or `run_as_non_root` without an explicit user (both need the image's user), IDs above 65535, a claim
 mounted by pods with different `fs_group`s, and referenced secret keys missing from the secret store.
 `/status` lists every blocking field as `JSON-pointer: reason (issue)`, citing the issue that adds it. An
@@ -136,6 +137,17 @@ address ([#123](https://github.com/rezn-project/rezn/issues/123)). Names resolve
 not: IR v2 says ready replicas only, which needs membership to change without a restart
 ([#59](https://github.com/rezn-project/rezn/issues/59)). Aliases are part of the pod spec: adding, removing or
 changing a service replaces its target's pods through the rolling replacement below.
+
+### Init containers and sidecars
+
+Each container of a pod is its own systemd unit, ordered by systemd (Orqos's
+[workload API](https://github.com/orqos-project/orqos/blob/main/docs/WORKLOAD_API.md)): `init` containers run once,
+in order, each after the previous one succeeded, and one that fails is retried in place with backoff (with `restart:
+never` the pod start fails instead); `sidecars` start after them and are always restarted; `containers` start after
+both and stop before the sidecars. When a sidecar has a `startup` probe, the containers wait until every such probe
+has passed. Scratch volumes are shared by all of them for the pod's lifetime. A replica is ready when its sidecars
+and containers are; `/status` lists every container with its `kind` (`init`, `sidecar`, `container`), and a
+completed init container reads `exited`. A changed pod is replaced whole, so its init containers run again.
 
 ### Probes and readiness
 
@@ -273,7 +285,7 @@ invalid persisted state returns HTTP 500, never an empty map. `GET /status` repo
 | `unexecuted[]` | `deployment` and `reasons` (`JSON-pointer: reason (issue)`) for each program the backend cannot run yet |
 | `workloads[]` | Per replica set: `deployment`, `kind`, `resource`, `desired_replicas` (null for pods awaiting removal or of unexecuted deployments), `running_replicas` and `ready_replicas` (null until observed), `rollout` (null when settled; `waiting_for` the pods that run but are not ready while a replacement or ordered step waits) and `pods[]` |
 | `volumes[]` | Owned volumes: `id`, `deployment`, `claim`, `workload` and `ordinal` (per-replica volumes), `desired` (wanted by the accepted programs; otherwise retained or awaiting deletion), `retain`, `exists` and `mounted_by` |
-| `pods[]` | `id`, `ordinal`, `hostname`, Orqos's `state` (`running`, `starting`, `restarting`, `degraded`, `failed`, `stopped`), `ready` (runs with every container ready), `current` (runs the desired spec), `changes` (why it is not current: `config "<name>"`, `secret "<name>"`, `pod template`), `aliases` (its DNS names on the namespace network), `containers[]` (`name`, `active_state`, `sub_state`, `result`, `restarts`, `started`, `ready`, `probe_restarts`, `last_probe_failure`) and Orqos's last `error` |
+| `pods[]` | `id`, `ordinal`, `hostname`, Orqos's `state` (`running`, `starting`, `restarting`, `degraded`, `failed`, `stopped`), `ready` (runs with every container ready), `current` (runs the desired spec), `changes` (why it is not current: `config "<name>"`, `secret "<name>"`, `pod template`), `aliases` (its DNS names on the namespace network), `containers[]` (`name`, `kind`, `active_state`, `sub_state`, `result`, `restarts`, `started`, `ready`, `probe_restarts`, `last_probe_failure`) and Orqos's last `error` |
 
 After a failure, status keeps the last successful observation with its timestamp and marks it stale; it never
 invents zero replicas or declares success. It starts `unknown` after a restart and rebuilds from Orqos's listing.
@@ -374,6 +386,9 @@ applies signed IR v2 programs and checks with Podman itself:
 - failing liveness restarts the container, not the pod, and it is unready until its probes pass again;
 - a rolling change waits for each new replica to be ready before replacing the next, and reports what it waits for;
 - an ordered set creates each replica only once the previous one is ready;
+- init containers run once, in order, a failing one is retried until it succeeds, and the main container starts
+  only after its sidecar's startup probe passes; status lists every container with its kind;
+- a changed pod runs its init containers and gated start again, from empty scratch volumes;
 - empty programs remove every owned pod and then the namespace networks, while a foreign Orqos pod stays.
 
 It removes everything it created, including after a failure. The *Acceptance* workflow runs it on Ubuntu 26.04
