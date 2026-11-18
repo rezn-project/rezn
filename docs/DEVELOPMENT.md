@@ -111,8 +111,9 @@ unexecuted deployment's pods from an earlier revision keep running untouched.
 
 Every pod of a namespace joins that namespace's network: an Orqos-owned Podman bridge network with aardvark-dns,
 named `orqos-net-rz-<first 24 hex digits of sha256([owner, "namespace", namespace])>` and shared by this owner's
-deployments in the namespace. Orqos creates it with the first pod and removes it after the last. Pods of different
-namespaces are on different networks, so they can neither resolve nor reach each other (stricter than Kubernetes'
+deployments in the namespace. Orqos creates it with the first pod and removes it after the last, strictly
+isolated (netavark `isolate=strict`), so pods of different namespaces can neither resolve nor reach each other,
+even by IP, while egress to the outside keeps working (stricter than Kubernetes'
 flat pod network, as IR v2 scopes names to the namespace).
 
 A service becomes DNS aliases on every pod of its target:

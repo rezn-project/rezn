@@ -346,6 +346,10 @@ class Acceptance:
         status = self.status()
         outsider = self.container(self.pods(status, "probe", self.deployment + "-x")[0])
         assert resolve(outsider, "web") is None and resolve(outsider, "web.acceptance.svc") is None
+        for address in both:
+            reply = subprocess.run(["podman", "exec", outsider, "timeout", "5", "nc", address, "8080"],
+                                   capture_output=True, text=True, timeout=30).stdout.strip()
+            assert reply not in {"web-0", "web-1"}, f"another namespace reached {address} by IP"
         assert resolve(client, "probe") is None
         try:
             self.apply([replica_set("web", 1, "c")], deployment=self.deployment + "-c")
@@ -353,7 +357,7 @@ class Acceptance:
         except urllib.error.HTTPError as error:
             body = error.read().decode()
             assert error.code == 400 and "is also a workload name" in body, (error.code, body)
-        self.record("namespaces are isolated, and a deployment whose names collide in a shared namespace is refused")
+        self.record("namespaces are isolated (no names, no traffic by IP), and a deployment whose names collide in a shared namespace is refused")
 
         current = self.container_ids(self.status())
         revision = self.apply([replica_set("web", 2, "b"), service("web", port=80, target_port=8080),
